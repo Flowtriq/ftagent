@@ -1,0 +1,38 @@
+[Unit]
+Description=Flowtriq DDoS Detection Agent
+Documentation=https://flowtriq.com/docs?section=agent
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m ftagent
+Restart=on-failure
+RestartSec=10s
+
+# Run as root for raw packet capture
+User=root
+Group=root
+
+# State and log directories
+RuntimeDirectory=ftagent
+StateDirectory=ftagent
+LogsDirectory=ftagent
+
+# Hardening
+PrivateTmp=true
+NoNewPrivileges=false
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ftagent /var/log
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# Output
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ftagent
+
+[Install]
+WantedBy=multi-user.target

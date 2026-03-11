@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ftagent"
+version = "1.1.4"
+description = "Flowtriq DDoS Detection Agent — real-time traffic monitoring, incident detection, PCAP capture, and auto-mitigation"
+readme = "README.md"
+license = { text = "Other/Proprietary License" }
+authors = [{ name = "Flowtriq", email = "hello@flowtriq.com" }]
+keywords = ["ddos", "network", "monitoring", "security", "ids", "traffic", "detection"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: Other/Proprietary License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Networking :: Monitoring",
+    "Topic :: Security",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.28.0",
+]
+
+[project.optional-dependencies]
+full = [
+    "requests>=2.28.0",
+    "scapy>=2.4.5",
+    "psutil>=5.9.0",
+    "colorama>=0.4.6",
+]
+capture = ["scapy>=2.4.5"]
+metrics = ["psutil>=5.9.0"]
+color   = ["colorama>=0.4.6"]
+
+[project.scripts]
+ftagent = "ftagent:main"
+
+[project.urls]
+Homepage     = "https://flowtriq.com"
+Repository   = "https://github.com/flowtriq/ftagent"
+Documentation= "https://flowtriq.com/docs"
+"Bug Tracker"= "https://github.com/flowtriq/ftagent/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ftagent*"]

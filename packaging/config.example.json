@@ -1,0 +1,23 @@
+{
+  "api_key": "YOUR_API_KEY_HERE",
+  "node_uuid": "YOUR_NODE_UUID_HERE",
+  "api_base": "https://flowtriq.com/api/v1",
+
+  "interface": "auto",
+
+  "pcap_enabled": true,
+  "pcap_dir": "/var/lib/ftagent/pcaps",
+  "pcap_max_packets": 10000,
+  "pcap_max_seconds": 60,
+  "pcap_retention_days": 7,
+
+  "log_file": "/var/log/ftagent.log",
+  "log_level": "INFO",
+
+  "dynamic_threshold": true,
+  "baseline_window_minutes": 60,
+  "threshold_multiplier": 3.0,
+
+  "heartbeat_interval": 30,
+  "metrics_interval": 10
+}
