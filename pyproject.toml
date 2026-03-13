@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ftagent"
-version = "1.1.4"
+version = "1.1.5"
 description = "Flowtriq DDoS Detection Agent — real-time traffic monitoring, incident detection, PCAP capture, and auto-mitigation"
 readme = "README.md"
 license = { text = "Other/Proprietary License" }

@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -602,7 +602,7 @@ class PcapCapture:
         self.iface = iface
         self.analyser = analyser
         self.ioc_matcher = ioc_matcher
-        self.ring_buffer: collections.deque = collections.deque(maxlen=500)
+        self.ring_buffer: collections.deque = collections.deque(maxlen=1000)
         self.capture_packets: list = []
         self.capturing = False
         self.max_capture = 10000
@@ -632,13 +632,18 @@ class PcapCapture:
         self._incident_uuid = incident_uuid
         self._api_client = api_client
         self._chunk_index = 0
-        self._chunk_size = 2000  # packets per chunk file
+        self._chunk_size = 500  # packets per chunk file (small for fast first upload)
         self._uploaded_chunks: list = []
         logger.info("PCAP capture started (%d pre-attack packets)",
                     len(self.capture_packets))
         # Start background chunk uploader thread
         if api_client and incident_uuid:
             self._chunk_stop = threading.Event()
+            # Immediately flush pre-buffer packets so backend gets early sample
+            if len(self.capture_packets) >= 50:
+                threading.Thread(
+                    target=self._flush_chunk, daemon=True,
+                    name="pcap-early-flush").start()
             self._chunk_thread = threading.Thread(
                 target=self._chunk_upload_loop, daemon=True,
                 name="pcap-chunk-upload")
@@ -647,7 +652,7 @@ class PcapCapture:
     def _chunk_upload_loop(self) -> None:
         """Periodically write and upload PCAP chunks during an attack."""
         while not self._chunk_stop.is_set():
-            self._chunk_stop.wait(30)  # check every 30 seconds
+            self._chunk_stop.wait(10)  # check every 10 seconds
             if self._chunk_stop.is_set():
                 break
             pkt_count = len(self.capture_packets)

@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.5] — 2026-03-13
+
+### Improved
+- PCAP ring buffer increased from 500 to 1000 pre-attack packets
+- Chunk size reduced from 2000 to 500 packets for faster initial upload
+- Upload loop interval reduced from 30s to 10s for near-real-time streaming
+- Early flush: pre-buffer packets uploaded immediately on capture start
+
+---
+
 ## [1.1.0] — 2026-03-11
 
 ### Added
