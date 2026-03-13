@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.6] — 2026-03-13
+
+### Fixed
+- Default `api_base` confirmed as `https://flowtriq.com/api/v1` (no separate subdomain)
+- Clearer error messages when `node_uuid` or `api_key` are missing from config
+
+---
+
 ## [1.1.5] — 2026-03-13
 
 ### Improved
