@@ -1,6 +1,6 @@
 # ftagent
 
-**Flowtriq DDoS Detection Agent** — real-time traffic monitoring, attack detection, PCAP capture, and auto-mitigation for Linux servers.
+**Flowtriq DDoS Detection Agent** Real-time traffic monitoring, attack detection, PCAP capture, and auto-mitigation for Linux servers.
 
 A valid [Flowtriq](https://flowtriq.com) account and API key are required. Start a free 7-day trial at **[flowtriq.com](https://flowtriq.com)**.
 
@@ -122,13 +122,13 @@ sudo ftagent [options]
 
 ## How it works
 
-1. **Baseline** — The agent collects traffic metrics for the configured baseline window and establishes a normal PPS/BPS range for the node.
-2. **Detection** — Each 10-second metrics window is compared against the baseline. If PPS exceeds `baseline × multiplier`, an incident is opened.
-3. **Classification** — Attack traffic is classified by protocol distribution, port patterns, packet size, and IP entropy to identify the attack family.
-4. **PCAP** — A packet capture starts immediately when an incident opens, giving you forensic data for analysis.
-5. **Reporting** — The incident is reported to Flowtriq which dispatches alerts to your configured channels (Discord, Slack, Teams, PagerDuty, etc.).
-6. **Mitigation** — If you have mitigation rules configured, the agent executes approved firewall commands (iptables, Cloudflare WAF, etc.) immediately.
-7. **Resolution** — When PPS drops back to baseline, the incident is closed, undo commands run, and the PCAP is uploaded.
+1. **Baseline**: The agent collects traffic metrics for the configured baseline window and establishes a normal PPS/BPS range for the node.
+2. **Detection**: Each 10-second metrics window is compared against the baseline. If PPS exceeds `baseline × multiplier`, an incident is opened.
+3. **Classification**: Attack traffic is classified by protocol distribution, port patterns, packet size, and IP entropy to identify the attack family.
+4. **PCAP**: A packet capture starts immediately when an incident opens, giving you forensic data for analysis.
+5. **Reporting**: The incident is reported to Flowtriq which dispatches alerts to your configured channels (Discord, Slack, Teams, PagerDuty, etc.).
+6. **Mitigation**: If you have mitigation rules configured, the agent executes approved firewall commands (iptables, Cloudflare WAF, etc.) immediately.
+7. **Resolution**: When PPS drops back to baseline, the incident is closed, undo commands run, and the PCAP is uploaded.
 
 ---
 
