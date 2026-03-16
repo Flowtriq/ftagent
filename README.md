@@ -37,11 +37,32 @@ pip install -e .[full]
 
 ## Quick start
 
+The fastest way to get running is the built-in setup wizard and service installer. No manual config editing needed.
+
 ### 1. Get your API key
 
-Log in to your [Flowtriq dashboard](https://flowtriq.com/dashboard) → **Nodes** → **Add Node** → copy the API key shown.
+Log in to your [Flowtriq dashboard](https://flowtriq.com/dashboard) → **Nodes** → **Add Node** → copy the API key and Node UUID shown.
 
-### 2. Create the config
+### 2. Run the setup wizard
+
+```bash
+sudo ftagent --setup
+```
+
+This creates `/etc/ftagent/config.json` with your API key, Node UUID, and sane defaults. It will prompt you for each value.
+
+### 3. Install as a service
+
+```bash
+sudo ftagent --install-service
+sudo systemctl enable --now ftagent
+```
+
+That's it. The agent will register your node, establish a baseline, and begin monitoring. Your node will appear in the Flowtriq dashboard within 30 seconds.
+
+### Manual config (alternative)
+
+If you prefer to create the config manually:
 
 ```bash
 sudo mkdir -p /etc/ftagent
@@ -49,33 +70,19 @@ sudo cp packaging/config.example.json /etc/ftagent/config.json
 sudo nano /etc/ftagent/config.json
 ```
 
-Set `api_key` to your key and `node_uuid` to the Node UUID shown in your Flowtriq dashboard under **Nodes**. Both are required.
+Set `api_key` and `node_uuid` to the values from your Flowtriq dashboard.
 
-### 3. Run
+### Verify connectivity
 
 ```bash
-sudo ftagent
+sudo ftagent --test
 ```
 
-Or with the Python module:
+This sends a test heartbeat to confirm the agent can reach the Flowtriq API.
+
+### Check service status
 
 ```bash
-sudo python3 -m ftagent
-```
-
-The agent will register your node, establish a baseline, and begin monitoring. Your node will appear in the Flowtriq dashboard within 30 seconds.
-
----
-
-## Install as a systemd service
-
-```bash
-sudo cp packaging/ftagent.service /etc/systemd/system/ftagent.service
-sudo systemctl daemon-reload
-sudo systemctl enable ftagent
-sudo systemctl start ftagent
-
-# Check status
 sudo systemctl status ftagent
 sudo journalctl -u ftagent -f
 ```
@@ -112,9 +119,10 @@ Config file: `/etc/ftagent/config.json`
 ```
 sudo ftagent [options]
 
+  --setup            Interactive setup wizard (creates config)
+  --install-service  Install systemd service unit
   --config PATH      Config file path (default: /etc/ftagent/config.json)
-  --interface IFACE  Override interface from config
-  --test             Trigger a synthetic detection event and exit
+  --test             Test API connectivity and exit
   --version          Show version
 ```
 
@@ -122,13 +130,14 @@ sudo ftagent [options]
 
 ## How it works
 
-1. **Baseline**: The agent collects traffic metrics for the configured baseline window and establishes a normal PPS/BPS range for the node.
-2. **Detection**: Each 10-second metrics window is compared against the baseline. If PPS exceeds `baseline × multiplier`, an incident is opened.
-3. **Classification**: Attack traffic is classified by protocol distribution, port patterns, packet size, and IP entropy to identify the attack family.
-4. **PCAP**: A packet capture starts immediately when an incident opens, giving you forensic data for analysis.
-5. **Reporting**: The incident is reported to Flowtriq which dispatches alerts to your configured channels (Discord, Slack, Teams, PagerDuty, etc.).
-6. **Mitigation**: If you have mitigation rules configured, the agent executes approved firewall commands (iptables, Cloudflare WAF, etc.) immediately.
-7. **Resolution**: When PPS drops back to baseline, the incident is closed, undo commands run, and the PCAP is uploaded.
+1. **Baseline**: The agent collects traffic metrics and establishes a normal PPS/BPS range for the node.
+2. **L3/L4 Detection**: Each metrics window is compared against the baseline. If PPS exceeds `baseline x multiplier`, an incident is opened.
+3. **L7 Detection**: When enabled, the agent tails your web server access log (nginx, Apache, Caddy, LiteSpeed, HAProxy) and detects HTTP floods via request rate spikes, IP concentration, endpoint targeting, and error rate analysis.
+4. **Classification**: Attack traffic is classified by protocol distribution, TCP flags, port patterns, packet size, and IP entropy.
+5. **PCAP**: A packet capture starts immediately when an incident opens, giving you forensic data for analysis.
+6. **Reporting**: The incident is reported to Flowtriq which dispatches alerts to your configured channels (Discord, Slack, Teams, PagerDuty, etc.).
+7. **Mitigation**: If you have mitigation rules configured, the agent executes approved firewall commands (iptables, Cloudflare WAF, etc.) immediately.
+8. **Resolution**: When traffic returns to baseline, the incident is closed, undo commands run, and the PCAP is uploaded.
 
 ---
 
