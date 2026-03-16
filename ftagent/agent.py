@@ -1051,6 +1051,7 @@ class Agent:
         # L7 monitoring (configured via server config)
         self.l7: Optional[L7Monitor] = None
         self.l7_enabled = False
+        self.l7_thread_running = False
         self.l7_incident_uuid = ""
         self.l7_last_metric_push: float = 0.0
 
@@ -1096,7 +1097,8 @@ class Agent:
         self._fetch_config()
 
         # Start L7 thread if enabled by server config
-        if self.l7 and self.l7_enabled:
+        if self.l7 and self.l7_enabled and not self.l7_thread_running:
+            self.l7_thread_running = True
             l7t = threading.Thread(target=self._l7_loop, daemon=True, name="l7-monitor")
             l7t.start()
 
