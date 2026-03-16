@@ -1339,12 +1339,18 @@ class Agent:
             # L7 config from server
             l7_cfg = data.get("l7", {})
             if l7_cfg.get("enabled"):
+                was_enabled = self.l7_enabled
                 self.l7_enabled = True
                 action = l7_cfg.get("action")
-                if action == "auto_detect":
+                if action == "auto_detect" and not self.l7:
                     self._l7_auto_detect()
-                elif l7_cfg.get("log_path") and not self.l7:
+                elif l7_cfg.get("log_path"):
                     self._l7_start(l7_cfg["log_path"])
+                    # Start L7 thread if not already running
+                    if self.l7 and not was_enabled:
+                        l7t = threading.Thread(
+                            target=self._l7_loop, daemon=True, name="l7-monitor")
+                        l7t.start()
             elif self.l7:
                 logger.info("L7: disabled by server config")
                 self.l7 = None
