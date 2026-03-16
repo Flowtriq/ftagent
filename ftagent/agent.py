@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import sys
 import threading
@@ -19,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.6"
+VERSION = "1.2.0"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -718,6 +719,291 @@ class PcapCapture:
 
 
 # ---------------------------------------------------------------------------
+# L7 (HTTP) Detection Module
+# ---------------------------------------------------------------------------
+
+WEB_SERVER_LOG_PATHS = {
+    "nginx": [
+        "/var/log/nginx/access.log",
+        "/var/log/nginx/access_log",
+        "/usr/local/nginx/logs/access.log",
+    ],
+    "apache": [
+        "/var/log/apache2/access.log",
+        "/var/log/apache2/other_vhosts_access.log",
+        "/var/log/httpd/access_log",
+        "/var/log/httpd/access.log",
+        "/var/log/apache/access.log",
+    ],
+    "caddy": ["/var/log/caddy/access.log"],
+    "litespeed": [
+        "/var/log/litespeed/access.log",
+        "/usr/local/lsws/logs/access.log",
+    ],
+    "haproxy": ["/var/log/haproxy.log"],
+}
+
+LOG_PATTERN_COMBINED = re.compile(
+    r'^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"(\S+)\s+(\S+)\s+\S+"\s+(\d{3})\s+(\S+)'
+    r'(?:\s+"[^"]*"\s+"([^"]*)")?'
+)
+
+
+def detect_web_server() -> dict:
+    """Auto-detect running web server and locate access log files."""
+    import subprocess
+
+    result = {"web_server": None, "server_version": None, "detected_paths": []}
+    checks = [
+        ("nginx",     ["nginx", "-v"]),
+        ("apache",    ["apache2", "-v"]),
+        ("apache",    ["httpd", "-v"]),
+        ("caddy",     ["caddy", "version"]),
+        ("litespeed", ["litespeed", "-v"]),
+        ("haproxy",   ["haproxy", "-v"]),
+    ]
+
+    for name, cmd in checks:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 or (r.stderr and name in r.stderr.lower()):
+                version_text = (r.stderr or r.stdout).strip().split("\n")[0]
+                result["web_server"] = name
+                result["server_version"] = version_text[:100]
+                break
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+    if not result["web_server"]:
+        try:
+            r = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
+            ps_out = r.stdout.lower()
+            for name in ["nginx", "apache2", "httpd", "caddy", "litespeed", "haproxy"]:
+                if name in ps_out:
+                    result["web_server"] = "apache" if name in ("apache2", "httpd") else name
+                    break
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    if not result["web_server"]:
+        return result
+
+    candidates = WEB_SERVER_LOG_PATHS.get(result["web_server"], [])
+    all_paths = set()
+    for paths in WEB_SERVER_LOG_PATHS.values():
+        all_paths.update(paths)
+    ordered = list(candidates) + [p for p in all_paths if p not in candidates]
+
+    for path in ordered:
+        if os.path.isfile(path) and os.access(path, os.R_OK):
+            result["detected_paths"].append(path)
+
+    return result
+
+
+class L7Monitor:
+    """Monitors HTTP access logs for L7 attack patterns."""
+
+    def __init__(self, log_path: str, api: APIClient):
+        self.log_path = log_path
+        self.api = api
+        self.file = None
+        self.inode = 0
+        self._window = 10
+        self._requests: list = []
+        self._baseline_rps: float = 0.0
+        self._baseline_samples: int = 0
+        self._attack_active = False
+        self._attack_start = 0.0
+        self._attack_uuid = ""
+        self._attack_peak_rps = 0.0
+
+    def open(self) -> bool:
+        try:
+            self.file = open(self.log_path, "r")
+            self.file.seek(0, 2)
+            self.inode = os.stat(self.log_path).st_ino
+            logger.info("L7: tailing %s", self.log_path)
+            return True
+        except (OSError, IOError) as exc:
+            logger.error("L7: cannot open %s: %s", self.log_path, exc)
+            return False
+
+    def tick(self) -> Optional[dict]:
+        if not self.file:
+            return None
+
+        try:
+            current_inode = os.stat(self.log_path).st_ino
+            if current_inode != self.inode:
+                logger.info("L7: log rotated, reopening %s", self.log_path)
+                self.file.close()
+                self.open()
+        except OSError:
+            pass
+
+        new_lines = []
+        try:
+            while True:
+                line = self.file.readline()
+                if not line:
+                    break
+                new_lines.append(line.rstrip("\n"))
+        except (OSError, IOError):
+            pass
+
+        now = time.time()
+        for line in new_lines:
+            parsed = self._parse_line(line)
+            if parsed:
+                self._requests.append((now, *parsed))
+
+        cutoff = now - self._window
+        self._requests = [r for r in self._requests if r[0] >= cutoff]
+
+        if not self._requests:
+            return None
+        return self._compute_stats(now)
+
+    def _parse_line(self, line: str) -> Optional[tuple]:
+        if line.startswith("{"):
+            try:
+                d = json.loads(line)
+                ip = d.get("remote_addr") or d.get("client_ip") or d.get("host", "")
+                method = d.get("method") or d.get("request_method", "GET")
+                path = d.get("uri") or d.get("path") or d.get("request_uri", "/")
+                status = int(d.get("status") or d.get("status_code", 0))
+                size = int(d.get("body_bytes_sent") or d.get("bytes", 0))
+                ua = d.get("http_user_agent") or d.get("user_agent", "")
+                if ip and status:
+                    return (ip, method, path, status, size, ua)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+            return None
+
+        m = LOG_PATTERN_COMBINED.match(line)
+        if m:
+            ip = m.group(1)
+            method, path = m.group(3), m.group(4)
+            status = int(m.group(5))
+            size_str = m.group(6)
+            ua = m.group(7) or ""
+            size = int(size_str) if size_str != "-" else 0
+            path = path.split("?")[0] if "?" in path else path
+            return (ip, method, path, status, size, ua)
+        return None
+
+    def _compute_stats(self, now: float) -> dict:
+        n = len(self._requests)
+        elapsed = max(1.0, now - self._requests[0][0]) if n > 1 else self._window
+        rps = n / elapsed
+
+        ip_counts: dict = {}
+        path_counts: dict = {}
+        status_counts: dict = {}
+
+        for _, ip, method, path, status, size, ua in self._requests:
+            ip_counts[ip] = ip_counts.get(ip, 0) + 1
+            path_counts[path] = path_counts.get(path, 0) + 1
+            code_group = f"{status // 100}xx"
+            status_counts[code_group] = status_counts.get(code_group, 0) + 1
+
+        error_count = status_counts.get("4xx", 0) + status_counts.get("5xx", 0)
+        error_rate = (error_count / max(n, 1)) * 100
+
+        top_ips = sorted(ip_counts.items(), key=lambda x: x[1], reverse=True)[:50]
+        top_paths = sorted(path_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+
+        return {
+            "rps": round(rps, 1),
+            "error_rate": round(error_rate, 1),
+            "unique_ips": len(ip_counts),
+            "total_requests": n,
+            "top_paths": dict(top_paths),
+            "top_ips": dict(top_ips),
+            "status_codes": status_counts,
+            "window_seconds": round(elapsed, 1),
+        }
+
+    def check_attack(self, stats: dict) -> Optional[dict]:
+        rps = stats["rps"]
+        total = stats["total_requests"]
+
+        if total < 10:
+            if self._attack_active:
+                return self._check_attack_end(stats)
+            return None
+
+        if not self._attack_active:
+            if self._baseline_samples < 300:
+                alpha = 1 / (self._baseline_samples + 1)
+            else:
+                alpha = 0.01
+            self._baseline_rps = (1 - alpha) * self._baseline_rps + alpha * rps
+            self._baseline_samples += 1
+
+        signals = 0
+        reasons = []
+
+        rps_threshold = max(self._baseline_rps * 5, 100) if self._baseline_rps > 5 else 100
+        if rps > rps_threshold:
+            signals += 2
+            reasons.append(f"RPS spike: {rps:.0f} vs baseline {self._baseline_rps:.0f}")
+
+        if stats["top_ips"]:
+            top_ip_name, top_ip_count = max(stats["top_ips"].items(), key=lambda x: x[1])
+            ip_pct = top_ip_count / max(total, 1)
+            if ip_pct > 0.3 and top_ip_count > 20:
+                signals += 1
+                reasons.append(f"IP concentration: {top_ip_name} = {ip_pct:.0%}")
+
+        if stats["top_paths"]:
+            top_path_name, top_path_count = max(stats["top_paths"].items(), key=lambda x: x[1])
+            path_pct = top_path_count / max(total, 1)
+            if path_pct > 0.6 and top_path_count > 30:
+                signals += 1
+                reasons.append(f"Path focus: {top_path_name} = {path_pct:.0%}")
+
+        if stats["error_rate"] > 50 and total > 20:
+            signals += 1
+            reasons.append(f"Error rate: {stats['error_rate']:.0f}%")
+
+        if signals >= 2 and not self._attack_active:
+            self._attack_active = True
+            self._attack_start = time.time()
+            self._attack_peak_rps = rps
+            return {
+                "type": "l7_flood",
+                "attack_family": "http_flood",
+                "rps": rps,
+                "baseline_rps": round(self._baseline_rps, 1),
+                "reasons": reasons,
+                "stats": stats,
+            }
+        elif self._attack_active:
+            if rps > self._attack_peak_rps:
+                self._attack_peak_rps = rps
+            return self._check_attack_end(stats)
+
+        return None
+
+    def _check_attack_end(self, stats: dict) -> Optional[dict]:
+        rps = stats["rps"]
+        rps_threshold = max(self._baseline_rps * 3, 50) if self._baseline_rps > 5 else 50
+
+        if rps < rps_threshold:
+            self._attack_active = False
+            duration = time.time() - self._attack_start
+            return {
+                "type": "l7_flood_end",
+                "duration_seconds": round(duration, 1),
+                "peak_rps": round(self._attack_peak_rps, 1),
+                "stats": stats,
+            }
+        return {"type": "l7_flood_update", "rps": rps, "peak_rps": self._attack_peak_rps, "stats": stats}
+
+
+# ---------------------------------------------------------------------------
 # Attack Classifier
 # ---------------------------------------------------------------------------
 
@@ -762,6 +1048,12 @@ class Agent:
         self.pcap = PcapCapture(cfg, self.monitor.interface,
                                 self.analyser, self.ioc_matcher)
 
+        # L7 monitoring (configured via server config)
+        self.l7: Optional[L7Monitor] = None
+        self.l7_enabled = False
+        self.l7_incident_uuid = ""
+        self.l7_last_metric_push: float = 0.0
+
         self.attacking = False
         self.attack_start: float = 0.0
         self.incident_uuid: str = ""
@@ -802,6 +1094,11 @@ class Agent:
             t.start()
 
         self._fetch_config()
+
+        # Start L7 thread if enabled by server config
+        if self.l7 and self.l7_enabled:
+            l7t = threading.Thread(target=self._l7_loop, daemon=True, name="l7-monitor")
+            l7t.start()
 
         logger.info("Entering main monitoring loop")
         while not self.shutdown.is_set():
@@ -1038,8 +1335,132 @@ class Agent:
             if "pending_commands" in data and data["pending_commands"]:
                 for cmd in data["pending_commands"]:
                     self._execute_command(cmd)
+
+            # L7 config from server
+            l7_cfg = data.get("l7", {})
+            if l7_cfg.get("enabled"):
+                self.l7_enabled = True
+                action = l7_cfg.get("action")
+                if action == "auto_detect":
+                    self._l7_auto_detect()
+                elif l7_cfg.get("log_path") and not self.l7:
+                    self._l7_start(l7_cfg["log_path"])
+            elif self.l7:
+                logger.info("L7: disabled by server config")
+                self.l7 = None
+                self.l7_enabled = False
+
         except Exception as exc:
             logger.error("Config fetch error: %s", exc)
+
+    # ── L7 Methods ─────────────────────────────────────────────────────────
+
+    def _l7_auto_detect(self) -> None:
+        logger.info("L7: running web server auto-detection...")
+        result = detect_web_server()
+        self.api._post("/agent/l7/detect", {
+            "web_server": result["web_server"],
+            "server_version": result.get("server_version"),
+            "detected_paths": result["detected_paths"],
+        }, retries=2)
+        if result["web_server"]:
+            logger.info("L7: detected %s, paths: %s",
+                        result["web_server"], result["detected_paths"])
+        else:
+            logger.info("L7: no web server detected")
+
+    def _l7_start(self, log_path: str) -> None:
+        if self.l7 and self.l7.log_path == log_path:
+            return
+        logger.info("L7: starting access log monitoring on %s", log_path)
+        self.l7 = L7Monitor(log_path, self.api)
+        if not self.l7.open():
+            logger.error("L7: failed to open %s, disabling", log_path)
+            self.l7 = None
+
+    def _l7_loop(self) -> None:
+        logger.info("L7: monitoring thread started")
+        while not self.shutdown.is_set():
+            self.shutdown.wait(2)
+            if self.shutdown.is_set():
+                break
+            if not self.l7:
+                continue
+            try:
+                stats = self.l7.tick()
+                if not stats:
+                    continue
+                now = time.monotonic()
+                if now - self.l7_last_metric_push >= 10:
+                    self.l7_last_metric_push = now
+                    self.api._post("/agent/l7/metrics", stats, retries=1)
+                attack_info = self.l7.check_attack(stats)
+                if not attack_info:
+                    continue
+                if attack_info["type"] == "l7_flood":
+                    self._l7_begin_attack(attack_info)
+                elif attack_info["type"] == "l7_flood_end":
+                    self._l7_end_attack(attack_info)
+                elif attack_info["type"] == "l7_flood_update":
+                    self._l7_update_attack(attack_info)
+            except Exception as exc:
+                logger.error("L7 tick error: %s", exc)
+
+    def _l7_begin_attack(self, info: dict) -> None:
+        rps = info["rps"]
+        logger.warning("L7 ATTACK DETECTED — RPS=%.0f baseline=%.0f reasons=%s",
+                       rps, info["baseline_rps"], info["reasons"])
+        result = self.api.open_incident({
+            "peak_pps": 0,
+            "peak_bps": 0,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "attack_family": "http_flood",
+        })
+        if result and "uuid" in result:
+            self.l7_incident_uuid = result["uuid"]
+        else:
+            self.l7_incident_uuid = str(uuid.uuid4())
+        stats = info.get("stats", {})
+        self.api.update_incident(self.l7_incident_uuid, {
+            "attack_family": "http_flood",
+            "attack_subtype": "l7_flood",
+            "source_ip_count": stats.get("unique_ips", 0),
+            "top_src_ips": [{"ip": ip, "count": cnt}
+                           for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
+            "top_dst_ports": stats.get("top_paths", {}),
+            "protocol_breakdown": {"tcp": 100, "udp": 0, "icmp": 0},
+        })
+
+    def _l7_update_attack(self, info: dict) -> None:
+        if not self.l7_incident_uuid:
+            return
+        stats = info.get("stats", {})
+        self.api.update_incident(self.l7_incident_uuid, {
+            "attack_family": "http_flood",
+            "source_ip_count": stats.get("unique_ips", 0),
+            "top_src_ips": [{"ip": ip, "count": cnt}
+                           for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
+        })
+
+    def _l7_end_attack(self, info: dict) -> None:
+        if not self.l7_incident_uuid:
+            return
+        duration = info.get("duration_seconds", 0)
+        peak_rps = info.get("peak_rps", 0)
+        logger.warning("L7 ATTACK ENDED — duration=%.0fs peak_rps=%.0f",
+                       duration, peak_rps)
+        stats = info.get("stats", {})
+        self.api.resolve_incident(self.l7_incident_uuid, {
+            "duration_seconds": duration,
+            "peak_pps": 0,
+            "peak_bps": 0,
+            "attack_family": "http_flood",
+            "protocol_breakdown": {"tcp": 100, "udp": 0, "icmp": 0},
+            "source_ip_count": stats.get("unique_ips", 0),
+            "top_src_ips": [{"ip": ip, "count": cnt}
+                           for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
+        })
+        self.l7_incident_uuid = ""
 
     def _execute_command(self, cmd: dict) -> None:
         """Execute a pending command (iptables/sysctl) from the dashboard."""
