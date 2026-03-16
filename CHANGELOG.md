@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.0] — 2026-03-16
+
+### Added
+- Layer 7 (HTTP) DDoS detection via web server access log analysis
+- Auto-detection of nginx, Apache, Caddy, LiteSpeed, and HAProxy
+- Access log tailing with automatic log rotation handling
+- Combined, common, and JSON log format parsing
+- L7 attack detection using 5 behavioral signals: RPS spike, IP concentration, endpoint targeting, error rate, and UA uniformity
+- L7 metrics reporting (RPS, error rate, unique IPs, top paths, status codes)
+- Web server detection results reported to dashboard for confirmation
+- L7 incidents flow through the same pipeline as L3/L4 attacks
+
+---
+
 ## [1.1.6] — 2026-03-13
 
 ### Fixed
