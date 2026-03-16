@@ -1383,6 +1383,18 @@ class Agent:
         if not self.l7.open():
             logger.error("L7: failed to open %s, disabling", log_path)
             self.l7 = None
+            # Tell server it failed
+            self.api._post("/agent/l7/detect", {
+                "web_server": None,
+                "detected_paths": [],
+            }, retries=1)
+        else:
+            # Tell server we're actively monitoring this path
+            self.api._post("/agent/l7/detect", {
+                "web_server": "detected",
+                "detected_paths": [log_path],
+                "active_log_path": log_path,
+            }, retries=1)
 
     def _l7_loop(self) -> None:
         logger.info("L7: monitoring thread started")
