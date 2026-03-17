@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -972,6 +972,7 @@ class L7Monitor:
             self._attack_active = True
             self._attack_start = time.time()
             self._attack_peak_rps = rps
+            self._below_count = 0
             return {
                 "type": "l7_flood",
                 "attack_family": "http_flood",
@@ -990,16 +991,27 @@ class L7Monitor:
     def _check_attack_end(self, stats: dict) -> Optional[dict]:
         rps = stats["rps"]
         rps_threshold = max(self._baseline_rps * 3, 50) if self._baseline_rps > 5 else 50
+        elapsed = time.time() - self._attack_start
 
+        # Minimum 30s before allowing resolve to prevent rapid open/close flapping
+        if elapsed < 30:
+            return {"type": "l7_flood_update", "rps": rps, "peak_rps": self._attack_peak_rps, "stats": stats}
+
+        # Require RPS to stay below threshold for 3 consecutive checks before resolving
         if rps < rps_threshold:
-            self._attack_active = False
-            duration = time.time() - self._attack_start
-            return {
-                "type": "l7_flood_end",
-                "duration_seconds": round(duration, 1),
-                "peak_rps": round(self._attack_peak_rps, 1),
-                "stats": stats,
-            }
+            self._below_count = getattr(self, '_below_count', 0) + 1
+            if self._below_count >= 3:
+                self._attack_active = False
+                self._below_count = 0
+                return {
+                    "type": "l7_flood_end",
+                    "duration_seconds": round(elapsed, 1),
+                    "peak_rps": round(self._attack_peak_rps, 1),
+                    "stats": stats,
+                }
+            return {"type": "l7_flood_update", "rps": rps, "peak_rps": self._attack_peak_rps, "stats": stats}
+
+        self._below_count = 0
         return {"type": "l7_flood_update", "rps": rps, "peak_rps": self._attack_peak_rps, "stats": stats}
 
 
@@ -1400,13 +1412,13 @@ class Agent:
         logger.info("L7: monitoring thread started")
         _l7_retry_count = 0
         while not self.shutdown.is_set():
-            self.shutdown.wait(2)
+            self.shutdown.wait(1)
             if self.shutdown.is_set():
                 break
             if not self.l7:
                 # File wasn't available (log rotation). Retry every 30s.
                 _l7_retry_count += 1
-                if _l7_retry_count % 15 == 0:  # every 30s (15 * 2s)
+                if _l7_retry_count % 30 == 0:  # every 30s (30 * 1s)
                     cfg = {"log_path": getattr(self, '_l7_log_path', None)}
                     if cfg["log_path"]:
                         self._l7_start(cfg["log_path"])
