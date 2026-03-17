@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.1] — 2026-03-16
+
+### Fixed
+- Agent now reports L7 monitoring status back to dashboard (sets status to "active" when log tailing starts)
+- Prevented duplicate L7 monitoring threads when config syncs during active monitoring
+- Added `__main__.py` for `python3 -m ftagent` invocation
+
+### Improved
+- README updated with `--setup` wizard and `--install-service` as recommended quickstart
+- L7 detection documented in README "How it works" section
+
+---
+
 ## [1.2.0] — 2026-03-16
 
 ### Added
