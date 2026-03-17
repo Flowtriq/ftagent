@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.3.1] — 2026-03-17
+
+### Fixed
+- L7 detection no longer creates dozens of rapid-fire incidents for a single attack
+- Added 30-second minimum attack duration before allowing resolve
+- Require RPS to stay below threshold for 3 consecutive checks before resolving (prevents flapping)
+- L7 monitor loop interval reduced from 2s to 1s for faster detection
+
+---
+
 ## [1.3.0] — 2026-03-17
 
 ### Added
