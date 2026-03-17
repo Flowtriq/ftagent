@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1380,16 +1380,13 @@ class Agent:
     def _l7_start(self, log_path: str) -> None:
         if self.l7 and self.l7.log_path == log_path:
             return
+        self._l7_log_path = log_path
         logger.info("L7: starting access log monitoring on %s", log_path)
         self.l7 = L7Monitor(log_path, self.api)
         if not self.l7.open():
-            logger.error("L7: failed to open %s, disabling", log_path)
+            logger.warning("L7: %s not available yet, will retry on next cycle", log_path)
             self.l7 = None
-            # Tell server it failed
-            self.api._post("/agent/l7/detect", {
-                "web_server": None,
-                "detected_paths": [],
-            }, retries=1)
+            # Don't report failure -- file may appear after log rotation
         else:
             # Tell server we're actively monitoring this path
             self.api._post("/agent/l7/detect", {
@@ -1400,11 +1397,20 @@ class Agent:
 
     def _l7_loop(self) -> None:
         logger.info("L7: monitoring thread started")
+        _l7_retry_count = 0
         while not self.shutdown.is_set():
             self.shutdown.wait(2)
             if self.shutdown.is_set():
                 break
             if not self.l7:
+                # File wasn't available (log rotation). Retry every 30s.
+                _l7_retry_count += 1
+                if _l7_retry_count % 15 == 0:  # every 30s (15 * 2s)
+                    cfg = {"log_path": getattr(self, '_l7_log_path', None)}
+                    if cfg["log_path"]:
+                        self._l7_start(cfg["log_path"])
+                        if self.l7:
+                            _l7_retry_count = 0
                 continue
             try:
                 stats = self.l7.tick()
