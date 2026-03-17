@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.3.0] — 2026-03-17
+
+### Added
+- PCAP capture for L7 (HTTP flood) attacks -- L7 incidents now get full packet captures like L3/L4
+- RPS and baseline RPS sent to server on L7 incident open, update, and resolve
+- `attack_subtype` field sent in all L7 incident lifecycle calls
+- `top_dst_ports` (HTTP paths) sent on L7 update and resolve for richer analytics
+
+### Fixed
+- L7 incidents now resolve correctly with peak RPS, duration, and source IP data
+- PCAP capture properly stopped when L7 attack ends
+- L7 severity no longer stuck at "low" -- server now calculates from RPS ratio instead of PPS
+
+---
+
+## [1.2.2] — 2026-03-16
+
+### Fixed
+- L7 auto-detect status correctly reported back to dashboard
+
+---
+
 ## [1.2.1] — 2026-03-16
 
 ### Fixed

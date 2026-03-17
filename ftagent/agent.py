@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1349,7 +1349,8 @@ class Agent:
                 elif l7_cfg.get("log_path"):
                     self._l7_start(l7_cfg["log_path"])
                     # Start L7 thread if not already running
-                    if self.l7 and not was_enabled:
+                    if self.l7 and not self.l7_thread_running:
+                        self.l7_thread_running = True
                         l7t = threading.Thread(
                             target=self._l7_loop, daemon=True, name="l7-monitor")
                         l7t.start()
@@ -1434,22 +1435,37 @@ class Agent:
 
     def _l7_begin_attack(self, info: dict) -> None:
         rps = info["rps"]
+        baseline_rps = info.get("baseline_rps", 0)
         logger.warning("L7 ATTACK DETECTED — RPS=%.0f baseline=%.0f reasons=%s",
-                       rps, info["baseline_rps"], info["reasons"])
+                       rps, baseline_rps, info["reasons"])
+        self.l7_peak_rps = rps
+        self.l7_baseline_rps = baseline_rps
         result = self.api.open_incident({
             "peak_pps": 0,
             "peak_bps": 0,
+            "rps": round(rps),
+            "baseline_rps": round(baseline_rps, 1),
             "started_at": datetime.now(timezone.utc).isoformat(),
             "attack_family": "http_flood",
+            "attack_subtype": "l7_flood",
         })
         if result and "uuid" in result:
             self.l7_incident_uuid = result["uuid"]
         else:
             self.l7_incident_uuid = str(uuid.uuid4())
+
+        # Trigger PCAP capture for L7 attacks too
+        if self.pcap.enabled:
+            self.pcap.start_capture(
+                incident_uuid=self.l7_incident_uuid,
+                api_client=self.api)
+
         stats = info.get("stats", {})
         self.api.update_incident(self.l7_incident_uuid, {
             "attack_family": "http_flood",
             "attack_subtype": "l7_flood",
+            "rps": round(rps),
+            "baseline_rps": round(baseline_rps, 1),
             "source_ip_count": stats.get("unique_ips", 0),
             "top_src_ips": [{"ip": ip, "count": cnt}
                            for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
@@ -1460,33 +1476,51 @@ class Agent:
     def _l7_update_attack(self, info: dict) -> None:
         if not self.l7_incident_uuid:
             return
+        rps = info.get("rps", 0)
+        if rps > getattr(self, 'l7_peak_rps', 0):
+            self.l7_peak_rps = rps
         stats = info.get("stats", {})
         self.api.update_incident(self.l7_incident_uuid, {
             "attack_family": "http_flood",
+            "attack_subtype": "l7_flood",
+            "rps": round(rps),
+            "baseline_rps": round(getattr(self, 'l7_baseline_rps', 0), 1),
             "source_ip_count": stats.get("unique_ips", 0),
             "top_src_ips": [{"ip": ip, "count": cnt}
                            for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
+            "top_dst_ports": stats.get("top_paths", {}),
         })
 
     def _l7_end_attack(self, info: dict) -> None:
         if not self.l7_incident_uuid:
             return
         duration = info.get("duration_seconds", 0)
-        peak_rps = info.get("peak_rps", 0)
+        peak_rps = getattr(self, 'l7_peak_rps', info.get("peak_rps", 0))
+        baseline_rps = getattr(self, 'l7_baseline_rps', 0)
         logger.warning("L7 ATTACK ENDED — duration=%.0fs peak_rps=%.0f",
                        duration, peak_rps)
+
+        # Stop PCAP capture
+        if self.pcap.capturing:
+            self.pcap.stop_capture()
+
         stats = info.get("stats", {})
         self.api.resolve_incident(self.l7_incident_uuid, {
             "duration_seconds": duration,
             "peak_pps": 0,
             "peak_bps": 0,
+            "peak_rps": round(peak_rps),
+            "baseline_rps": round(baseline_rps, 1),
             "attack_family": "http_flood",
+            "attack_subtype": "l7_flood",
             "protocol_breakdown": {"tcp": 100, "udp": 0, "icmp": 0},
             "source_ip_count": stats.get("unique_ips", 0),
             "top_src_ips": [{"ip": ip, "count": cnt}
                            for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
+            "top_dst_ports": stats.get("top_paths", {}),
         })
         self.l7_incident_uuid = ""
+        self.l7_peak_rps = 0
 
     def _execute_command(self, cmd: dict) -> None:
         """Execute a pending command (iptables/sysctl) from the dashboard."""
