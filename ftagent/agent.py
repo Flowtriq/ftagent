@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
