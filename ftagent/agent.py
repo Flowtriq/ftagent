@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -289,6 +289,32 @@ class PPSMonitor:
     def _resolve_interface(iface: str) -> str:
         if iface != "auto":
             return iface
+        # Pick the non-lo interface with the most received bytes.
+        # Handles servers with docker0, br-*, veth*, virbr*, dummy*, tun*, etc.
+        skip = {"lo", "docker0"}
+        skip_prefix = ("br-", "veth", "virbr", "dummy", "tun", "tap", "flannel", "cni", "cali")
+        best_name = None
+        best_bytes = -1
+        try:
+            with open("/proc/net/dev") as f:
+                for line in f:
+                    parts = line.strip().split(":")
+                    if len(parts) != 2:
+                        continue
+                    name = parts[0].strip()
+                    if name in skip or name.startswith(skip_prefix):
+                        continue
+                    fields = parts[1].split()
+                    if len(fields) >= 1:
+                        rx_bytes = int(fields[0])
+                        if rx_bytes > best_bytes:
+                            best_bytes = rx_bytes
+                            best_name = name
+        except (OSError, ValueError):
+            pass
+        if best_name:
+            return best_name
+        # Fallback: first non-lo interface
         try:
             with open("/proc/net/dev") as f:
                 for line in f:
