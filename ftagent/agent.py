@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -32,6 +32,9 @@ DEFAULT_CONFIG = {
     "log_file": "/var/log/ftagent.log",
     "log_level": "INFO",
     "dynamic_threshold": True,
+    "baseline_window": 300,
+    "health_port": 9100,
+    "auto_update": False,
 }
 
 # Optional dependency imports
@@ -118,6 +121,8 @@ logger = logging.getLogger("ftagent")
 
 
 def setup_logging(log_file: str, log_level: str) -> None:
+    from logging.handlers import RotatingFileHandler
+
     level = getattr(logging, log_level.upper(), logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
@@ -130,7 +135,8 @@ def setup_logging(log_file: str, log_level: str) -> None:
 
     try:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_file)
+        fh = RotatingFileHandler(
+            log_file, maxBytes=10 * 1024 * 1024, backupCount=5)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
     except OSError as exc:
@@ -185,6 +191,24 @@ class APIClient:
         for attempt in range(1, retries + 1):
             try:
                 resp = self.session.post(url, json=payload, timeout=timeout)
+                if resp.status_code == 503:
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = int(retry_after)
+                        except ValueError:
+                            delay = 2 ** attempt
+                    else:
+                        delay = min(2 ** attempt, 16)
+                    logger.warning(
+                        "API POST %s returned 503 (attempt %d/%d), "
+                        "retrying in %ds", path, attempt, retries, delay)
+                    if attempt < retries:
+                        time.sleep(delay)
+                        continue
+                    else:
+                        self.retry_queue.append(("POST", path, payload, timeout))
+                        return None
                 resp.raise_for_status()
                 if resp.content:
                     return resp.json()
@@ -198,15 +222,37 @@ class APIClient:
                     self.retry_queue.append(("POST", path, payload, timeout))
         return None
 
-    def _get(self, path: str, timeout: int = 10) -> Optional[dict]:
+    def _get(self, path: str, timeout: int = 10,
+             retries: int = 3) -> Optional[dict]:
         url = f"{self.base}{path}"
-        try:
-            resp = self.session.get(url, timeout=timeout)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as exc:
-            logger.warning("API GET %s failed: %s", path, exc)
-            return None
+        for attempt in range(1, retries + 1):
+            try:
+                resp = self.session.get(url, timeout=timeout)
+                if resp.status_code == 503:
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = int(retry_after)
+                        except ValueError:
+                            delay = 2 ** attempt
+                    else:
+                        delay = min(2 ** attempt, 16)
+                    logger.warning(
+                        "API GET %s returned 503 (attempt %d/%d), "
+                        "retrying in %ds", path, attempt, retries, delay)
+                    if attempt < retries:
+                        time.sleep(delay)
+                        continue
+                    else:
+                        return None
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as exc:
+                logger.warning("API GET %s attempt %d/%d failed: %s",
+                               path, attempt, retries, exc)
+                if attempt < retries:
+                    time.sleep(min(2 ** attempt, 10))
+        return None
 
     def send_metrics(self, data: dict) -> None:
         self._post("/agent/metrics", data, timeout=5)
@@ -481,13 +527,13 @@ class PPSMonitor:
 # ---------------------------------------------------------------------------
 
 class BaselineManager:
-    WINDOW = 300
     _RECALC_EVERY = 10  # recalculate percentiles every N samples
     # Use a low default floor (150 PPS) only before baseline is established.
     # Once baseline is ready, threshold is purely data-driven (p99 * 3).
     _DEFAULT_FLOOR = 150
 
-    def __init__(self):
+    def __init__(self, window: int = 300):
+        self.WINDOW = window
         self.samples: collections.deque = collections.deque(maxlen=self.WINDOW)
         self.avg_pps = 0.0
         self.p95_pps = 0.0
@@ -1485,6 +1531,57 @@ def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
 
 
 # ---------------------------------------------------------------------------
+# Health Check Server
+# ---------------------------------------------------------------------------
+
+class HealthCheckHandler:
+    """Minimal HTTP health endpoint on localhost."""
+
+    def __init__(self, agent, port: int = 9100):
+        self._agent = agent
+        self._port = port
+        self._server = None
+
+    def start(self) -> None:
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+
+        agent_ref = self._agent
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                body = json.dumps({
+                    "status": "ok",
+                    "version": VERSION,
+                    "uptime_seconds": round(time.monotonic() - agent_ref._start_mono, 1),
+                    "interface": agent_ref.monitor.interface,
+                    "current_pps": round(agent_ref.monitor.pps, 1),
+                    "current_bps": round(agent_ref.monitor.bps, 1),
+                    "baseline_ready": agent_ref.baseline.baseline_ready,
+                    "baseline_avg_pps": round(agent_ref.baseline.avg_pps, 1),
+                    "baseline_threshold": round(agent_ref.threshold, 1),
+                    "attack_active": agent_ref.attacking,
+                    "incident_uuid": agent_ref.incident_uuid or None,
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                # Suppress default stderr logging
+                pass
+
+        try:
+            self._server = HTTPServer(("127.0.0.1", self._port), _Handler)
+            logger.info("Health check listening on 127.0.0.1:%d", self._port)
+            self._server.serve_forever()
+        except OSError as exc:
+            logger.warning("Health check server failed to start on port %d: %s",
+                           self._port, exc)
+
+
+# ---------------------------------------------------------------------------
 # Agent Core
 # ---------------------------------------------------------------------------
 
@@ -1494,7 +1591,8 @@ class Agent:
         self.shutdown = threading.Event()
         self.api = APIClient(cfg)
         self.monitor = PPSMonitor(cfg.get("interface", "auto"))
-        self.baseline = BaselineManager()
+        self.baseline = BaselineManager(
+            window=cfg.get("baseline_window", 300))
         self.analyser = TrafficAnalyser()
         self.ioc_matcher = IOCMatcher()
         self.pcap = PcapCapture(cfg, self.monitor.interface,
@@ -1521,6 +1619,7 @@ class Agent:
         self._metrics_interval = 5  # seconds between API POSTs
         self._metrics_buffer: list = []
         self._last_metrics_push: float = 0.0
+        self._start_mono: float = time.monotonic()
 
     @property
     def threshold(self) -> float:
@@ -1546,10 +1645,27 @@ class Agent:
             threading.Thread(target=self._command_poll_loop, daemon=True,
                              name="command-poll"),
         ]
+
+        # PCAP sniffer thread (tracked for watchdog restart)
+        self._sniffer_thread = None
         if self.pcap.enabled:
-            threads.append(threading.Thread(
+            self._sniffer_thread = threading.Thread(
                 target=self.pcap.background_ring, args=(self.shutdown,),
-                daemon=True, name="pcap-ring"))
+                daemon=True, name="pcap-ring")
+            threads.append(self._sniffer_thread)
+
+        # Health check HTTP server
+        health_port = self.cfg.get("health_port", 9100)
+        if health_port:
+            health = HealthCheckHandler(self, port=health_port)
+            threads.append(threading.Thread(
+                target=health.start, daemon=True, name="health-check"))
+
+        # Auto-update thread
+        if self.cfg.get("auto_update", False):
+            threads.append(threading.Thread(
+                target=self._auto_update_loop, daemon=True,
+                name="auto-update"))
 
         for t in threads:
             t.start()
@@ -1563,12 +1679,27 @@ class Agent:
             l7t.start()
 
         logger.info("Entering main monitoring loop")
+        last_watchdog = time.monotonic()
         while not self.shutdown.is_set():
             loop_start = time.monotonic()
             try:
                 self._tick()
             except Exception as exc:
                 logger.error("Tick error: %s", exc)
+
+            # Watchdog: check sniffer thread health every 60s
+            if (self._sniffer_thread is not None
+                    and loop_start - last_watchdog >= 60):
+                last_watchdog = loop_start
+                if not self._sniffer_thread.is_alive():
+                    logger.warning(
+                        "Sniffer thread died, restarting...")
+                    self._sniffer_thread = threading.Thread(
+                        target=self.pcap.background_ring,
+                        args=(self.shutdown,),
+                        daemon=True, name="pcap-ring")
+                    self._sniffer_thread.start()
+
             elapsed = time.monotonic() - loop_start
             sleep_for = max(0, 1.0 - elapsed)
             self.shutdown.wait(sleep_for)
@@ -1810,6 +1941,54 @@ class Agent:
             if time.monotonic() - _last_update_check >= 21600:
                 _last_update_check = time.monotonic()
                 check_for_updates()
+
+    def _auto_update_loop(self) -> None:
+        """Check PyPI for newer version every 6 hours; upgrade if auto_update is on."""
+        while not self.shutdown.is_set():
+            self.shutdown.wait(21600)  # 6 hours
+            if self.shutdown.is_set():
+                break
+            try:
+                import urllib.request
+                url = "https://pypi.org/pypi/ftagent/json"
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": f"ftagent/{VERSION}"})
+                resp = urllib.request.urlopen(req, timeout=15)
+                data = json.loads(resp.read())
+                latest = data.get("info", {}).get("version", "")
+                if not latest:
+                    continue
+
+                def _ver_tuple(v):
+                    parts = []
+                    for p in v.split("."):
+                        try:
+                            parts.append(int(p))
+                        except ValueError:
+                            parts.append(0)
+                    return tuple(parts)
+
+                if _ver_tuple(latest) > _ver_tuple(VERSION):
+                    logger.info(
+                        "Auto-update: newer version %s available (current %s), "
+                        "upgrading...", latest, VERSION)
+                    import subprocess
+                    result = subprocess.run(
+                        [sys.executable, "-m", "pip", "install",
+                         "--upgrade", "ftagent"],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    if result.returncode == 0:
+                        logger.info(
+                            "Auto-update: ftagent upgraded to %s. "
+                            "Restart the agent to use the new version.",
+                            latest)
+                    else:
+                        logger.warning(
+                            "Auto-update: pip upgrade failed: %s",
+                            result.stderr.strip()[:500])
+            except Exception as exc:
+                logger.debug("Auto-update check failed: %s", exc)
 
     def _command_poll_loop(self) -> None:
         """Poll for pending commands (iptables rules).
