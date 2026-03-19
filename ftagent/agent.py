@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1176,7 +1176,8 @@ class L7Monitor:
         # Skip baseline learning if error rate is very high (likely attack traffic
         # arriving during warmup) or RPS is already extreme.
         if not self._attack_active:
-            is_clean = error_rate < 40 and (self._baseline_rps < 5 or rps < self._baseline_rps * 10)
+            is_clean = (error_rate < 60
+                        and (self._baseline_samples < 3 or rps < self._baseline_rps * 10))
             if is_clean:
                 if self._baseline_samples < 300:
                     alpha = 1 / (self._baseline_samples + 1)
@@ -1185,22 +1186,23 @@ class L7Monitor:
                 self._baseline_rps = (1 - alpha) * self._baseline_rps + alpha * rps
                 self._baseline_samples += 1
 
-        # Don't trigger until we have a stable baseline (warmup period)
-        if self._baseline_samples < 10 and not self._attack_active:
-            return None
-
         signals = 0
         reasons = []
+        warmup = self._baseline_samples < 10
 
-        # RPS threshold: use override if set, otherwise auto-calculate
+        # RPS threshold: use override if set, otherwise auto-calculate.
+        # During warmup (no baseline yet), only trigger RPS signal if RPS is
+        # clearly extreme in absolute terms (>500 RPS).
         if self._rps_threshold_override:
             rps_threshold = self._rps_threshold_override
+        elif warmup:
+            rps_threshold = 500  # absolute floor during warmup
         else:
             mult = self._sensitivity_multiplier
             rps_threshold = max(self._baseline_rps * mult, self._min_rps) if self._baseline_rps > 5 else self._min_rps
         if rps > rps_threshold:
             signals += 2
-            reasons.append(f"RPS spike: {rps:.0f} vs baseline {self._baseline_rps:.0f} (threshold {rps_threshold:.0f})")
+            reasons.append(f"RPS spike: {rps:.0f} (threshold {rps_threshold:.0f})")
 
         if stats["top_ips"]:
             top_ip_name, top_ip_count = max(stats["top_ips"].items(), key=lambda x: x[1])
