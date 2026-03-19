@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.4.6"
+VERSION = "1.5.0"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -483,13 +483,16 @@ class PPSMonitor:
 class BaselineManager:
     WINDOW = 300
     _RECALC_EVERY = 10  # recalculate percentiles every N samples
+    # Use a low default floor (150 PPS) only before baseline is established.
+    # Once baseline is ready, threshold is purely data-driven (p99 * 3).
+    _DEFAULT_FLOOR = 150
 
     def __init__(self):
         self.samples: collections.deque = collections.deque(maxlen=self.WINDOW)
         self.avg_pps = 0.0
         self.p95_pps = 0.0
         self.p99_pps = 0.0
-        self.threshold = 1000.0
+        self.threshold = self._DEFAULT_FLOOR
         self.baseline_ready = False
         self._since_recalc = 0
         self._running_sum = 0.0
@@ -513,7 +516,12 @@ class BaselineManager:
             sorted_s = sorted(self.samples)
             self.p95_pps = sorted_s[int(n * 0.95)]
             self.p99_pps = sorted_s[int(n * 0.99)]
-            self.threshold = max(self.p99_pps * 3, 1000.0)
+            # Before baseline is ready, use a low floor so low-traffic nodes
+            # can still detect attacks. Once ready, go purely data-driven.
+            if self.baseline_ready:
+                self.threshold = self.p99_pps * 3
+            else:
+                self.threshold = max(self.p99_pps * 3, self._DEFAULT_FLOOR)
 
         if n >= self.WINDOW:
             self.baseline_ready = True
@@ -1208,11 +1216,15 @@ class L7Monitor:
                 if L7_BOT_UA_PATTERNS.search(ua):
                     bot_request_count += 1
 
-            # Threat pattern detection on path + query
+            # Threat pattern detection on path + query.
+            # Fast-path: skip regex if path is short and has no suspicious chars.
+            # This avoids 12 regex matches on clean paths like "/", "/index.html".
             full_path = path
-            for pattern_name, pattern_re in L7_THREAT_PATTERNS.items():
-                if pattern_re.search(full_path):
-                    threat_hits[pattern_name] = threat_hits.get(pattern_name, 0) + 1
+            _lp = full_path.lower()
+            if len(full_path) > 6 or "'" in _lp or "." in _lp or "$" in _lp or "<" in _lp or "(" in _lp or "/" in _lp[1:]:
+                for pattern_name, pattern_re in L7_THREAT_PATTERNS.items():
+                    if pattern_re.search(full_path):
+                        threat_hits[pattern_name] = threat_hits.get(pattern_name, 0) + 1
 
             if resp_time is not None:
                 resp_times.append(resp_time)
@@ -1272,15 +1284,22 @@ class L7Monitor:
         signals = 0
         reasons = []
         warmup = self._baseline_samples < 10
+        baseline_ready = self._baseline_samples >= 30
 
         # RPS threshold: use override if set, otherwise auto-calculate.
-        # During warmup (no baseline yet), only trigger RPS signal if RPS is
-        # clearly extreme in absolute terms (>500 RPS).
+        # During warmup (< 10 samples), use a high floor to avoid false positives.
+        # Once baseline is established (>= 30 samples), go purely data-driven.
         if self._rps_threshold_override:
             rps_threshold = self._rps_threshold_override
         elif warmup:
-            rps_threshold = 500  # absolute floor during warmup
+            # Not enough data yet -- use high absolute floor
+            rps_threshold = 500
+        elif baseline_ready:
+            # Baseline established -- purely data-driven, no minimum floor
+            mult = self._sensitivity_multiplier
+            rps_threshold = self._baseline_rps * mult if self._baseline_rps > 1 else 100
         else:
+            # Partial baseline -- use data but keep a modest floor
             mult = self._sensitivity_multiplier
             rps_threshold = max(self._baseline_rps * mult, self._min_rps) if self._baseline_rps > 5 else self._min_rps
         if rps > rps_threshold:
@@ -1640,8 +1659,21 @@ class Agent:
         # Flush buffered metrics immediately so dashboard sees the spike
         self._flush_metrics()
 
+        # Estimate syn_ratio from ring buffer for better initial classification.
+        # Without this, TCP-dominant attacks open as "unknown" until _end_attack.
+        _syn_est = 0.0
+        if SCAPY_AVAILABLE and self.pcap.ring_buffer:
+            _syn_c = _ack_c = 0
+            for _rpkt in self.pcap.ring_buffer:
+                if _rpkt.haslayer(TCP):
+                    _f = _rpkt[TCP].flags
+                    if _f & 0x02: _syn_c += 1
+                    if _f & 0x10: _ack_c += 1
+            if _syn_c + _ack_c > 0:
+                _syn_est = _syn_c / (_syn_c + _ack_c)
+
         family = classify_attack(self.monitor.tcp_pct, self.monitor.udp_pct,
-                                 self.monitor.icmp_pct)
+                                 self.monitor.icmp_pct, syn_ratio=_syn_est)
         started_at = datetime.now(timezone.utc).isoformat()
 
         logger.warning("ATTACK DETECTED — PPS=%.0f threshold=%.0f family=%s",
@@ -1653,6 +1685,7 @@ class Agent:
             "peak_bps": round(self.peak_bps, 1),
             "started_at": started_at,
             "attack_family": family,
+            "baseline_pps": round(self.baseline.avg_pps, 1),
             "duration": 0,
         })
 
