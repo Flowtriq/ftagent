@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.4.3"
+VERSION = "1.4.5"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -530,7 +530,8 @@ class TrafficAnalyser:
     def reset(self) -> None:
         self.tcp_flags = {"SYN": 0, "ACK": 0, "RST": 0, "FIN": 0,
                           "PSH": 0, "URG": 0}
-        self.src_ips: dict = {}
+        self.src_ips: dict = {}        # ip -> count
+        self.src_ip_detail: dict = {}  # ip -> {tcp, udp, icmp, syn, ack, bytes, ttls}
         self.dst_ports: dict = {}
         self.pkt_lengths: list = []
         self.ttl_values: list = []
@@ -551,14 +552,27 @@ class TrafficAnalyser:
             self.pkt_lengths.append(len(pkt))
             self.ttl_values.append(ip.ttl)
 
+            # Per-IP detail tracking for confidence scoring
+            if src not in self.src_ip_detail:
+                self.src_ip_detail[src] = {
+                    "tcp": 0, "udp": 0, "icmp": 0,
+                    "syn": 0, "ack": 0, "bytes": 0, "ttls": set()
+                }
+            d = self.src_ip_detail[src]
+            d["bytes"] += len(pkt)
+            d["ttls"].add(ip.ttl)
+
             if pkt.haslayer(TCP):
                 tcp = pkt[TCP]
                 self.dst_ports[tcp.dport] = self.dst_ports.get(tcp.dport, 0) + 1
+                d["tcp"] += 1
                 flags = tcp.flags
                 if flags & 0x02:
                     self.tcp_flags["SYN"] += 1
+                    d["syn"] += 1
                 if flags & 0x10:
                     self.tcp_flags["ACK"] += 1
+                    d["ack"] += 1
                 if flags & 0x04:
                     self.tcp_flags["RST"] += 1
                 if flags & 0x01:
@@ -571,6 +585,10 @@ class TrafficAnalyser:
             elif pkt.haslayer(UDP):
                 self.dst_ports[pkt[UDP].dport] = (
                     self.dst_ports.get(pkt[UDP].dport, 0) + 1)
+                d["udp"] += 1
+
+            elif pkt.haslayer(ICMP):
+                d["icmp"] += 1
 
             if pkt.haslayer(DNS) and pkt[DNS].qr == 0:
                 try:
@@ -616,9 +634,48 @@ class TrafficAnalyser:
         return len(self.src_ips) > 300
 
     def top_src_ips(self, n: int = 20) -> list:
-        return [{"ip": ip, "count": c}
-                for ip, c in sorted(self.src_ips.items(),
-                                    key=lambda x: x[1], reverse=True)[:n]]
+        total = self.total_packets or 1
+        result = []
+        for ip, c in sorted(self.src_ips.items(),
+                             key=lambda x: x[1], reverse=True)[:n]:
+            entry = {"ip": ip, "count": c}
+            d = self.src_ip_detail.get(ip)
+            if d:
+                pct = c / total
+                # Confidence scoring: higher = more likely attacker
+                conf = 0
+                # High packet contribution = likely attacker
+                if pct > 0.05: conf += 30
+                elif pct > 0.02: conf += 15
+                # SYN-only (no ACK) = likely SYN flood source
+                if d["tcp"] > 0 and d["ack"] == 0 and d["syn"] > 0:
+                    conf += 25
+                # Single TTL = likely spoofed
+                if len(d["ttls"]) <= 1 and c > 50:
+                    conf += 20
+                # Pure single-protocol = more suspicious
+                protos_used = (1 if d["tcp"] > 0 else 0) + \
+                              (1 if d["udp"] > 0 else 0) + \
+                              (1 if d["icmp"] > 0 else 0)
+                if protos_used == 1 and c > 100:
+                    conf += 10
+                # Very high packet count (>500 in capture window)
+                if c > 500: conf += 15
+                elif c > 200: conf += 5
+                # Low byte/pkt ratio for UDP = amplification
+                avg_pkt = d["bytes"] / max(c, 1)
+                if d["udp"] > d["tcp"] and avg_pkt < 100 and c > 100:
+                    conf += 10
+
+                conf = min(conf, 100)
+                entry["confidence"] = conf
+                entry["tcp"] = d["tcp"]
+                entry["udp"] = d["udp"]
+                entry["icmp"] = d["icmp"]
+                entry["ttl_unique"] = len(d["ttls"])
+                entry["pct"] = round(pct * 100, 2)
+            result.append(entry)
+        return result
 
     def top_dst_ports(self, n: int = 20) -> list:
         return [{"port": p, "count": c}
