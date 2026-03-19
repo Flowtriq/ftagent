@@ -1673,6 +1673,11 @@ class Agent:
             "pps": round(self.peak_pps, 1),
         })
 
+        # Immediately fetch config to pick up any mitigation commands
+        # queued by the server in response to the incident we just opened
+        threading.Thread(target=self._fetch_config, daemon=True,
+                         name="attack-config-fetch").start()
+
     def _update_attack(self) -> None:
         self.last_update = time.monotonic()
         elapsed = time.time() - self.attack_start
@@ -1774,9 +1779,11 @@ class Agent:
                 check_for_updates()
 
     def _command_poll_loop(self) -> None:
-        """Poll for pending commands (iptables rules) every 5 minutes."""
+        """Poll for pending commands (iptables rules).
+        Normal: every 5 minutes. During attack: every 10 seconds for fast mitigation."""
         while not self.shutdown.is_set():
-            self.shutdown.wait(300)  # 5 minutes
+            interval = 10 if self.attacking else 300
+            self.shutdown.wait(interval)
             if self.shutdown.is_set():
                 break
             try:
