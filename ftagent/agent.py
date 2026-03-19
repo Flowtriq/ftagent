@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1163,24 +1163,30 @@ class L7Monitor:
         rps = stats["rps"]
         total = stats["total_requests"]
         unique_ips = stats.get("unique_ips", 0)
+        error_rate = stats.get("error_rate", 0)
 
         # Need enough requests in the window to make a judgement
-        if total < 30:
+        if total < 15:
             if self._attack_active:
                 self._accumulate_attack_stats(stats)
                 return self._check_attack_end(stats)
             return None
 
+        # Update baseline only when NOT under attack and traffic looks clean.
+        # Skip baseline learning if error rate is very high (likely attack traffic
+        # arriving during warmup) or RPS is already extreme.
         if not self._attack_active:
-            if self._baseline_samples < 300:
-                alpha = 1 / (self._baseline_samples + 1)
-            else:
-                alpha = 0.01
-            self._baseline_rps = (1 - alpha) * self._baseline_rps + alpha * rps
-            self._baseline_samples += 1
+            is_clean = error_rate < 40 and (self._baseline_rps < 5 or rps < self._baseline_rps * 10)
+            if is_clean:
+                if self._baseline_samples < 300:
+                    alpha = 1 / (self._baseline_samples + 1)
+                else:
+                    alpha = 0.01
+                self._baseline_rps = (1 - alpha) * self._baseline_rps + alpha * rps
+                self._baseline_samples += 1
 
         # Don't trigger until we have a stable baseline (warmup period)
-        if self._baseline_samples < 30 and not self._attack_active:
+        if self._baseline_samples < 10 and not self._attack_active:
             return None
 
         signals = 0
@@ -1299,19 +1305,36 @@ class L7Monitor:
 
     def _check_attack_end(self, stats: dict) -> Optional[dict]:
         rps = stats["rps"]
-        rps_threshold = max(self._baseline_rps * 3, 75) if self._baseline_rps > 5 else 75
+        total = stats.get("total_requests", 0)
+        error_rate = stats.get("error_rate", 0)
         elapsed = time.time() - self._attack_start
 
-        # Minimum 30s before allowing resolve to prevent rapid open/close flapping
-        if elapsed < 30:
+        # Minimum 15s before allowing resolve to prevent rapid open/close flapping
+        if elapsed < 15:
             return {"type": "l7_flood_update", "rps": rps, "peak_rps": self._attack_peak_rps, "stats": stats}
 
-        # Require RPS to stay below threshold for 3 consecutive checks before resolving
-        if rps < rps_threshold:
+        # Resolve when traffic has clearly calmed down. Check multiple conditions:
+        # 1. RPS dropped to low absolute level (under 50 RPS)
+        # 2. OR error rate normalized AND RPS dropped significantly from peak
+        # 3. OR very few requests in the window (traffic stopped)
+        should_resolve = False
+        if total < 10:
+            should_resolve = True
+        elif rps < 50:
+            should_resolve = True
+        elif rps < self._attack_peak_rps * 0.1 and error_rate < 30:
+            should_resolve = True
+        elif self._baseline_rps > 5 and rps < self._baseline_rps * 2 and error_rate < 30:
+            should_resolve = True
+
+        if should_resolve:
             self._below_count = getattr(self, '_below_count', 0) + 1
             if self._below_count >= 3:
                 self._attack_active = False
                 self._below_count = 0
+                # Reset baseline so it relearns from clean traffic
+                self._baseline_rps = max(rps, 1.0)
+                self._baseline_samples = 1
                 summary = self.get_attack_summary()
                 subtype = _classify_l7_subtype(stats)
                 return {
