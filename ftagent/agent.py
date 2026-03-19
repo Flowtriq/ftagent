@@ -333,6 +333,8 @@ class PPSMonitor:
         self.udp_pct = 0.0
         self.icmp_pct = 0.0
         self.conn_count = 0
+        self._conn_count_interval = 15  # seconds between /proc/net/tcp reads
+        self._last_conn_read = 0.0
         logger.info("Monitoring interface: %s", self.interface)
 
     @staticmethod
@@ -409,7 +411,11 @@ class PPSMonitor:
             self.udp_pct = round(d_udp / total_proto * 100, 1)
             self.icmp_pct = round(d_icmp / total_proto * 100, 1)
 
-        self.conn_count = self._read_conn_count()
+        # /proc/net/tcp is expensive (kernel serializes full socket table).
+        # Read every 15s instead of every tick — not needed for detection.
+        if now - self._last_conn_read >= self._conn_count_interval:
+            self.conn_count = self._read_conn_count()
+            self._last_conn_read = now
 
         self.prev_rx_packets = rx_packets
         self.prev_rx_bytes = rx_bytes
@@ -476,6 +482,7 @@ class PPSMonitor:
 
 class BaselineManager:
     WINDOW = 300
+    _RECALC_EVERY = 10  # recalculate percentiles every N samples
 
     def __init__(self):
         self.samples: collections.deque = collections.deque(maxlen=self.WINDOW)
@@ -484,17 +491,30 @@ class BaselineManager:
         self.p99_pps = 0.0
         self.threshold = 1000.0
         self.baseline_ready = False
+        self._since_recalc = 0
+        self._running_sum = 0.0
 
     def add(self, pps: float) -> None:
+        # Track evicted sample for running sum
+        if len(self.samples) == self.samples.maxlen:
+            self._running_sum -= self.samples[0]
         self.samples.append(pps)
+        self._running_sum += pps
         n = len(self.samples)
         if n < 2:
             return
-        sorted_s = sorted(self.samples)
-        self.avg_pps = sum(sorted_s) / n
-        self.p95_pps = sorted_s[int(n * 0.95)]
-        self.p99_pps = sorted_s[int(n * 0.99)]
-        self.threshold = max(self.p99_pps * 3, 1000.0)
+
+        self.avg_pps = self._running_sum / n
+        self._since_recalc += 1
+
+        # Full percentile sort only every N ticks (expensive O(n log n))
+        if self._since_recalc >= self._RECALC_EVERY:
+            self._since_recalc = 0
+            sorted_s = sorted(self.samples)
+            self.p95_pps = sorted_s[int(n * 0.95)]
+            self.p99_pps = sorted_s[int(n * 0.99)]
+            self.threshold = max(self.p99_pps * 3, 1000.0)
+
         if n >= self.WINDOW:
             self.baseline_ready = True
 
@@ -685,6 +705,8 @@ class PcapCapture:
         self.max_capture = 10000
         self._thread = None
         self._stop_event = threading.Event()
+        self._pkt_counter = 0
+        self._analyse_every = 10  # deep-analyse every Nth packet during capture
 
     def background_ring(self, shutdown: threading.Event) -> None:
         if not self.enabled:
@@ -700,7 +722,11 @@ class PcapCapture:
         self.ring_buffer.append(pkt)
         if self.capturing and len(self.capture_packets) < self.max_capture:
             self.capture_packets.append(pkt)
-            self.analyser.process_packet(pkt, self.ioc_matcher)
+            # Deep analysis (protocol parsing + IOC matching) is expensive.
+            # Sample every Nth packet to keep CPU bounded at high PPS.
+            self._pkt_counter += 1
+            if self._pkt_counter % self._analyse_every == 0:
+                self.analyser.process_packet(pkt, self.ioc_matcher)
 
     def start_capture(self, incident_uuid: str = "",
                        api_client=None) -> None:
@@ -1415,6 +1441,11 @@ class Agent:
         self.last_update: float = 0.0
         self.server_threshold: float | None = None
 
+        # Metrics batching: buffer locally, POST every N seconds
+        self._metrics_interval = 5  # seconds between API POSTs
+        self._metrics_buffer: list = []
+        self._last_metrics_push: float = 0.0
+
     @property
     def threshold(self) -> float:
         if self.server_threshold is not None:
@@ -1483,7 +1514,9 @@ class Agent:
         if not self.attacking:
             self.baseline.add(pps)
 
-        self.api.send_metrics({
+        # Buffer metrics locally, flush every _metrics_interval seconds.
+        # Detection still runs every 1s tick — only the API POST is batched.
+        self._metrics_buffer.append({
             "pps": round(pps, 1),
             "bps": round(bps, 1),
             "tcp_pct": self.monitor.tcp_pct,
@@ -1492,6 +1525,10 @@ class Agent:
             "conn_count": self.monitor.conn_count,
             "threshold": round(self.threshold, 1),
         })
+        now = time.monotonic()
+        if now - self._last_metrics_push >= self._metrics_interval:
+            self._last_metrics_push = now
+            self._flush_metrics()
 
         if not self.attacking:
             if pps > self.threshold:
@@ -1512,6 +1549,27 @@ class Agent:
             elif time.monotonic() - self.last_update >= 5:
                 self._update_attack()
 
+    def _flush_metrics(self) -> None:
+        """Aggregate buffered metrics and send a single API POST."""
+        buf = self._metrics_buffer
+        if not buf:
+            return
+        n = len(buf)
+        # Send the latest snapshot with peak values from the buffer window
+        agg = {
+            "pps":       round(max(m["pps"] for m in buf), 1),
+            "bps":       round(max(m["bps"] for m in buf), 1),
+            "tcp_pct":   buf[-1]["tcp_pct"],
+            "udp_pct":   buf[-1]["udp_pct"],
+            "icmp_pct":  buf[-1]["icmp_pct"],
+            "conn_count": buf[-1]["conn_count"],
+            "threshold": buf[-1]["threshold"],
+            "avg_pps":   round(sum(m["pps"] for m in buf) / n, 1),
+            "samples":   n,
+        }
+        self._metrics_buffer = []
+        self.api.send_metrics(agg)
+
     def _begin_attack(self) -> None:
         self.attacking = True
         self.attack_start = time.time()
@@ -1521,6 +1579,9 @@ class Agent:
         self.velocity_curve = []
         self.analyser.reset()
         self.last_update = time.monotonic()
+
+        # Flush buffered metrics immediately so dashboard sees the spike
+        self._flush_metrics()
 
         family = classify_attack(self.monitor.tcp_pct, self.monitor.udp_pct,
                                  self.monitor.icmp_pct)
