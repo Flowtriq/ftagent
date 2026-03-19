@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -954,8 +954,10 @@ class L7Monitor:
     def check_attack(self, stats: dict) -> Optional[dict]:
         rps = stats["rps"]
         total = stats["total_requests"]
+        unique_ips = stats.get("unique_ips", 0)
 
-        if total < 10:
+        # Need enough requests in the window to make a judgement
+        if total < 30:
             if self._attack_active:
                 return self._check_attack_end(stats)
             return None
@@ -968,10 +970,14 @@ class L7Monitor:
             self._baseline_rps = (1 - alpha) * self._baseline_rps + alpha * rps
             self._baseline_samples += 1
 
+        # Don't trigger until we have a stable baseline (warmup period)
+        if self._baseline_samples < 30 and not self._attack_active:
+            return None
+
         signals = 0
         reasons = []
 
-        rps_threshold = max(self._baseline_rps * 5, 100) if self._baseline_rps > 5 else 100
+        rps_threshold = max(self._baseline_rps * 5, 150) if self._baseline_rps > 5 else 150
         if rps > rps_threshold:
             signals += 2
             reasons.append(f"RPS spike: {rps:.0f} vs baseline {self._baseline_rps:.0f}")
@@ -994,7 +1000,8 @@ class L7Monitor:
             signals += 1
             reasons.append(f"Error rate: {stats['error_rate']:.0f}%")
 
-        if signals >= 2 and not self._attack_active:
+        # Need at least 2 signals AND multiple source IPs (single IP = scanner, not flood)
+        if signals >= 2 and unique_ips >= 3 and not self._attack_active:
             self._attack_active = True
             self._attack_start = time.time()
             self._attack_peak_rps = rps
@@ -1016,7 +1023,7 @@ class L7Monitor:
 
     def _check_attack_end(self, stats: dict) -> Optional[dict]:
         rps = stats["rps"]
-        rps_threshold = max(self._baseline_rps * 3, 50) if self._baseline_rps > 5 else 50
+        rps_threshold = max(self._baseline_rps * 3, 75) if self._baseline_rps > 5 else 75
         elapsed = time.time() - self._attack_start
 
         # Minimum 30s before allowing resolve to prevent rapid open/close flapping
