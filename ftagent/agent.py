@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1882,8 +1882,11 @@ class Agent:
                        subtype, duration, peak_rps)
 
         # Stop PCAP capture
-        if self.pcap.capturing:
-            self.pcap.stop_capture()
+        try:
+            if self.pcap.capturing:
+                self.pcap.stop_capture(self.l7_incident_uuid)
+        except Exception as exc:
+            logger.error("L7: PCAP stop error: %s", exc)
 
         stats = info.get("stats", {})
         summary = info.get("attack_summary", {})
