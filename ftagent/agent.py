@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.6.5"
+VERSION = "1.6.6"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -735,6 +735,28 @@ class TrafficAnalyser:
         return [{"port": p, "count": c}
                 for p, c in sorted(self.dst_ports.items(),
                                    key=lambda x: x[1], reverse=True)[:n]]
+
+    def protocol_breakdown(self) -> dict:
+        """Compute protocol percentages from actual packet inspection (scapy).
+        This is authoritative — unlike /proc/net/snmp which misses dropped packets."""
+        tcp_total = udp_total = icmp_total = 0
+        for d in self.src_ip_detail.values():
+            tcp_total += d["tcp"]
+            udp_total += d["udp"]
+            icmp_total += d["icmp"]
+        grand = tcp_total + udp_total + icmp_total
+        if grand == 0:
+            return {"tcp": 0, "udp": 0, "icmp": 0}
+        return {
+            "tcp": round(tcp_total / grand * 100, 1),
+            "udp": round(udp_total / grand * 100, 1),
+            "icmp": round(icmp_total / grand * 100, 1),
+        }
+
+    def syn_ratio(self) -> float:
+        """SYN ratio from captured TCP flags."""
+        total = sum(self.tcp_flags.values())
+        return (self.tcp_flags["SYN"] / total) if total > 0 else 0.0
 
     def pkt_length_histogram(self) -> dict:
         buckets = {"0-64": 0, "65-128": 0, "129-256": 0, "257-512": 0,
@@ -1630,6 +1652,22 @@ class Agent:
             return self.server_threshold
         return self.baseline.threshold
 
+    def _proto_breakdown(self) -> dict:
+        """Protocol breakdown from scapy packet inspection when available,
+        falling back to /proc/net/snmp.  Scapy sees ALL packets including
+        those dropped before the kernel protocol handler, so it's the
+        ground truth for flood classification."""
+        scapy_proto = self.analyser.protocol_breakdown()
+        # Use scapy data if it has meaningful packet counts
+        if sum(scapy_proto.values()) > 0:
+            return scapy_proto
+        # Fallback to SNMP (only reliable for non-flood traffic)
+        return {
+            "tcp": self.monitor.tcp_pct,
+            "udp": self.monitor.udp_pct,
+            "icmp": self.monitor.icmp_pct,
+        }
+
     def run(self) -> None:
         logger.info("Flowtriq Agent %s starting on %s",
                     VERSION, self.monitor.interface)
@@ -1799,27 +1837,43 @@ class Agent:
         # Flush buffered metrics immediately so dashboard sees the spike
         self._flush_metrics()
 
-        # Estimate syn_ratio from ring buffer for better initial classification.
-        # Without this, TCP-dominant attacks open as "unknown" until _end_attack.
+        # Estimate protocol breakdown + SYN ratio from ring buffer for accurate
+        # initial classification.  /proc/net/snmp misses dropped flood packets,
+        # so we inspect the actual captured packets from scapy's ring buffer.
         _syn_est = 0.0
+        _ring_tcp = _ring_udp = _ring_icmp = 0
         if SCAPY_AVAILABLE and self.pcap.ring_buffer:
             try:
-                # Snapshot the deque to a list to avoid RuntimeError if the
-                # sniffer thread appends during iteration (deque mutation).
                 _ring_snapshot = list(self.pcap.ring_buffer)
             except RuntimeError:
                 _ring_snapshot = []
             _syn_c = _ack_c = 0
             for _rpkt in _ring_snapshot:
                 if _rpkt.haslayer(TCP):
+                    _ring_tcp += 1
                     _f = _rpkt[TCP].flags
                     if _f & 0x02: _syn_c += 1
                     if _f & 0x10: _ack_c += 1
+                elif _rpkt.haslayer(UDP):
+                    _ring_udp += 1
+                elif _rpkt.haslayer(ICMP):
+                    _ring_icmp += 1
             if _syn_c + _ack_c > 0:
                 _syn_est = _syn_c / (_syn_c + _ack_c)
 
-        family = classify_attack(self.monitor.tcp_pct, self.monitor.udp_pct,
-                                 self.monitor.icmp_pct, syn_ratio=_syn_est)
+        # Use ring buffer protocol data if available, fall back to SNMP
+        _ring_total = _ring_tcp + _ring_udp + _ring_icmp
+        if _ring_total > 10:
+            _init_tcp = round(_ring_tcp / _ring_total * 100, 1)
+            _init_udp = round(_ring_udp / _ring_total * 100, 1)
+            _init_icmp = round(_ring_icmp / _ring_total * 100, 1)
+        else:
+            _init_tcp = self.monitor.tcp_pct
+            _init_udp = self.monitor.udp_pct
+            _init_icmp = self.monitor.icmp_pct
+
+        family = classify_attack(_init_tcp, _init_udp, _init_icmp,
+                                 syn_ratio=_syn_est)
         started_at = datetime.now(timezone.utc).isoformat()
 
         logger.warning("ATTACK DETECTED — PPS=%.0f threshold=%.0f family=%s",
@@ -1868,18 +1922,14 @@ class Agent:
             "pps": round(self.monitor.pps, 1),
         })
 
-        family = classify_attack(self.monitor.tcp_pct, self.monitor.udp_pct,
-                                 self.monitor.icmp_pct)
+        proto = self._proto_breakdown()
+        family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"])
 
         self.api.update_incident(self.incident_uuid, {
             "peak_pps": round(self.peak_pps, 1),
             "peak_bps": round(self.peak_bps, 1),
             "attack_family": family,
-            "protocol_breakdown": {
-                "tcp": self.monitor.tcp_pct,
-                "udp": self.monitor.udp_pct,
-                "icmp": self.monitor.icmp_pct,
-            },
+            "protocol_breakdown": proto,
             "source_ip_count": len(self.analyser.src_ips),
             "total_packets": self.analyser.total_packets,
             "top_src_ips": self.analyser.top_src_ips(),
@@ -1891,12 +1941,10 @@ class Agent:
 
     def _end_attack(self) -> None:
         duration = time.time() - self.attack_start
-        syn_total = sum(self.analyser.tcp_flags.values())
-        syn_ratio = (self.analyser.tcp_flags["SYN"] / max(syn_total, 1))
+        proto = self._proto_breakdown()
         family = classify_attack(
-            self.monitor.tcp_pct, self.monitor.udp_pct,
-            self.monitor.icmp_pct,
-            syn_ratio=syn_ratio,
+            proto["tcp"], proto["udp"], proto["icmp"],
+            syn_ratio=self.analyser.syn_ratio(),
             dns_detected=bool(self.analyser.dns_queries),
         )
 
@@ -1913,18 +1961,14 @@ class Agent:
             "peak_pps": round(self.peak_pps, 1),
             "peak_bps": round(self.peak_bps, 1),
             "attack_family": family,
-            "protocol_breakdown": {
-                "tcp": self.monitor.tcp_pct,
-                "udp": self.monitor.udp_pct,
-                "icmp": self.monitor.icmp_pct,
-            },
+            "protocol_breakdown": proto,
             "ioc_hits": list(set(self.analyser.ioc_hits)),
             "spoofing_detected": self.analyser.spoofing_detected(),
             "botnet_detected": self.analyser.botnet_detected(),
             "total_packets": self.analyser.total_packets,
             "source_ip_count": len(self.analyser.src_ips),
             "src_ip_entropy": self.analyser.src_ip_entropy(),
-            "tcp_flag_breakdown": self.analyser.tcp_flags,
+            "tcp_flag_breakdown": dict(self.analyser.tcp_flags),
             "dns_query_stats": self.analyser.dns_query_stats(),
             "pkt_length_histogram": self.analyser.pkt_length_histogram(),
             "ttl_distribution": self.analyser.ttl_distribution(),
@@ -2202,12 +2246,8 @@ class Agent:
                 incident_uuid=self.l7_incident_uuid,
                 api_client=self.api)
 
-        # Use real protocol data from L3/L4 monitor instead of hardcoding
-        real_proto = {
-            "tcp": self.monitor.tcp_pct,
-            "udp": self.monitor.udp_pct,
-            "icmp": self.monitor.icmp_pct,
-        }
+        # Use real protocol data from scapy/SNMP instead of hardcoding
+        real_proto = self._proto_breakdown()
         self.api.update_incident(self.l7_incident_uuid, {
             "attack_family": "http_flood",
             "attack_subtype": subtype,
@@ -2251,11 +2291,7 @@ class Agent:
             "top_src_ips": [{"ip": ip, "count": cnt}
                            for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
             "top_dst_ports": stats.get("top_paths", {}),
-            "protocol_breakdown": {
-                "tcp": self.monitor.tcp_pct,
-                "udp": self.monitor.udp_pct,
-                "icmp": self.monitor.icmp_pct,
-            },
+            "protocol_breakdown": self._proto_breakdown(),
             "botnet_detected": bot_pct > 70,
             "l7_error_rate": stats.get("error_rate", 0),
             "l7_status_codes": stats.get("status_codes", {}),
@@ -2296,11 +2332,7 @@ class Agent:
             "baseline_rps": round(baseline_rps, 1),
             "attack_family": "http_flood",
             "attack_subtype": subtype,
-            "protocol_breakdown": {
-                "tcp": self.monitor.tcp_pct,
-                "udp": self.monitor.udp_pct,
-                "icmp": self.monitor.icmp_pct,
-            },
+            "protocol_breakdown": self._proto_breakdown(),
             "source_ip_count": stats.get("unique_ips", 0),
             "total_packets": summary.get("total_requests", stats.get("total_requests", 0)),
             "botnet_detected": bot_pct > 70,
