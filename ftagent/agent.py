@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -923,45 +923,82 @@ class PcapCapture:
         Full-fidelity capture of every packet at any PPS."""
         import subprocess
         ring_dir = os.path.join(self.pcap_dir, "_ring")
-        os.makedirs(ring_dir, mode=0o755, exist_ok=True)
-        # Ensure the directory is writable
-        os.chmod(ring_dir, 0o755)
+        os.makedirs(ring_dir, mode=0o777, exist_ok=True)
+        os.chmod(ring_dir, 0o777)  # writable by any user (tcpdump may drop privs)
         self._ring_dir = ring_dir
 
         ring_file = os.path.join(ring_dir, "ring_%Y%m%d_%H%M%S.pcap")
         tcpdump_cmd = [
             "tcpdump", "-i", self.iface, "-w", ring_file,
-            "-G", "30",         # rotate every 30 seconds
-            "-W", "3",          # keep 3 files max (ring)
-            "-s", "0",          # full packet capture
-            "-Z", "root",       # stay as root (don't drop to tcpdump user)
-            "-q",               # quiet
+            "-G", "30", "-W", "3", "-s", "0", "-q",
         ]
 
         logger.info("PCAP ring buffer active on %s (tcpdump mode)", self.iface)
         try:
             import subprocess
-            # Run tcpdump without dropping privileges
-            env = os.environ.copy()
-            env["HOME"] = "/root"
+
+            # Auto-install tcpdump if not present
+            if subprocess.run(["which", "tcpdump"], capture_output=True).returncode != 0:
+                logger.info("tcpdump not found, attempting to install...")
+                installed = False
+                for pm_cmd in [
+                    ["apt-get", "install", "-y", "tcpdump"],
+                    ["yum", "install", "-y", "tcpdump"],
+                    ["dnf", "install", "-y", "tcpdump"],
+                    ["apk", "add", "tcpdump"],
+                    ["pacman", "-S", "--noconfirm", "tcpdump"],
+                ]:
+                    try:
+                        r = subprocess.run(pm_cmd, capture_output=True, timeout=60)
+                        if r.returncode == 0:
+                            logger.info("tcpdump installed via %s", pm_cmd[0])
+                            installed = True
+                            break
+                    except (FileNotFoundError, subprocess.TimeoutExpired):
+                        continue
+                if not installed:
+                    logger.warning("Could not install tcpdump, falling back to scapy")
+                    self._background_ring_scapy(shutdown)
+                    return
+
+            # Also ensure mergecap is available (for merging ring files on capture stop)
+            if subprocess.run(["which", "mergecap"], capture_output=True).returncode != 0:
+                for pm_cmd in [
+                    ["apt-get", "install", "-y", "wireshark-common"],
+                    ["yum", "install", "-y", "wireshark-cli"],
+                    ["dnf", "install", "-y", "wireshark-cli"],
+                ]:
+                    try:
+                        r = subprocess.run(pm_cmd, capture_output=True, timeout=120)
+                        if r.returncode == 0:
+                            logger.info("mergecap installed via %s", pm_cmd[0])
+                            break
+                    except (FileNotFoundError, subprocess.TimeoutExpired):
+                        continue
+
             self._tcpdump_proc = subprocess.Popen(
                 tcpdump_cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                env=env,
             )
+            _restarts = 0
             while not shutdown.is_set():
                 shutdown.wait(1)
                 if self._tcpdump_proc.poll() is not None:
                     stderr = self._tcpdump_proc.stderr.read().decode(errors="replace")
                     logger.warning("tcpdump exited (code %d): %s",
                                    self._tcpdump_proc.returncode, stderr[:200])
+                    _restarts += 1
+                    if _restarts > 5:
+                        logger.error("tcpdump crashed %d times, falling back to scapy", _restarts)
+                        self._background_ring_scapy(shutdown)
+                        return
                     shutdown.wait(5)
                     if not shutdown.is_set():
-                        logger.info("Restarting tcpdump...")
+                        logger.info("Restarting tcpdump (attempt %d)...", _restarts)
                         self._tcpdump_proc = subprocess.Popen(
                             tcpdump_cmd, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE, env=env)
+                            stderr=subprocess.PIPE)
 
             self._tcpdump_proc.terminate()
             try:
