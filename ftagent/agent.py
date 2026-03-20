@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.6.7"
+VERSION = "1.6.8"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -2368,22 +2368,29 @@ class Agent:
         self.l7_velocity_curve = curve
 
         bot_pct = stats.get("bot_request_pct", 0)
+        # Use accumulated attack-wide data for IPs, paths, UAs, status codes
+        # so dashboard shows running totals, not just the last 10-second window
+        accum = self.l7.get_attack_summary() if self.l7 else {}
+        accum_ips = accum.get("top_ips", stats.get("top_ips", {}))
+        accum_paths = accum.get("top_paths", stats.get("top_paths", {}))
+        accum_total = accum.get("total_requests", stats.get("total_requests", 0))
+
         self.api.update_incident(self.l7_incident_uuid, {
             "attack_family": "http_flood",
             "attack_subtype": subtype,
             "rps": round(rps),
             "baseline_rps": round(getattr(self, 'l7_baseline_rps', 0), 1),
-            "source_ip_count": stats.get("unique_ips", 0),
-            "total_packets": stats.get("total_requests", 0),
+            "source_ip_count": len(accum_ips),
+            "total_packets": accum_total,
             "top_src_ips": [{"ip": ip, "count": cnt}
-                           for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
-            "top_dst_ports": stats.get("top_paths", {}),
+                           for ip, cnt in list(accum_ips.items())[:50]],
+            "top_dst_ports": accum_paths,
             "protocol_breakdown": self._proto_breakdown(),
             "botnet_detected": bot_pct > 70,
             "l7_error_rate": stats.get("error_rate", 0),
-            "l7_status_codes": stats.get("status_codes", {}),
-            "l7_top_user_agents": stats.get("top_user_agents", {}),
-            "l7_threat_patterns": stats.get("threat_patterns", {}),
+            "l7_status_codes": accum.get("status_codes", stats.get("status_codes", {})),
+            "l7_top_user_agents": accum.get("top_user_agents", stats.get("top_user_agents", {})),
+            "l7_threat_patterns": accum.get("threat_patterns", stats.get("threat_patterns", {})),
         })
 
     def _l7_end_attack(self, info: dict) -> None:
@@ -2420,15 +2427,16 @@ class Agent:
             "attack_family": "http_flood",
             "attack_subtype": subtype,
             "protocol_breakdown": self._proto_breakdown(),
-            "source_ip_count": stats.get("unique_ips", 0),
+            "source_ip_count": len(summary.get("top_ips", stats.get("top_ips", {}))),
             "total_packets": summary.get("total_requests", stats.get("total_requests", 0)),
             "botnet_detected": bot_pct > 70,
             "velocity_curve": velocity,
+            # Use accumulated attack-wide data (summary), not last-window (stats)
             "top_src_ips": [{"ip": ip, "count": cnt}
-                           for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
-            "top_dst_ports": stats.get("top_paths", {}),
+                           for ip, cnt in list(summary.get("top_ips", stats.get("top_ips", {})).items())[:50]],
+            "top_dst_ports": summary.get("top_paths", stats.get("top_paths", {})),
             # Full attack-wide L7 enrichment
-            "l7_error_rate": stats.get("error_rate", 0),
+            "l7_error_rate": summary.get("error_rate", stats.get("error_rate", 0)),
             "l7_status_codes": summary.get("status_codes", stats.get("status_codes", {})),
             "l7_top_user_agents": summary.get("top_user_agents", stats.get("top_user_agents", {})),
             "l7_targeted_paths": summary.get("top_paths", stats.get("top_paths", {})),
