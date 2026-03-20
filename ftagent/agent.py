@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -85,12 +85,25 @@ def check_for_updates(force: bool = False, interactive: bool = True) -> None:
             pass
 
     try:
-        url = "https://api.github.com/repos/Flowtriq/ftagent/releases/latest"
-        req = urllib.request.Request(url, headers={"User-Agent": f"ftagent/{VERSION}"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = _json.loads(resp.read().decode())
+        # Try GitHub releases first, fall back to tags
+        latest = None
+        for api_url in [
+            "https://api.github.com/repos/Flowtriq/ftagent/releases/latest",
+            "https://api.github.com/repos/Flowtriq/ftagent/tags?per_page=1",
+        ]:
+            try:
+                req = urllib.request.Request(api_url, headers={"User-Agent": f"ftagent/{VERSION}"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = _json.loads(resp.read().decode())
+                if isinstance(data, list) and data:
+                    latest = data[0].get("name", "").lstrip("v")
+                elif isinstance(data, dict):
+                    latest = data.get("tag_name", "").lstrip("v")
+                if latest:
+                    break
+            except Exception:
+                continue
 
-        latest = data.get("tag_name", "").lstrip("v")
         if not latest:
             return
 
