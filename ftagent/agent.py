@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.6.6"
+VERSION = "1.6.7"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1528,7 +1528,8 @@ class L7Monitor:
 # ---------------------------------------------------------------------------
 
 def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
-                    syn_ratio: float = 0.0, dns_detected: bool = False) -> str:
+                    syn_ratio: float = 0.0, dns_detected: bool = False,
+                    top_ports: list = None, tcp_flags: dict = None) -> str:
     if dns_detected:
         return "dns_flood"
     if udp_pct > 45:
@@ -1541,9 +1542,6 @@ def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
     if elevated >= 2:
         return "multi_vector"
     # Last resort: pick dominant protocol.
-    # Require syn_ratio >= 0.3 (30%+ SYNs) to classify as SYN flood.
-    # Normal TCP traffic has SYN ratios of 1-10%; attack traffic is 50%+.
-    # Using 0.3 avoids false positives from regular web/game server traffic.
     if udp_pct >= tcp_pct and udp_pct >= icmp_pct and udp_pct > 5:
         return "udp_flood"
     if tcp_pct >= udp_pct and tcp_pct >= icmp_pct and tcp_pct > 5:
@@ -1553,6 +1551,84 @@ def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
     if icmp_pct > 5:
         return "icmp_flood"
     return "unknown"
+
+
+def classify_subtype(family: str, top_ports: list = None,
+                     tcp_flags: dict = None, avg_pkt_len: int = 0) -> str:
+    """Derive attack subtype from port/flag/size evidence."""
+    if not family or family == "unknown":
+        return ""
+
+    ports = top_ports or []
+    top_port = 0
+    if ports:
+        entry = ports[0]
+        top_port = entry.get("port", 0) if isinstance(entry, dict) else int(entry)
+
+    # ── UDP subtypes ──
+    if family == "udp_flood":
+        if top_port == 53:
+            return "dns_amplification"
+        if top_port == 123:
+            return "ntp_amplification"
+        if top_port == 1900:
+            return "ssdp_amplification"
+        if top_port == 11211:
+            return "memcached_amplification"
+        if top_port == 389:
+            return "cldap_amplification"
+        if top_port == 19:
+            return "chargen_amplification"
+        if top_port == 161:
+            return "snmp_amplification"
+        if avg_pkt_len > 0 and avg_pkt_len < 100:
+            return "small_packet_flood"
+        if avg_pkt_len > 1200:
+            return "amplification_generic"
+        return "volumetric"
+
+    # ── TCP subtypes (beyond SYN flood) ──
+    if family == "syn_flood":
+        return "syn_flood"
+
+    # ── DNS subtypes ──
+    if family == "dns_flood":
+        if top_port == 53 and avg_pkt_len > 512:
+            return "dns_amplification"
+        return "dns_query_flood"
+
+    # ── ICMP subtypes ──
+    if family == "icmp_flood":
+        if avg_pkt_len > 1000:
+            return "ping_of_death"
+        return "ping_flood"
+
+    return ""
+
+
+def classify_tcp_subtype(tcp_flags: dict) -> str:
+    """Classify TCP attack subtype from flag distribution.
+    Only called when tcp_pct is dominant but SYN ratio is below flood threshold."""
+    if not tcp_flags:
+        return ""
+    total = sum(tcp_flags.values())
+    if total == 0:
+        return ""
+    syn_r = tcp_flags.get("SYN", 0) / total
+    ack_r = tcp_flags.get("ACK", 0) / total
+    rst_r = tcp_flags.get("RST", 0) / total
+    fin_r = tcp_flags.get("FIN", 0) / total
+    psh_r = tcp_flags.get("PSH", 0) / total
+
+    if rst_r > 0.5:
+        return "rst_flood"
+    if fin_r > 0.4:
+        return "fin_flood"
+    if ack_r > 0.6 and syn_r < 0.1:
+        return "ack_flood"
+    if psh_r > 0.4 and ack_r > 0.3:
+        return "psh_ack_flood"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1942,14 +2018,24 @@ class Agent:
     def _end_attack(self) -> None:
         duration = time.time() - self.attack_start
         proto = self._proto_breakdown()
+        _top_ports = self.analyser.top_dst_ports()
+        _flags = dict(self.analyser.tcp_flags)
+        _avg_pkt = self.analyser.avg_pkt_length()
         family = classify_attack(
             proto["tcp"], proto["udp"], proto["icmp"],
             syn_ratio=self.analyser.syn_ratio(),
             dns_detected=bool(self.analyser.dns_queries),
         )
+        # Derive subtype from port/flag/size evidence
+        subtype = classify_subtype(family, _top_ports, _flags, _avg_pkt)
+        # For TCP-dominant traffic that isn't SYN flood, check for other TCP subtypes
+        if family == "unknown" and proto["tcp"] > 40:
+            tcp_sub = classify_tcp_subtype(_flags)
+            if tcp_sub:
+                subtype = tcp_sub
 
-        logger.warning("ATTACK ENDED — duration=%.0fs peak_pps=%.0f family=%s",
-                       duration, self.peak_pps, family)
+        logger.warning("ATTACK ENDED — duration=%.0fs peak_pps=%.0f family=%s subtype=%s",
+                       duration, self.peak_pps, family, subtype or "none")
 
         if not self.incident_uuid:
             logger.error("Cannot resolve incident — UUID is empty (open_incident likely failed)")
@@ -1961,6 +2047,7 @@ class Agent:
             "peak_pps": round(self.peak_pps, 1),
             "peak_bps": round(self.peak_bps, 1),
             "attack_family": family,
+            "attack_subtype": subtype or None,
             "protocol_breakdown": proto,
             "ioc_hits": list(set(self.analyser.ioc_hits)),
             "spoofing_detected": self.analyser.spoofing_detected(),
@@ -1968,7 +2055,7 @@ class Agent:
             "total_packets": self.analyser.total_packets,
             "source_ip_count": len(self.analyser.src_ips),
             "src_ip_entropy": self.analyser.src_ip_entropy(),
-            "tcp_flag_breakdown": dict(self.analyser.tcp_flags),
+            "tcp_flag_breakdown": _flags,
             "dns_query_stats": self.analyser.dns_query_stats(),
             "pkt_length_histogram": self.analyser.pkt_length_histogram(),
             "ttl_distribution": self.analyser.ttl_distribution(),
