@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.6.8"
+VERSION = "1.6.9"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -68,49 +68,99 @@ except ImportError:
 # Update Checker
 # ---------------------------------------------------------------------------
 
-def check_for_updates() -> None:
-    """Check GitHub releases Atom feed for a newer version of ftagent."""
+def check_for_updates(force: bool = False, interactive: bool = True) -> None:
+    """Check GitHub releases for a newer agent version. Optionally prompt to upgrade."""
+    import urllib.request
+    import json as _json
+
+    # Throttle: only check once per day unless forced
+    state_file = os.path.expanduser("~/.ftagent_update_check")
+    if not force:
+        try:
+            mtime = os.path.getmtime(state_file)
+            if time.time() - mtime < 86400:
+                return
+        except OSError:
+            pass
+
     try:
-        import urllib.request
-        import xml.etree.ElementTree as ET
-
-        url = "https://github.com/Flowtriq/ftagent/releases.atom"
+        url = "https://api.github.com/repos/Flowtriq/ftagent/releases/latest"
         req = urllib.request.Request(url, headers={"User-Agent": f"ftagent/{VERSION}"})
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = resp.read()
-        root = ET.fromstring(data)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read().decode())
 
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        entries = root.findall("atom:entry", ns)
-        if not entries:
+        latest = data.get("tag_name", "").lstrip("v")
+        if not latest:
             return
 
-        title = entries[0].find("atom:title", ns)
-        if title is None or title.text is None:
+        # Record check time
+        Path(state_file).touch()
+
+        def _ver(v):
+            try:
+                return tuple(int(x) for x in v.split("."))
+            except (ValueError, AttributeError):
+                return (0,)
+
+        if _ver(latest) <= _ver(VERSION):
+            return  # Up to date
+
+        msg = f"A newer version of ftagent is available: v{latest} (you have v{VERSION})"
+
+        if not interactive:
+            # Running as daemon: just log it
+            try:
+                logger.warning("%s. Run: pip install --upgrade ftagent", msg)
+            except Exception:
+                print(f"  {msg}")
+                print("  Run: pip install --upgrade ftagent")
             return
 
-        latest = title.text.strip().lstrip("vV")
-        current = VERSION.lstrip("vV")
+        # Interactive: prompt to upgrade
+        print(f"\n  {msg}")
+        print(f"  Release: https://github.com/Flowtriq/ftagent/releases/tag/v{latest}\n")
 
-        if latest != current:
-            # Compare version tuples
-            def _ver_tuple(v):
-                parts = []
-                for p in v.split("."):
-                    try:
-                        parts.append(int(p))
-                    except ValueError:
-                        parts.append(0)
-                return tuple(parts)
+        try:
+            answer = input("  Would you like to update now? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
 
-            if _ver_tuple(latest) > _ver_tuple(current):
-                logger.warning(
-                    "A newer version of ftagent is available: %s (current: %s). "
-                    "Run: pip install --upgrade ftagent",
-                    latest, VERSION,
-                )
+        if answer not in ("y", "yes"):
+            return
+
+        _do_pip_upgrade()
+
     except Exception:
-        pass
+        pass  # Never let update check break the agent
+
+
+def _do_pip_upgrade() -> None:
+    """Run pip upgrade, handling --break-system-packages for PEP 668."""
+    import subprocess as _sp
+
+    pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "ftagent"]
+
+    print("  Updating ftagent...")
+    result = _sp.run(pip_cmd, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print("  Updated successfully. Restart the agent to use the new version.")
+        print("  Run: systemctl restart ftagent")
+        return
+
+    # PEP 668: externally managed Python (Debian 12+, Ubuntu 23.04+)
+    if "externally-managed-environment" in result.stderr:
+        print("  System Python detected. Retrying with --break-system-packages...")
+        pip_cmd.insert(-1, "--break-system-packages")
+        result = _sp.run(pip_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("  Updated successfully. Restart the agent to use the new version.")
+            print("  Run: systemctl restart ftagent")
+            return
+
+    print(f"  Update failed: {result.stderr.strip()}")
+    print("  Try manually: pip install --upgrade ftagent")
 
 
 # ---------------------------------------------------------------------------
@@ -2457,7 +2507,14 @@ class Agent:
 
         logger.info("Executing %s command #%d: %s", cmd_type, cmd_id, title)
 
-        allowed_prefixes = ("iptables ", "ip6tables ", "ipset ", "sysctl ")
+        allowed_prefixes = (
+            "iptables ", "ip6tables ", "ipset ", "sysctl ",
+            "nft ", "ufw ", "tc ", "ip route ",
+            "fail2ban-client ", "nginx ", "apache2ctl ",
+            "echo ", "sed ", "rm -f /etc/nginx/conf.d/ft_",
+            "rm -f /etc/apache2/conf-enabled/ft_",
+            "for cc in ",
+        )
         errors = []
         applied = 0
 
@@ -2604,7 +2661,15 @@ def main() -> None:
                         help="Test API connectivity")
     parser.add_argument("--install-service", action="store_true",
                         help="Install systemd service unit")
+    parser.add_argument("--update", action="store_true",
+                        help="Check for and install agent updates")
+    parser.add_argument("--no-update-check", action="store_true",
+                        help="Skip automatic update check on startup")
     args = parser.parse_args()
+
+    if args.update:
+        check_for_updates(force=True, interactive=True)
+        return
 
     if args.setup:
         setup_wizard(args.config)
@@ -2632,6 +2697,10 @@ def main() -> None:
     if not cfg["node_uuid"]:
         logger.error("No node_uuid configured. Set it to the Node UUID from your Flowtriq dashboard. Run: ftagent --setup")
         sys.exit(1)
+
+    # Check for updates on startup (non-blocking, logs only)
+    if not args.no_update_check:
+        check_for_updates(force=False, interactive=False)
 
     agent = Agent(cfg)
     agent.run()
