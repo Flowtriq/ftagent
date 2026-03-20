@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -28,7 +28,7 @@ DEFAULT_CONFIG = {
     "api_base": "https://flowtriq.com/api/v1",
     "interface": "auto",
     "pcap_enabled": True,
-    "pcap_mode": "tcpdump",  # "tcpdump" (fast, low CPU) or "scapy" (in-memory, higher CPU)
+    "pcap_mode": "scapy",  # "scapy" (default, real-time analysis) or "tcpdump" (low CPU for high-traffic servers)
     "pcap_dir": "/var/lib/ftagent/pcaps",
     "log_file": "/var/log/ftagent.log",
     "log_level": "INFO",
@@ -2180,6 +2180,33 @@ class Agent:
             if _syn_c + _ack_c > 0:
                 _syn_est = _syn_c / (_syn_c + _ack_c)
 
+        # tcpdump mode: parse ring files for protocol classification
+        if self.pcap.pcap_mode == "tcpdump" and _ring_total == 0 and self.pcap._ring_dir:
+            try:
+                import glob, subprocess
+                ring_files = sorted(glob.glob(os.path.join(self.pcap._ring_dir, "ring_*.pcap")))
+                if ring_files:
+                    # Use the most recent ring file
+                    latest = ring_files[-1]
+                    out = subprocess.run(
+                        ["tcpdump", "-nn", "-r", latest, "-c", "500", "-q"],
+                        capture_output=True, text=True, timeout=10)
+                    for _tline in out.stdout.splitlines():
+                        if "UDP" in _tline or "udp" in _tline:
+                            _ring_udp += 1
+                        elif "TCP" in _tline or "Flags" in _tline:
+                            _ring_tcp += 1
+                            if " S " in _tline or "[S]" in _tline:
+                                _syn_c += 1
+                            if "[.]" in _tline or " ack " in _tline:
+                                _ack_c += 1
+                        elif "ICMP" in _tline or "icmp" in _tline:
+                            _ring_icmp += 1
+                    if _syn_c + _ack_c > 0:
+                        _syn_est = _syn_c / (_syn_c + _ack_c)
+            except Exception as _e:
+                logger.debug("tcpdump ring parse for classify: %s", _e)
+
         # Use ring buffer protocol data if available, fall back to SNMP
         _ring_total = _ring_tcp + _ring_udp + _ring_icmp
         if _ring_total > 10:
@@ -2770,6 +2797,19 @@ def setup_wizard(config_path: str) -> None:
         cfg["interface"] = iface
     pcap = input("  Enable PCAP capture? [Y/n]: ").strip().lower()
     cfg["pcap_enabled"] = pcap != "n"
+
+    if cfg["pcap_enabled"]:
+        print("\n  PCAP capture mode:")
+        print("    1. scapy   - Real-time per-packet analysis (default)")
+        print("                 Best for most servers. Higher CPU at very high PPS (50K+).")
+        print("    2. tcpdump - Native kernel-speed capture, near-zero CPU")
+        print("                 Best for high-traffic servers or nodes that regularly see 10K+ PPS.")
+        pcap_choice = input("  Choose [1/2, default=1]: ").strip()
+        if pcap_choice == "2":
+            cfg["pcap_mode"] = "tcpdump"
+            print("  Using tcpdump mode. The agent will auto-install tcpdump if needed.")
+        else:
+            cfg["pcap_mode"] = "scapy"
 
     save_config(config_path, cfg)
     print(f"\n  Config written to {config_path}")
