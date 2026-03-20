@@ -1519,12 +1519,15 @@ def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
     if elevated >= 2:
         return "multi_vector"
     # Last resort: pick dominant protocol.
-    # Only label TCP-dominant as syn_flood when we have actual flag evidence
-    # (syn_ratio > 0); without it, return unknown so _end_attack can correct.
+    # Require syn_ratio >= 0.3 (30%+ SYNs) to classify as SYN flood.
+    # Normal TCP traffic has SYN ratios of 1-10%; attack traffic is 50%+.
+    # Using 0.3 avoids false positives from regular web/game server traffic.
     if udp_pct >= tcp_pct and udp_pct >= icmp_pct and udp_pct > 5:
         return "udp_flood"
     if tcp_pct >= udp_pct and tcp_pct >= icmp_pct and tcp_pct > 5:
-        return "syn_flood" if syn_ratio > 0 else "unknown"
+        if syn_ratio >= 0.3:
+            return "syn_flood"
+        return "unknown"
     if icmp_pct > 5:
         return "icmp_flood"
     return "unknown"
