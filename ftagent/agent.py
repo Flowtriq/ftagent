@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1739,6 +1739,9 @@ class Agent:
 
         if not self.attacking:
             if pps > self.threshold:
+                # Flush buffered metrics immediately so the dashboard sees the spike
+                self._flush_metrics()
+                self._last_metrics_push = now
                 self._begin_attack()
         else:
             if pps > self.peak_pps:
@@ -1752,6 +1755,9 @@ class Agent:
                 self.below_count = 0
 
             if self.below_count >= 10:
+                # Flush metrics immediately so dashboard sees the resolution
+                self._flush_metrics()
+                self._last_metrics_push = now
                 self._end_attack()
             elif time.monotonic() - self.last_update >= 5:
                 self._update_attack()
@@ -1794,8 +1800,14 @@ class Agent:
         # Without this, TCP-dominant attacks open as "unknown" until _end_attack.
         _syn_est = 0.0
         if SCAPY_AVAILABLE and self.pcap.ring_buffer:
+            try:
+                # Snapshot the deque to a list to avoid RuntimeError if the
+                # sniffer thread appends during iteration (deque mutation).
+                _ring_snapshot = list(self.pcap.ring_buffer)
+            except RuntimeError:
+                _ring_snapshot = []
             _syn_c = _ack_c = 0
-            for _rpkt in self.pcap.ring_buffer:
+            for _rpkt in _ring_snapshot:
                 if _rpkt.haslayer(TCP):
                     _f = _rpkt[TCP].flags
                     if _f & 0x02: _syn_c += 1
@@ -1843,6 +1855,9 @@ class Agent:
                          name="attack-config-fetch").start()
 
     def _update_attack(self) -> None:
+        if not self.incident_uuid:
+            logger.warning("Skipping attack update — no incident UUID")
+            return
         self.last_update = time.monotonic()
         elapsed = time.time() - self.attack_start
         self.velocity_curve.append({
@@ -1882,6 +1897,11 @@ class Agent:
 
         logger.warning("ATTACK ENDED — duration=%.0fs peak_pps=%.0f family=%s",
                        duration, self.peak_pps, family)
+
+        if not self.incident_uuid:
+            logger.error("Cannot resolve incident — UUID is empty (open_incident likely failed)")
+            self.attacking = False
+            return
 
         self.api.resolve_incident(self.incident_uuid, {
             "duration_seconds": round(duration, 1),
