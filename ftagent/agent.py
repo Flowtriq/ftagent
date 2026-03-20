@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -34,7 +34,7 @@ DEFAULT_CONFIG = {
     "dynamic_threshold": True,
     "baseline_window": 300,
     "health_port": 9100,
-    "auto_update": False,
+    "auto_update": True,
 }
 
 # Optional dependency imports
