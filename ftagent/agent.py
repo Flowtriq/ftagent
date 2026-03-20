@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -923,25 +923,32 @@ class PcapCapture:
         Full-fidelity capture of every packet at any PPS."""
         import subprocess
         ring_dir = os.path.join(self.pcap_dir, "_ring")
-        os.makedirs(ring_dir, exist_ok=True)
+        os.makedirs(ring_dir, mode=0o755, exist_ok=True)
+        # Ensure the directory is writable
+        os.chmod(ring_dir, 0o755)
         self._ring_dir = ring_dir
 
+        ring_file = os.path.join(ring_dir, "ring_%Y%m%d_%H%M%S.pcap")
         tcpdump_cmd = [
-            "tcpdump", "-i", self.iface, "-w", os.path.join(ring_dir, "ring"),
+            "tcpdump", "-i", self.iface, "-w", ring_file,
             "-G", "30",         # rotate every 30 seconds
             "-W", "3",          # keep 3 files max (ring)
             "-s", "0",          # full packet capture
-            "-Z", "root",       # don't drop privileges
-            "--immediate-mode", # don't buffer
+            "-Z", "root",       # stay as root (don't drop to tcpdump user)
             "-q",               # quiet
         ]
 
         logger.info("PCAP ring buffer active on %s (tcpdump mode)", self.iface)
         try:
+            import subprocess
+            # Run tcpdump without dropping privileges
+            env = os.environ.copy()
+            env["HOME"] = "/root"
             self._tcpdump_proc = subprocess.Popen(
                 tcpdump_cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                env=env,
             )
             while not shutdown.is_set():
                 shutdown.wait(1)
@@ -954,7 +961,7 @@ class PcapCapture:
                         logger.info("Restarting tcpdump...")
                         self._tcpdump_proc = subprocess.Popen(
                             tcpdump_cmd, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE)
+                            stderr=subprocess.PIPE, env=env)
 
             self._tcpdump_proc.terminate()
             try:
