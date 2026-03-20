@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.6.9"
+VERSION = "1.7.0"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -28,6 +28,7 @@ DEFAULT_CONFIG = {
     "api_base": "https://flowtriq.com/api/v1",
     "interface": "auto",
     "pcap_enabled": True,
+    "pcap_mode": "tcpdump",  # "tcpdump" (fast, low CPU) or "scapy" (in-memory, higher CPU)
     "pcap_dir": "/var/lib/ftagent/pcaps",
     "log_file": "/var/log/ftagent.log",
     "log_level": "INFO",
@@ -877,9 +878,12 @@ class IOCMatcher:
 class PcapCapture:
     def __init__(self, cfg: dict, iface: str, analyser: TrafficAnalyser,
                  ioc_matcher: IOCMatcher):
-        self.enabled = cfg.get("pcap_enabled", True) and SCAPY_AVAILABLE
+        self.pcap_mode = cfg.get("pcap_mode", "tcpdump")
+        self.enabled = cfg.get("pcap_enabled", True) and (SCAPY_AVAILABLE or self.pcap_mode == "tcpdump")
         self.pcap_dir = cfg.get("pcap_dir", "/var/lib/ftagent/pcaps")
         self.iface = iface
+        self._tcpdump_proc = None
+        self._ring_dir = None
         self.analyser = analyser
         self.ioc_matcher = ioc_matcher
         self.ring_buffer: collections.deque = collections.deque(maxlen=1000)
@@ -894,7 +898,66 @@ class PcapCapture:
     def background_ring(self, shutdown: threading.Event) -> None:
         if not self.enabled:
             return
-        logger.info("PCAP ring buffer active on %s", self.iface)
+
+        if self.pcap_mode == "tcpdump":
+            self._background_ring_tcpdump(shutdown)
+        else:
+            self._background_ring_scapy(shutdown)
+
+    def _background_ring_tcpdump(self, shutdown: threading.Event) -> None:
+        """Use tcpdump for continuous capture. Native speed, near-zero CPU.
+        Rotates files every 30s, keeps last 3 as a ring buffer.
+        Full-fidelity capture of every packet at any PPS."""
+        import subprocess
+        ring_dir = os.path.join(self.pcap_dir, "_ring")
+        os.makedirs(ring_dir, exist_ok=True)
+        self._ring_dir = ring_dir
+
+        tcpdump_cmd = [
+            "tcpdump", "-i", self.iface, "-w", os.path.join(ring_dir, "ring"),
+            "-G", "30",         # rotate every 30 seconds
+            "-W", "3",          # keep 3 files max (ring)
+            "-s", "0",          # full packet capture
+            "-Z", "root",       # don't drop privileges
+            "--immediate-mode", # don't buffer
+            "-q",               # quiet
+        ]
+
+        logger.info("PCAP ring buffer active on %s (tcpdump mode)", self.iface)
+        try:
+            self._tcpdump_proc = subprocess.Popen(
+                tcpdump_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            while not shutdown.is_set():
+                shutdown.wait(1)
+                if self._tcpdump_proc.poll() is not None:
+                    stderr = self._tcpdump_proc.stderr.read().decode(errors="replace")
+                    logger.warning("tcpdump exited (code %d): %s",
+                                   self._tcpdump_proc.returncode, stderr[:200])
+                    shutdown.wait(5)
+                    if not shutdown.is_set():
+                        logger.info("Restarting tcpdump...")
+                        self._tcpdump_proc = subprocess.Popen(
+                            tcpdump_cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE)
+
+            self._tcpdump_proc.terminate()
+            try:
+                self._tcpdump_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._tcpdump_proc.kill()
+
+        except FileNotFoundError:
+            logger.warning("tcpdump not found, falling back to scapy sniff mode")
+            self._background_ring_scapy(shutdown)
+        except Exception as exc:
+            logger.warning("PCAP ring buffer error: %s", exc)
+
+    def _background_ring_scapy(self, shutdown: threading.Event) -> None:
+        """Fallback to scapy sniff if tcpdump is not available."""
+        logger.info("PCAP ring buffer active on %s (scapy fallback)", self.iface)
         try:
             sniff(iface=self.iface, prn=self._ring_cb, store=False,
                   stop_filter=lambda _: shutdown.is_set())
@@ -905,14 +968,37 @@ class PcapCapture:
         self.ring_buffer.append(pkt)
         if self.capturing and len(self.capture_packets) < self.max_capture:
             self.capture_packets.append(pkt)
-            # Deep analysis (protocol parsing + IOC matching) is expensive.
-            # Sample every Nth packet to keep CPU bounded at high PPS.
             self._pkt_counter += 1
             if self._pkt_counter % self._analyse_every == 0:
                 self.analyser.process_packet(pkt, self.ioc_matcher)
 
     def start_capture(self, incident_uuid: str = "",
                        api_client=None) -> None:
+        if self.pcap_mode == "tcpdump" and self._ring_dir:
+            # In tcpdump mode, snapshot the current ring files as the pre-attack sample
+            import glob
+            import shutil
+            self._tcpdump_capture_dir = os.path.join(self.pcap_dir, f"_capture_{incident_uuid[:8]}")
+            os.makedirs(self._tcpdump_capture_dir, exist_ok=True)
+            for rf in sorted(glob.glob(os.path.join(self._ring_dir, "ring*"))):
+                try:
+                    shutil.copy2(rf, self._tcpdump_capture_dir)
+                except Exception:
+                    pass
+            # Start a dedicated tcpdump for this incident
+            import subprocess
+            self._capture_file = os.path.join(self._tcpdump_capture_dir, "attack.pcap")
+            try:
+                self._capture_proc = subprocess.Popen(
+                    ["tcpdump", "-i", self.iface, "-w", self._capture_file,
+                     "-s", "0", "-Z", "root", "-c", str(self.max_capture), "-q"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except FileNotFoundError:
+                self._capture_proc = None
+        else:
+            self._tcpdump_capture_dir = None
+            self._capture_proc = None
+
         self.capture_packets = list(self.ring_buffer)
         self.capturing = True
         self._incident_uuid = incident_uuid
@@ -981,6 +1067,55 @@ class PcapCapture:
 
     def stop_capture(self, incident_uuid: str) -> Optional[str]:
         self.capturing = False
+
+        # tcpdump mode: stop capture process and merge files
+        if self.pcap_mode == "tcpdump" and hasattr(self, '_capture_proc') and self._capture_proc:
+            self._capture_proc.terminate()
+            try:
+                self._capture_proc.wait(timeout=5)
+            except Exception:
+                self._capture_proc.kill()
+
+            # Merge ring snapshots + attack capture into one file
+            import glob
+            Path(self.pcap_dir).mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            filepath = os.path.join(self.pcap_dir, f"{incident_uuid}_{ts}.pcap")
+
+            ring_files = sorted(glob.glob(os.path.join(self._tcpdump_capture_dir, "ring*")))
+            attack_file = os.path.join(self._tcpdump_capture_dir, "attack.pcap")
+            all_files = ring_files + ([attack_file] if os.path.exists(attack_file) else [])
+
+            if all_files:
+                try:
+                    # Use mergecap if available, else simple concat
+                    import subprocess
+                    merge_result = subprocess.run(
+                        ["mergecap", "-w", filepath] + all_files,
+                        capture_output=True, timeout=30)
+                    if merge_result.returncode != 0:
+                        # Fallback: concatenate (works for pcap, not pcapng)
+                        with open(filepath, "wb") as out:
+                            for f in all_files:
+                                with open(f, "rb") as inp:
+                                    out.write(inp.read())
+                    logger.info("PCAP merged: %s (%d source files)", filepath, len(all_files))
+                except FileNotFoundError:
+                    # No mergecap, just use the attack file
+                    if os.path.exists(attack_file):
+                        import shutil
+                        shutil.move(attack_file, filepath)
+                except Exception as exc:
+                    logger.error("PCAP merge failed: %s", exc)
+
+            # Cleanup temp dir
+            import shutil
+            shutil.rmtree(self._tcpdump_capture_dir, ignore_errors=True)
+
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                return filepath
+            return None
+
         # Stop chunk upload thread
         if hasattr(self, '_chunk_stop'):
             self._chunk_stop.set()
@@ -1883,6 +2018,7 @@ class Agent:
 
         pps = self.monitor.pps
         bps = self.monitor.bps
+
         # Don't pollute baseline with attack traffic — it would inflate the
         # threshold and make future detection less sensitive.
         if not self.attacking:
