@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.6.4"
+VERSION = "1.6.5"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1882,6 +1882,8 @@ class Agent:
             },
             "source_ip_count": len(self.analyser.src_ips),
             "total_packets": self.analyser.total_packets,
+            "top_src_ips": self.analyser.top_src_ips(),
+            "top_dst_ports": self.analyser.top_dst_ports(),
             "ioc_hits": list(set(self.analyser.ioc_hits)),
             "spoofing_detected": self.analyser.spoofing_detected(),
             "botnet_detected": self.analyser.botnet_detected(),
@@ -2177,6 +2179,8 @@ class Agent:
                        subtype, rps, baseline_rps, info["reasons"])
         self.l7_peak_rps = rps
         self.l7_baseline_rps = baseline_rps
+        self.l7_velocity_curve = [{"t": 0, "rps": round(rps, 1)}]
+        self.l7_attack_start = time.time()
         stats = info.get("stats", {})
         result = self.api.open_incident({
             "peak_pps": 0,
@@ -2229,15 +2233,30 @@ class Agent:
             self.l7_peak_rps = rps
         stats = info.get("stats", {})
         subtype = _classify_l7_subtype(stats) if stats else "l7_flood"
+
+        # Track RPS velocity curve
+        elapsed = time.time() - getattr(self, 'l7_attack_start', time.time())
+        curve = getattr(self, 'l7_velocity_curve', [])
+        curve.append({"t": round(elapsed, 1), "rps": round(rps, 1)})
+        self.l7_velocity_curve = curve
+
+        bot_pct = stats.get("bot_request_pct", 0)
         self.api.update_incident(self.l7_incident_uuid, {
             "attack_family": "http_flood",
             "attack_subtype": subtype,
             "rps": round(rps),
             "baseline_rps": round(getattr(self, 'l7_baseline_rps', 0), 1),
             "source_ip_count": stats.get("unique_ips", 0),
+            "total_packets": stats.get("total_requests", 0),
             "top_src_ips": [{"ip": ip, "count": cnt}
                            for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
             "top_dst_ports": stats.get("top_paths", {}),
+            "protocol_breakdown": {
+                "tcp": self.monitor.tcp_pct,
+                "udp": self.monitor.udp_pct,
+                "icmp": self.monitor.icmp_pct,
+            },
+            "botnet_detected": bot_pct > 70,
             "l7_error_rate": stats.get("error_rate", 0),
             "l7_status_codes": stats.get("status_codes", {}),
             "l7_top_user_agents": stats.get("top_user_agents", {}),
@@ -2263,6 +2282,12 @@ class Agent:
 
         stats = info.get("stats", {})
         summary = info.get("attack_summary", {})
+        bot_pct = stats.get("bot_request_pct", summary.get("bot_request_pct", 0))
+
+        # Finalize velocity curve
+        velocity = getattr(self, 'l7_velocity_curve', [])
+        velocity.append({"t": round(duration, 1), "rps": round(info.get("rps", 0), 1)})
+
         self.api.resolve_incident(self.l7_incident_uuid, {
             "duration_seconds": duration,
             "peak_pps": 0,
@@ -2277,6 +2302,9 @@ class Agent:
                 "icmp": self.monitor.icmp_pct,
             },
             "source_ip_count": stats.get("unique_ips", 0),
+            "total_packets": summary.get("total_requests", stats.get("total_requests", 0)),
+            "botnet_detected": bot_pct > 70,
+            "velocity_curve": velocity,
             "top_src_ips": [{"ip": ip, "count": cnt}
                            for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
             "top_dst_ports": stats.get("top_paths", {}),
