@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.7.4"
+VERSION = "1.7.5"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -2078,7 +2078,10 @@ class Agent:
 
         # Don't pollute baseline with attack traffic — it would inflate the
         # threshold and make future detection less sensitive.
-        if not self.attacking:
+        # Also skip samples above the absolute floor when baseline isn't ready,
+        # so a new node getting attacked doesn't build a baseline from attack data.
+        _abs_floor = self.server_threshold or 10000
+        if not self.attacking and (self.baseline.baseline_ready or pps < _abs_floor):
             self.baseline.add(pps)
 
         # Buffer metrics locally, flush every _metrics_interval seconds.
@@ -2098,7 +2101,18 @@ class Agent:
             self._flush_metrics()
 
         if not self.attacking:
-            if pps > self.threshold:
+            # Two detection paths:
+            # 1. Baseline-driven: PPS exceeds the dynamic threshold (p99 * 3)
+            # 2. Absolute floor: if baseline isn't ready yet and PPS exceeds
+            #    a hard floor (10K), treat it as an attack immediately.
+            #    This catches attacks on brand-new nodes before enough
+            #    samples exist for a meaningful baseline.
+            _absolute_floor = self.server_threshold or 10000
+            _trigger = pps > self.threshold
+            if not self.baseline.baseline_ready and pps >= _absolute_floor:
+                _trigger = True
+
+            if _trigger:
                 # Flush buffered metrics immediately so the dashboard sees the spike
                 self._flush_metrics()
                 self._last_metrics_push = now
