@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.6.3"
+VERSION = "1.6.4"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -2153,6 +2153,13 @@ class Agent:
                 attack_info = self.l7.check_attack(stats)
                 if not attack_info:
                     continue
+                # Suppress L7 detection when an L3/L4 attack is already active —
+                # web server stress during a volumetric flood is a side effect,
+                # not a separate L7 attack.
+                if attack_info["type"] == "l7_flood" and self.attacking:
+                    logger.debug("L7: suppressed — L3/L4 attack already active")
+                    self.l7._attack_active = False
+                    continue
                 if attack_info["type"] == "l7_flood":
                     self._l7_begin_attack(attack_info)
                 elif attack_info["type"] == "l7_flood_end":
@@ -2191,6 +2198,12 @@ class Agent:
                 incident_uuid=self.l7_incident_uuid,
                 api_client=self.api)
 
+        # Use real protocol data from L3/L4 monitor instead of hardcoding
+        real_proto = {
+            "tcp": self.monitor.tcp_pct,
+            "udp": self.monitor.udp_pct,
+            "icmp": self.monitor.icmp_pct,
+        }
         self.api.update_incident(self.l7_incident_uuid, {
             "attack_family": "http_flood",
             "attack_subtype": subtype,
@@ -2200,7 +2213,7 @@ class Agent:
             "top_src_ips": [{"ip": ip, "count": cnt}
                            for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
             "top_dst_ports": stats.get("top_paths", {}),
-            "protocol_breakdown": {"tcp": 100, "udp": 0, "icmp": 0},
+            "protocol_breakdown": real_proto,
             # New L7-specific fields
             "l7_error_rate": stats.get("error_rate", 0),
             "l7_status_codes": stats.get("status_codes", {}),
@@ -2258,7 +2271,11 @@ class Agent:
             "baseline_rps": round(baseline_rps, 1),
             "attack_family": "http_flood",
             "attack_subtype": subtype,
-            "protocol_breakdown": {"tcp": 100, "udp": 0, "icmp": 0},
+            "protocol_breakdown": {
+                "tcp": self.monitor.tcp_pct,
+                "udp": self.monitor.udp_pct,
+                "icmp": self.monitor.icmp_pct,
+            },
             "source_ip_count": stats.get("unique_ips", 0),
             "top_src_ips": [{"ip": ip, "count": cnt}
                            for ip, cnt in list(stats.get("top_ips", {}).items())[:50]],
