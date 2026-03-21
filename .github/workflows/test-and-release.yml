@@ -14,7 +14,7 @@ jobs:
   # ── Stage 1: Deploy to test server and verify agent starts ─────────────────
   test-on-server:
     name: Deploy & Smoke Test
-    runs-on: [self-hosted, linux, ftagent]
+    runs-on: self-hosted
     timeout-minutes: 5
     steps:
       - name: Checkout code
