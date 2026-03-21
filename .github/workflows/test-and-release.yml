@@ -25,10 +25,15 @@ jobs:
           pip3 install --break-system-packages --upgrade pip
           pip3 install --break-system-packages -e ".[full]" 2>&1 | tail -5
 
+      - name: Write test config
+        run: |
+          sudo mkdir -p /etc/ftagent
+          echo '{"api_key":"${{ secrets.STAGING_NODE_KEY }}","node_uuid":"${{ secrets.STAGING_NODE_UUID }}","api_base":"${{ secrets.STAGING_API_URL }}"}' | sudo tee /etc/ftagent/config.json > /dev/null
+
       - name: Verify agent starts
         run: |
-          # Run agent in test mode (--test flag: single heartbeat then exit)
-          timeout 30 ftagent --api-url ${{ secrets.STAGING_API_URL }} --api-key ${{ secrets.STAGING_NODE_KEY }} --test 2>&1 || CODE=$?
+          # Run agent in test mode (single heartbeat then exit)
+          timeout 30 ftagent --test 2>&1 || CODE=$?
           if [ "${CODE:-0}" -le 1 ]; then
             echo "Agent started and connected successfully"
           else
