@@ -27,8 +27,8 @@ jobs:
 
       - name: Write test config
         run: |
-          sudo mkdir -p /etc/ftagent
-          echo '{"api_key":"${{ secrets.STAGING_NODE_KEY }}","node_uuid":"${{ secrets.STAGING_NODE_UUID }}","api_base":"${{ secrets.STAGING_API_URL }}"}' | sudo tee /etc/ftagent/config.json > /dev/null
+          mkdir -p /etc/ftagent 2>/dev/null || sudo mkdir -p /etc/ftagent
+          echo '{"api_key":"${{ secrets.STAGING_NODE_KEY }}","node_uuid":"${{ secrets.STAGING_NODE_UUID }}","api_base":"${{ secrets.STAGING_API_URL }}"}' > /etc/ftagent/config.json 2>/dev/null || echo '{"api_key":"${{ secrets.STAGING_NODE_KEY }}","node_uuid":"${{ secrets.STAGING_NODE_UUID }}","api_base":"${{ secrets.STAGING_API_URL }}"}' | sudo tee /etc/ftagent/config.json > /dev/null
 
       - name: Verify agent starts
         run: |
