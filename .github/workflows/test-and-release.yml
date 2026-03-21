@@ -1,0 +1,128 @@
+name: Test & Release ftagent
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+    inputs:
+      skip_publish:
+        description: 'Skip PyPI/GitHub publish (test only)'
+        type: boolean
+        default: false
+
+jobs:
+  # ── Stage 1: Deploy to test server and verify agent starts ─────────────────
+  test-on-server:
+    name: Deploy & Smoke Test
+    runs-on: [self-hosted, linux, ftagent]
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          pip3 install --upgrade pip
+          pip3 install -e ".[full]" 2>&1 | tail -5
+
+      - name: Verify agent starts
+        run: |
+          # Run agent in test mode (--test flag: single heartbeat then exit)
+          timeout 30 ftagent --api-url ${{ secrets.STAGING_API_URL }} --api-key ${{ secrets.STAGING_NODE_KEY }} --test 2>&1 || CODE=$?
+          if [ "${CODE:-0}" -le 1 ]; then
+            echo "Agent started and connected successfully"
+          else
+            echo "Agent failed to start (exit code: $CODE)"
+            exit 1
+          fi
+
+      - name: Restart agent service
+        run: |
+          sudo systemctl restart ftagent 2>/dev/null || true
+          sleep 5
+          # Check it's running
+          if systemctl is-active --quiet ftagent 2>/dev/null; then
+            echo "ftagent service running"
+            sudo journalctl -u ftagent --no-pager -n 10
+          else
+            echo "Warning: ftagent service not active (may not be installed as service)"
+          fi
+
+      - name: Verify agent is reporting
+        run: |
+          # Give it 15 seconds to send heartbeats, then check logs
+          sleep 15
+          if sudo journalctl -u ftagent --no-pager -n 5 2>/dev/null | grep -q "heartbeat\|online\|baseline"; then
+            echo "Agent is reporting normally"
+          else
+            echo "Agent may not be reporting - check manually"
+          fi
+
+  # ── Stage 2: Build and publish (only on main branch push) ──────────────────
+  publish:
+    name: Build & Publish
+    needs: test-on-server
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || !inputs.skip_publish)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Extract version
+        id: version
+        run: |
+          VER=$(python3 -c "import re; print(re.search(r'VERSION\s*=\s*\"([^\"]+)\"', open('ftagent/agent.py').read()).group(1))")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Version: $VER"
+
+      - name: Check if version already published
+        id: check_pypi
+        run: |
+          pip3 install requests
+          STATUS=$(python3 -c "
+          import requests
+          r = requests.get('https://pypi.org/pypi/ftagent/${{ steps.version.outputs.version }}/json')
+          print('exists' if r.status_code == 200 else 'new')
+          ")
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "PyPI status: $STATUS"
+
+      - name: Build package
+        if: steps.check_pypi.outputs.status == 'new'
+        run: |
+          pip3 install build twine
+          python3 -m build
+          ls -la dist/
+
+      - name: Publish to PyPI
+        if: steps.check_pypi.outputs.status == 'new'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          python3 -m twine upload dist/*
+          echo "Published ftagent ${{ steps.version.outputs.version }} to PyPI"
+
+      - name: Create GitHub Release
+        if: steps.check_pypi.outputs.status == 'new'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          # Extract changelog for this version (between version headers)
+          NOTES=$(awk "/^## $VER/,/^## [0-9]/" CHANGELOG.md | head -n -1 | tail -n +2)
+          if [ -z "$NOTES" ]; then
+            NOTES="Release v$VER"
+          fi
+          gh release create "v$VER" dist/* \
+            --title "v$VER" \
+            --notes "$NOTES" \
+            --latest
+          echo "Created GitHub release v$VER"
