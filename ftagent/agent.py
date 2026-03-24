@@ -2252,6 +2252,13 @@ class Agent:
         if result and "uuid" in result:
             self.incident_uuid = result["uuid"]
             logger.info("Incident opened: %s", self.incident_uuid)
+            # Apply auto-mitigation commands returned with the incident response
+            # so firewall rules take effect immediately without waiting for next poll
+            if "pending_commands" in result and result["pending_commands"]:
+                logger.info("Applying %d auto-mitigation command(s) from incident response",
+                            len(result["pending_commands"]))
+                for cmd in result["pending_commands"]:
+                    self._execute_command(cmd)
         else:
             self.incident_uuid = str(uuid.uuid4())
             logger.warning("Using local incident UUID: %s", self.incident_uuid)
@@ -2743,7 +2750,7 @@ class Agent:
 
         allowed_prefixes = (
             "iptables ", "ip6tables ", "ipset ", "sysctl ",
-            "nft ", "ufw ", "tc ", "ip route ",
+            "nft ", "ufw ", "firewall-cmd ", "tc ", "ip route ",
             "fail2ban-client ", "nginx ", "apache2ctl ",
             "echo ", "sed ", "rm -f /etc/nginx/conf.d/ft_",
             "rm -f /etc/apache2/conf-enabled/ft_",
