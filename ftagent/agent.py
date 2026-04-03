@@ -2204,12 +2204,20 @@ class Agent:
 
         # Buffer metrics locally, flush every _metrics_interval seconds.
         # Detection still runs every 1s tick — only the API POST is batched.
+        # Use flow protocol breakdown when flow data is richer than /proc/net/snmp
+        tcp_pct = self.monitor.tcp_pct
+        udp_pct = self.monitor.udp_pct
+        icmp_pct = self.monitor.icmp_pct
+        if self.flow and self.flow.aggregator.flow_count > 0:
+            tcp_pct = self.flow.aggregator.tcp_pct
+            udp_pct = self.flow.aggregator.udp_pct
+            icmp_pct = self.flow.aggregator.icmp_pct
         self._metrics_buffer.append({
             "pps": round(pps, 1),
             "bps": round(bps, 1),
-            "tcp_pct": self.monitor.tcp_pct,
-            "udp_pct": self.monitor.udp_pct,
-            "icmp_pct": self.monitor.icmp_pct,
+            "tcp_pct": tcp_pct,
+            "udp_pct": udp_pct,
+            "icmp_pct": icmp_pct,
             "conn_count": self.monitor.conn_count,
             "threshold": round(self.threshold, 1),
         })
