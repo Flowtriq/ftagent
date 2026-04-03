@@ -36,7 +36,16 @@ DEFAULT_CONFIG = {
     "baseline_window": 300,
     "health_port": 9100,
     "auto_update": True,
+    # Flow protocol collector (sFlow/NetFlow/IPFIX)
+    "flow_enabled": False,
+    "flow_protocol": "auto",  # "auto", "sflow", "netflow_v5", "netflow_v9", "ipfix"
+    "flow_port": 0,           # 0 = use protocol default (6343/2055/4739)
+    "flow_bind": "0.0.0.0",
+    "flow_sample_rate": 0,    # Override sample rate (0 = use what's in the packets)
 }
+
+# Flow collector (built-in, no extra deps)
+from ftagent.flow_collector import FlowCollector
 
 # Optional dependency imports
 try:
@@ -2023,6 +2032,11 @@ class Agent:
         self.pcap = PcapCapture(cfg, self.monitor.interface,
                                 self.analyser, self.ioc_matcher)
 
+        # Flow collector (sFlow/NetFlow/IPFIX)
+        self.flow: Optional[FlowCollector] = None
+        if cfg.get("flow_enabled"):
+            self.flow = FlowCollector(cfg)
+
         # L7 monitoring (configured via server config)
         self.l7: Optional[L7Monitor] = None
         self.l7_enabled = False
@@ -2053,15 +2067,20 @@ class Agent:
         return self.baseline.threshold
 
     def _proto_breakdown(self) -> dict:
-        """Protocol breakdown from scapy packet inspection when available,
-        falling back to /proc/net/snmp.  Scapy sees ALL packets including
-        those dropped before the kernel protocol handler, so it's the
-        ground truth for flood classification."""
+        """Protocol breakdown from the best available source:
+        1. Scapy packet inspection (ground truth — sees drops)
+        2. Flow collector data (upstream router visibility)
+        3. /proc/net/snmp (kernel counters only)"""
         scapy_proto = self.analyser.protocol_breakdown()
-        # Use scapy data if it has meaningful packet counts
         if sum(scapy_proto.values()) > 0:
             return scapy_proto
-        # Fallback to SNMP (only reliable for non-flood traffic)
+        # Flow collector has per-protocol breakdowns from flow records
+        if self.flow and self.flow.aggregator.flow_count > 0:
+            return {
+                "tcp": self.flow.aggregator.tcp_pct,
+                "udp": self.flow.aggregator.udp_pct,
+                "icmp": self.flow.aggregator.icmp_pct,
+            }
         return {
             "tcp": self.monitor.tcp_pct,
             "udp": self.monitor.udp_pct,
@@ -2101,6 +2120,12 @@ class Agent:
             health = HealthCheckHandler(self, port=health_port)
             threads.append(threading.Thread(
                 target=health.start, daemon=True, name="health-check"))
+
+        # Flow collector thread (sFlow/NetFlow/IPFIX)
+        if self.flow:
+            threads.append(threading.Thread(
+                target=self.flow.start, args=(self.shutdown,),
+                daemon=True, name="flow-collector"))
 
         # Auto-update thread
         if self.cfg.get("auto_update", False):
@@ -2157,6 +2182,17 @@ class Agent:
 
         pps = self.monitor.pps
         bps = self.monitor.bps
+
+        # Merge flow collector data when active — flow data provides richer
+        # protocol breakdown and source IP visibility from upstream routers.
+        # Use flow PPS/BPS if higher than local /proc/net/dev (flow sees
+        # traffic before it reaches the kernel, e.g. upstream aggregation).
+        if self.flow and self.flow.aggregator.read(dt=1.0):
+            flow_pps = self.flow.aggregator.pps
+            flow_bps = self.flow.aggregator.bps
+            if flow_pps > pps:
+                pps = flow_pps
+                bps = flow_bps
 
         # Don't pollute baseline with attack traffic — it would inflate the
         # threshold and make future detection less sensitive.
@@ -2322,14 +2358,26 @@ class Agent:
                        self.peak_pps, self.threshold, family)
 
         # Alert-first: open incident before starting PCAP capture
-        result = self.api.open_incident({
+        inc_data = {
             "peak_pps": round(self.peak_pps, 1),
             "peak_bps": round(self.peak_bps, 1),
             "started_at": started_at,
             "attack_family": family,
             "baseline_pps": round(self.baseline.avg_pps, 1),
             "duration": 0,
-        })
+        }
+        # Include flow collector source IPs + ports for immediate visibility
+        if self.flow and self.flow.aggregator.src_ip_count > 0:
+            inc_data["top_src_ips"] = [
+                {"ip": ip, "packets": pkts}
+                for ip, pkts in self.flow.aggregator.top_src_ips(20)
+            ]
+            inc_data["top_dst_ports"] = [
+                {"port": port, "packets": pkts}
+                for port, pkts in self.flow.aggregator.top_dst_ports(20)
+            ]
+            inc_data["source_ip_count"] = self.flow.aggregator.src_ip_count
+        result = self.api.open_incident(inc_data)
 
         if result and "uuid" in result:
             self.incident_uuid = result["uuid"]
@@ -2470,6 +2518,9 @@ class Agent:
                     hb["src_ip_overflow"] = self.analyser._src_ip_overflow
                     hb["src_ip_count"] = len(self.analyser.src_ips)
                     hb["pkt_samples_count"] = len(self.analyser.pkt_lengths)
+                # Export flow collector stats
+                if self.flow:
+                    hb["flow_collector"] = self.flow.stats
                 self.api.heartbeat(hb)
             except Exception as exc:
                 logger.error("Heartbeat error: %s", exc)
@@ -2587,6 +2638,25 @@ class Agent:
             if "pending_commands" in data and data["pending_commands"]:
                 for cmd in data["pending_commands"]:
                     self._execute_command(cmd)
+
+            # Flow collector config from server (dashboard can enable/configure per node)
+            flow_cfg = data.get("flow", {})
+            if flow_cfg.get("enabled") and not self.flow:
+                # Server enabled flow collection — start collector
+                merged = dict(self.cfg)
+                merged["flow_enabled"] = True
+                merged["flow_protocol"] = flow_cfg.get("protocol", "auto")
+                merged["flow_port"] = flow_cfg.get("port", 0)
+                merged["flow_sample_rate"] = flow_cfg.get("sample_rate", 0)
+                self.flow = FlowCollector(merged)
+                threading.Thread(
+                    target=self.flow.start, args=(self.shutdown,),
+                    daemon=True, name="flow-collector").start()
+                logger.info("Flow collector enabled by server config: %s port %d",
+                           merged["flow_protocol"], self.flow.port)
+            elif not flow_cfg.get("enabled") and self.flow:
+                logger.info("Flow collector disabled by server config")
+                self.flow = None  # thread will exit on next shutdown check
 
             # L7 config from server
             l7_cfg = data.get("l7", {})
