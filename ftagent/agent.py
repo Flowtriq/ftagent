@@ -2416,9 +2416,13 @@ class Agent:
                 check_for_updates()
 
     def _auto_update_loop(self) -> None:
-        """Check PyPI for newer version every 6 hours; upgrade if auto_update is on."""
+        """Check PyPI for newer version; upgrade if auto_update is on.
+        First check after 60 seconds (catch updates quickly), then every 6 hours."""
+        first_run = True
         while not self.shutdown.is_set():
-            self.shutdown.wait(21600)  # 6 hours
+            wait_time = 60 if first_run else 21600  # 60s first, then 6 hours
+            first_run = False
+            self.shutdown.wait(wait_time)
             if self.shutdown.is_set():
                 break
             try:
@@ -2446,16 +2450,29 @@ class Agent:
                         "Auto-update: newer version %s available (current %s), "
                         "upgrading...", latest, VERSION)
                     import subprocess
+                    pip_cmd = [sys.executable, "-m", "pip", "install",
+                               "--upgrade", "ftagent"]
                     result = subprocess.run(
-                        [sys.executable, "-m", "pip", "install",
-                         "--upgrade", "ftagent"],
-                        capture_output=True, text=True, timeout=120,
+                        pip_cmd, capture_output=True, text=True, timeout=120,
                     )
+                    # Handle PEP 668 (externally managed Python on Debian 12+, Ubuntu 23.04+)
+                    if result.returncode != 0 and "externally-managed-environment" in result.stderr:
+                        pip_cmd.insert(-1, "--break-system-packages")
+                        result = subprocess.run(
+                            pip_cmd, capture_output=True, text=True, timeout=120,
+                        )
                     if result.returncode == 0:
                         logger.info(
                             "Auto-update: ftagent upgraded to %s. "
-                            "Restart the agent to use the new version.",
-                            latest)
+                            "Restarting service...", latest)
+                        # Auto-restart via systemd if running as service
+                        try:
+                            subprocess.run(
+                                ["systemctl", "restart", "ftagent"],
+                                capture_output=True, timeout=30,
+                            )
+                        except Exception:
+                            logger.info("Auto-update: restart ftagent manually to use v%s", latest)
                     else:
                         logger.warning(
                             "Auto-update: pip upgrade failed: %s",
