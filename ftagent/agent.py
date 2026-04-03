@@ -236,6 +236,11 @@ def save_config(path: str, cfg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 class APIClient:
+    # Circuit breaker settings
+    CB_FAILURE_THRESHOLD = 5       # consecutive failures to trip open
+    CB_RECOVERY_TIMEOUT  = 60      # seconds before half-open probe
+    CB_HALF_OPEN_MAX     = 1       # probes allowed in half-open state
+
     def __init__(self, cfg: dict):
         self.base = cfg["api_base"].rstrip("/")
         self.api_key = cfg["api_key"]
@@ -248,9 +253,51 @@ class APIClient:
             "User-Agent": f"ftagent/{VERSION}",
         })
         self.retry_queue: collections.deque = collections.deque(maxlen=2000)
+        # Circuit breaker state
+        self._cb_state = "closed"          # closed | open | half-open
+        self._cb_failures = 0
+        self._cb_last_failure: float = 0.0
+        self._cb_lock = threading.Lock()
+
+    def _cb_record_success(self) -> None:
+        with self._cb_lock:
+            self._cb_failures = 0
+            if self._cb_state != "closed":
+                logger.info("Circuit breaker closed — API recovered")
+                self._cb_state = "closed"
+
+    def _cb_record_failure(self) -> None:
+        with self._cb_lock:
+            self._cb_failures += 1
+            self._cb_last_failure = time.monotonic()
+            if self._cb_failures >= self.CB_FAILURE_THRESHOLD and self._cb_state == "closed":
+                self._cb_state = "open"
+                logger.warning("Circuit breaker OPEN after %d consecutive failures — "
+                               "blocking API calls for %ds",
+                               self._cb_failures, self.CB_RECOVERY_TIMEOUT)
+
+    def _cb_allow_request(self) -> bool:
+        with self._cb_lock:
+            if self._cb_state == "closed":
+                return True
+            elapsed = time.monotonic() - self._cb_last_failure
+            if self._cb_state == "open" and elapsed >= self.CB_RECOVERY_TIMEOUT:
+                self._cb_state = "half-open"
+                logger.info("Circuit breaker half-open — allowing probe request")
+                return True
+            if self._cb_state == "half-open":
+                return True  # allow the single probe
+            return False
+
+    @property
+    def circuit_breaker_state(self) -> str:
+        return self._cb_state
 
     def _post(self, path: str, payload: dict, timeout: int = 10,
               retries: int = 3) -> Optional[dict]:
+        if not self._cb_allow_request():
+            self.retry_queue.append(("POST", path, payload, timeout))
+            return None
         url = f"{self.base}{path}"
         for attempt in range(1, retries + 1):
             try:
@@ -271,9 +318,11 @@ class APIClient:
                         time.sleep(delay)
                         continue
                     else:
+                        self._cb_record_failure()
                         self.retry_queue.append(("POST", path, payload, timeout))
                         return None
                 resp.raise_for_status()
+                self._cb_record_success()
                 if resp.content:
                     return resp.json()
                 return {}
@@ -283,11 +332,14 @@ class APIClient:
                 if attempt < retries:
                     time.sleep(min(2 ** attempt, 10))
                 else:
+                    self._cb_record_failure()
                     self.retry_queue.append(("POST", path, payload, timeout))
         return None
 
     def _get(self, path: str, timeout: int = 10,
              retries: int = 3) -> Optional[dict]:
+        if not self._cb_allow_request():
+            return None
         url = f"{self.base}{path}"
         for attempt in range(1, retries + 1):
             try:
@@ -308,14 +360,18 @@ class APIClient:
                         time.sleep(delay)
                         continue
                     else:
+                        self._cb_record_failure()
                         return None
                 resp.raise_for_status()
+                self._cb_record_success()
                 return resp.json()
             except Exception as exc:
                 logger.warning("API GET %s attempt %d/%d failed: %s",
                                path, attempt, retries, exc)
                 if attempt < retries:
                     time.sleep(min(2 ** attempt, 10))
+                else:
+                    self._cb_record_failure()
         return None
 
     def send_metrics(self, data: dict) -> None:
@@ -2401,12 +2457,20 @@ class Agent:
             if self.shutdown.is_set():
                 break
             try:
-                self.api.heartbeat({
+                hb = {
                     "version": VERSION,
                     "baseline_ready": self.baseline.baseline_ready,
                     "baseline_avg_pps": round(self.baseline.avg_pps, 1),
                     "baseline_p99_pps": round(self.baseline.p99_pps, 1),
-                })
+                    "circuit_breaker": self.api.circuit_breaker_state,
+                    "retry_queue_size": len(self.api.retry_queue),
+                }
+                # Export analyser overflow metrics
+                if hasattr(self, 'analyser'):
+                    hb["src_ip_overflow"] = self.analyser._src_ip_overflow
+                    hb["src_ip_count"] = len(self.analyser.src_ips)
+                    hb["pkt_samples_count"] = len(self.analyser.pkt_lengths)
+                self.api.heartbeat(hb)
             except Exception as exc:
                 logger.error("Heartbeat error: %s", exc)
 
