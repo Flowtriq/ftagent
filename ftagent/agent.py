@@ -645,6 +645,13 @@ class TrafficAnalyser:
     def __init__(self):
         self.reset()
 
+    # Memory safety caps — prevent OOM on large botnets (10M+ source IPs)
+    MAX_SRC_IPS = 100_000       # max unique source IPs tracked
+    MAX_PKT_SAMPLES = 50_000    # max packet length / TTL samples
+    MAX_DNS_QUERIES = 10_000    # max unique DNS query names
+    MAX_IOC_HITS = 5_000        # max IOC match entries
+    MAX_TTL_PER_IP = 10         # max unique TTLs per source IP
+
     def reset(self) -> None:
         self.tcp_flags = {"SYN": 0, "ACK": 0, "RST": 0, "FIN": 0,
                           "PSH": 0, "URG": 0}
@@ -656,6 +663,7 @@ class TrafficAnalyser:
         self.dns_queries: dict = {}
         self.total_packets = 0
         self.ioc_hits: list = []
+        self._src_ip_overflow = False   # flag: True once we hit cap
 
     def process_packet(self, pkt, ioc_matcher=None) -> None:
         self.total_packets += 1
@@ -666,19 +674,36 @@ class TrafficAnalyser:
         if pkt.haslayer(IP):
             ip = pkt[IP]
             src = ip.src
-            self.src_ips[src] = self.src_ips.get(src, 0) + 1
-            self.pkt_lengths.append(len(pkt))
-            self.ttl_values.append(ip.ttl)
 
-            # Per-IP detail tracking for confidence scoring
-            if src not in self.src_ip_detail:
-                self.src_ip_detail[src] = {
-                    "tcp": 0, "udp": 0, "icmp": 0,
-                    "syn": 0, "ack": 0, "bytes": 0, "ttls": set()
-                }
-            d = self.src_ip_detail[src]
-            d["bytes"] += len(pkt)
-            d["ttls"].add(ip.ttl)
+            # Bounded src_ips: only track new IPs if under cap
+            if src in self.src_ips:
+                self.src_ips[src] += 1
+            elif len(self.src_ips) < self.MAX_SRC_IPS:
+                self.src_ips[src] = 1
+            else:
+                if not self._src_ip_overflow:
+                    self._src_ip_overflow = True
+                    logger.warning("Source IP tracking cap reached (%d IPs) — additional IPs not individually tracked", self.MAX_SRC_IPS)
+
+            # Bounded packet length / TTL samples
+            if len(self.pkt_lengths) < self.MAX_PKT_SAMPLES:
+                self.pkt_lengths.append(len(pkt))
+            if len(self.ttl_values) < self.MAX_PKT_SAMPLES:
+                self.ttl_values.append(ip.ttl)
+
+            # Bounded per-IP detail tracking
+            if src in self.src_ip_detail:
+                d = self.src_ip_detail[src]
+            elif len(self.src_ip_detail) < self.MAX_SRC_IPS:
+                d = {"tcp": 0, "udp": 0, "icmp": 0, "syn": 0, "ack": 0, "bytes": 0, "ttls": set()}
+                self.src_ip_detail[src] = d
+            else:
+                d = None
+
+            if d is not None:
+                d["bytes"] += len(pkt)
+                if len(d["ttls"]) < self.MAX_TTL_PER_IP:
+                    d["ttls"].add(ip.ttl)
 
             if pkt.haslayer(TCP):
                 tcp = pkt[TCP]
@@ -711,13 +736,14 @@ class TrafficAnalyser:
             if pkt.haslayer(DNS) and pkt[DNS].qr == 0:
                 try:
                     qname = pkt[DNS].qd.qname.decode(errors="ignore")
-                    self.dns_queries[qname] = self.dns_queries.get(qname, 0) + 1
+                    if qname in self.dns_queries or len(self.dns_queries) < self.MAX_DNS_QUERIES:
+                        self.dns_queries[qname] = self.dns_queries.get(qname, 0) + 1
                 except Exception:
                     pass
 
         if ioc_matcher and pkt.haslayer(Raw):
             hit = ioc_matcher.check(bytes(pkt[Raw].load))
-            if hit:
+            if hit and len(self.ioc_hits) < self.MAX_IOC_HITS:
                 self.ioc_hits.append(hit)
 
     def src_ip_entropy(self) -> float:
