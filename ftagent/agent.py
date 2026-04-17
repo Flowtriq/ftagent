@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -28,7 +28,7 @@ DEFAULT_CONFIG = {
     "api_base": "https://flowtriq.com/api/v1",
     "interface": "auto",
     "pcap_enabled": True,
-    "pcap_mode": "scapy",  # "scapy" (default, real-time analysis) or "tcpdump" (low CPU for high-traffic servers)
+    "pcap_mode": "tcpdump",  # "tcpdump" (recommended, near-zero CPU) or "scapy" (per-packet Python analysis — high CPU on busy servers)
     "pcap_dir": "/var/lib/ftagent/pcaps",
     "log_file": "/var/log/ftagent.log",
     "log_level": "INFO",
@@ -984,6 +984,7 @@ class PcapCapture:
                  ioc_matcher: IOCMatcher):
         self.pcap_mode = cfg.get("pcap_mode", "tcpdump")
         self.enabled = cfg.get("pcap_enabled", True) and (SCAPY_AVAILABLE or self.pcap_mode == "tcpdump")
+        self.config_path = cfg.get("_config_path", CONFIG_PATH)
         self.pcap_dir = cfg.get("pcap_dir", "/var/lib/ftagent/pcaps")
         self.iface = iface
         self._tcpdump_proc = None
@@ -1007,6 +1008,81 @@ class PcapCapture:
             self._background_ring_tcpdump(shutdown)
         else:
             self._background_ring_scapy(shutdown)
+
+    def _tcpdump_unavailable(self, reason: str) -> None:
+        """Handle tcpdump being unavailable — warn the user, prompt to disable
+        pcap or let them fix it.  Never silently fall back to scapy."""
+        border = "=" * 72
+        msg = f"""
+{border}
+  PCAP CAPTURE UNAVAILABLE — tcpdump could not be started
+{border}
+
+  Reason: {reason}
+
+  Your pcap_mode is set to "tcpdump", which is the recommended mode for
+  servers handling significant traffic.  tcpdump captures packets at
+  native speed with near-zero CPU overhead.
+
+  The alternative "scapy" mode processes every packet in Python and WILL
+  cause extremely high CPU usage (90%+) on busy servers — such as game
+  servers, proxies, or anything above a few thousand packets/sec.
+  If you still want to use scapy, you can change pcap_mode to "scapy"
+  in your config file:  {self.config_path}
+
+  You can also ingest traffic data from an upstream router or switch
+  using our built-in flow collector instead of local packet capture.
+  We support sFlow, NetFlow v5, NetFlow v9, and IPFIX.
+  Enable it in your config with "flow_enabled": true — see docs for
+  details.
+
+{border}
+"""
+        # Log it so it always appears in journalctl / log file
+        for line in msg.strip().splitlines():
+            logger.error(line)
+
+        # Interactive prompt — if stdin is available, let the user choose.
+        # In daemon/systemd context this will fall through to disabling pcap.
+        try:
+            if sys.stdin is not None and sys.stdin.isatty():
+                print(msg, file=sys.stderr)
+                print(
+                    "  WARNING: Disabling packet capture removes a core feature\n"
+                    "  of the Flowtriq agent.  Attack analysis, traffic fingerprinting,\n"
+                    "  and PCAP evidence collection will all be unavailable.\n"
+                    "  This will severely limit our ability to analyze and mitigate attacks.\n",
+                    file=sys.stderr,
+                )
+                answer = input("  Disable packet capture and continue without it? [y/N] ").strip().lower()
+                if answer == "y":
+                    logger.warning("Packet capture disabled by user — running without PCAP")
+                    print("\n  Packet capture disabled.  The agent will continue running but\n"
+                          "  attack analysis capabilities are severely reduced.\n",
+                          file=sys.stderr)
+                    self.enabled = False
+                    return
+                else:
+                    logger.error("User chose not to disable pcap — exiting so tcpdump can be fixed")
+                    print("\n  Please install tcpdump and restart the agent.\n"
+                          "  On Debian/Ubuntu:  apt-get install -y tcpdump\n"
+                          "  On RHEL/CentOS:    yum install -y tcpdump\n"
+                          "  On Alpine:         apk add tcpdump\n",
+                          file=sys.stderr)
+                    os._exit(1)
+            else:
+                # Non-interactive (systemd, nohup, etc.) — cannot prompt, disable pcap
+                logger.error(
+                    "Non-interactive session — disabling packet capture.  "
+                    "Install tcpdump and restart the agent to restore full functionality."
+                )
+                self.enabled = False
+        except (EOFError, OSError):
+            logger.error(
+                "Cannot prompt for input — disabling packet capture.  "
+                "Install tcpdump and restart the agent to restore full functionality."
+            )
+            self.enabled = False
 
     def _background_ring_tcpdump(self, shutdown: threading.Event) -> None:
         """Use tcpdump for continuous capture. Native speed, near-zero CPU.
@@ -1048,8 +1124,10 @@ class PcapCapture:
                     except (FileNotFoundError, subprocess.TimeoutExpired):
                         continue
                 if not installed:
-                    logger.warning("Could not install tcpdump, falling back to scapy")
-                    self._background_ring_scapy(shutdown)
+                    self._tcpdump_unavailable(
+                        "tcpdump is not installed and automatic installation failed.  "
+                        "Install it manually (e.g. apt-get install tcpdump) and restart the agent."
+                    )
                     return
 
             # Also ensure mergecap is available (for merging ring files on capture stop)
@@ -1081,8 +1159,10 @@ class PcapCapture:
                                    self._tcpdump_proc.returncode, stderr[:200])
                     _restarts += 1
                     if _restarts > 5:
-                        logger.error("tcpdump crashed %d times, falling back to scapy", _restarts)
-                        self._background_ring_scapy(shutdown)
+                        self._tcpdump_unavailable(
+                            f"tcpdump crashed {_restarts} times consecutively.  "
+                            "It may be incompatible with this system or missing permissions."
+                        )
                         return
                     shutdown.wait(5)
                     if not shutdown.is_set():
@@ -1098,14 +1178,16 @@ class PcapCapture:
                 self._tcpdump_proc.kill()
 
         except FileNotFoundError:
-            logger.warning("tcpdump not found, falling back to scapy sniff mode")
-            self._background_ring_scapy(shutdown)
+            self._tcpdump_unavailable(
+                "tcpdump binary not found on this system."
+            )
         except Exception as exc:
-            logger.warning("PCAP ring buffer error: %s", exc)
+            self._tcpdump_unavailable(f"Unexpected error starting tcpdump: {exc}")
 
     def _background_ring_scapy(self, shutdown: threading.Event) -> None:
-        """Fallback to scapy sniff if tcpdump is not available."""
-        logger.info("PCAP ring buffer active on %s (scapy fallback)", self.iface)
+        """Scapy sniff mode — per-packet Python analysis. Only runs when
+        pcap_mode is explicitly set to 'scapy' in the config."""
+        logger.warning("PCAP ring buffer active on %s (scapy mode — high CPU on busy servers)", self.iface)
         try:
             sniff(iface=self.iface, prn=self._ring_cb, store=False,
                   stop_filter=lambda _: shutdown.is_set())
@@ -3273,6 +3355,7 @@ def main() -> None:
         sys.exit(1)
 
     cfg = load_config(args.config)
+    cfg["_config_path"] = args.config  # pass through so PcapCapture can reference it
     setup_logging(cfg["log_file"], cfg["log_level"])
 
     if args.test:
