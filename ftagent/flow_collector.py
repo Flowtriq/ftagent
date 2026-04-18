@@ -591,10 +591,9 @@ class FlowAggregator:
             "SYN": 0, "ACK": 0, "RST": 0, "FIN": 0, "PSH": 0, "URG": 0,
         }
         self._flow_count = 0
-        # Destination IP monitoring (cumulative, not reset per window)
-        self._monitored_dst_ips: set[str] = set()
-        self._dst_ip_cap: int = 0  # 0 = unlimited
-        self._dst_ip_cap_reached: bool = False
+        # Destination IP filter: only process flow records destined for this node
+        self._node_ip: str = ""
+        self._records_filtered = 0
         # Snapshot from last read()
         self._snap_packets = 0
         self._snap_octets = 0
@@ -610,12 +609,10 @@ class FlowAggregator:
         """Ingest parsed flow records into the current aggregation window."""
         with self._lock:
             for rec in records:
-                # Enforce destination IP cap
-                if rec.dst_ip and rec.dst_ip not in self._monitored_dst_ips:
-                    if self._dst_ip_cap > 0 and len(self._monitored_dst_ips) >= self._dst_ip_cap:
-                        self._dst_ip_cap_reached = True
-                        continue
-                    self._monitored_dst_ips.add(rec.dst_ip)
+                # Only process flow records destined for this node's IP
+                if self._node_ip and rec.dst_ip and rec.dst_ip != self._node_ip:
+                    self._records_filtered += 1
+                    continue
 
                 self._packets += rec.packets
                 self._octets += rec.octets
@@ -723,23 +720,13 @@ class FlowAggregator:
         return dict(self._snap_tcp_flags)
 
     @property
-    def monitored_dst_ip_count(self) -> int:
-        return len(self._monitored_dst_ips)
+    def node_ip(self) -> str:
+        return self._node_ip
 
-    @property
-    def dst_ip_cap(self) -> int:
-        return self._dst_ip_cap
-
-    @dst_ip_cap.setter
-    def dst_ip_cap(self, value: int) -> None:
+    @node_ip.setter
+    def node_ip(self, value: str) -> None:
         with self._lock:
-            self._dst_ip_cap = value
-            if value == 0 or len(self._monitored_dst_ips) < value:
-                self._dst_ip_cap_reached = False
-
-    @property
-    def dst_ip_cap_reached(self) -> bool:
-        return self._dst_ip_cap_reached
+            self._node_ip = value
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -883,7 +870,6 @@ class FlowCollector:
             "protocol": self.protocol,
             "port": self.port,
             "running": self._running,
-            "monitored_dst_ips": self.aggregator.monitored_dst_ip_count,
-            "dst_ip_cap": self.aggregator.dst_ip_cap,
-            "dst_ip_cap_reached": self.aggregator.dst_ip_cap_reached,
+            "node_ip_filter": self.aggregator.node_ip or "none",
+            "records_filtered": self.aggregator._records_filtered,
         }
