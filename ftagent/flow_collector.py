@@ -737,6 +737,7 @@ class FlowCollector:
         self.port = cfg.get("flow_port", 0) or DEFAULT_PORTS.get(self.protocol, 6343)
         self.bind_addr = cfg.get("flow_bind", "0.0.0.0")
         self.sample_rate_override = cfg.get("flow_sample_rate", 0)
+        self.allowed_sources: set[str] = set(cfg.get("flow_source_ips", []))
         self.aggregator = FlowAggregator()
         self.template_cache = TemplateCache()
         self._sock: Optional[socket.socket] = None
@@ -744,6 +745,7 @@ class FlowCollector:
         # Metrics
         self._datagrams_received = 0
         self._datagrams_errors = 0
+        self._datagrams_rejected = 0
         self._records_parsed = 0
         self._last_template_prune: float = 0.0
 
@@ -777,6 +779,11 @@ class FlowCollector:
 
             self._datagrams_received += 1
             source_ip = addr[0]
+
+            # Enforce source IP whitelist (skip if whitelist is empty)
+            if self.allowed_sources and source_ip not in self.allowed_sources:
+                self._datagrams_rejected += 1
+                continue
 
             try:
                 records = self._parse(data, source_ip)
@@ -839,6 +846,7 @@ class FlowCollector:
     def stats(self) -> dict:
         return {
             "datagrams_received": self._datagrams_received,
+            "datagrams_rejected": self._datagrams_rejected,
             "datagrams_errors": self._datagrams_errors,
             "records_parsed": self._records_parsed,
             "templates_cached": len(self.template_cache._templates),
