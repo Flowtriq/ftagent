@@ -2741,15 +2741,15 @@ class Agent:
                 merged["flow_sample_rate"] = flow_cfg.get("sample_rate", 0)
                 merged["flow_source_ips"] = flow_cfg.get("source_ips", [])
                 self.flow = FlowCollector(merged)
-                self.flow.aggregator.dst_ip_cap = int(flow_cfg.get("dest_ip_cap", 0))
+                self.flow.aggregator.node_ip = flow_cfg.get("node_ip", "")
                 threading.Thread(
                     target=self.flow.start, args=(self.shutdown,),
                     daemon=True, name="flow-collector").start()
-                logger.info("Flow collector enabled by server config: %s port %d",
-                           merged["flow_protocol"], self.flow.port)
+                logger.info("Flow collector enabled by server config: %s port %d (filtering dst_ip=%s)",
+                           merged["flow_protocol"], self.flow.port, flow_cfg.get("node_ip", ""))
             elif flow_cfg.get("enabled") and self.flow:
-                # Update cap on existing collector (changes when nodes are added/removed)
-                self.flow.aggregator.dst_ip_cap = int(flow_cfg.get("dest_ip_cap", 0))
+                # Update node IP filter (in case node IP changes)
+                self.flow.aggregator.node_ip = flow_cfg.get("node_ip", "")
             elif not flow_cfg.get("enabled") and self.flow:
                 logger.info("Flow collector disabled by server config")
                 self.flow = None  # thread will exit on next shutdown check
