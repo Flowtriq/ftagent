@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "flow_port": 0,           # 0 = use protocol default (6343/2055/4739)
     "flow_bind": "0.0.0.0",
     "flow_sample_rate": 0,    # Override sample rate (0 = use what's in the packets)
+    "flow_source_ips": [],    # Allowed source IPs (empty = accept all)
 }
 
 # Flow collector (built-in, no extra deps)
@@ -2738,6 +2739,7 @@ class Agent:
                 merged["flow_protocol"] = flow_cfg.get("protocol", "auto")
                 merged["flow_port"] = flow_cfg.get("port", 0)
                 merged["flow_sample_rate"] = flow_cfg.get("sample_rate", 0)
+                merged["flow_source_ips"] = flow_cfg.get("source_ips", [])
                 self.flow = FlowCollector(merged)
                 threading.Thread(
                     target=self.flow.start, args=(self.shutdown,),
