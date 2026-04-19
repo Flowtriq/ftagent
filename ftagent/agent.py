@@ -2514,15 +2514,30 @@ class Agent:
         proto = self._proto_breakdown()
         family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"])
 
+        # Merge source IP data: use whichever source (scapy or flow) has more visibility
+        _scapy_src_count = len(self.analyser.src_ips)
+        _scapy_top_ips = self.analyser.top_src_ips()
+        _scapy_top_ports = self.analyser.top_dst_ports()
+        _src_count = _scapy_src_count
+        _top_ips = _scapy_top_ips
+        _top_ports = _scapy_top_ports
+        if self.flow and self.flow.aggregator.src_ip_count > _scapy_src_count:
+            _src_count = self.flow.aggregator.src_ip_count
+            _top_ips = [{"ip": ip, "packets": pkts}
+                        for ip, pkts in self.flow.aggregator.top_src_ips(20)]
+        if self.flow and len(self.flow.aggregator.top_dst_ports(20)) > len(_scapy_top_ports):
+            _top_ports = [{"port": p, "packets": pkts}
+                          for p, pkts in self.flow.aggregator.top_dst_ports(20)]
+
         self.api.update_incident(self.incident_uuid, {
             "peak_pps": round(self.peak_pps, 1),
             "peak_bps": round(self.peak_bps, 1),
             "attack_family": family,
             "protocol_breakdown": proto,
-            "source_ip_count": len(self.analyser.src_ips),
+            "source_ip_count": _src_count,
             "total_packets": self.analyser.total_packets,
-            "top_src_ips": self.analyser.top_src_ips(),
-            "top_dst_ports": self.analyser.top_dst_ports(),
+            "top_src_ips": _top_ips,
+            "top_dst_ports": _top_ports,
             "ioc_hits": list(set(self.analyser.ioc_hits)),
             "spoofing_detected": self.analyser.spoofing_detected(),
             "botnet_detected": self.analyser.botnet_detected(),
@@ -2555,6 +2570,19 @@ class Agent:
             self.attacking = False
             return
 
+        # Merge source IP data: prefer flow collector if it has broader visibility
+        _scapy_src_count = len(self.analyser.src_ips)
+        _src_count = _scapy_src_count
+        _top_ips = self.analyser.top_src_ips()
+        _top_ports_final = _top_ports
+        if self.flow and self.flow.aggregator.src_ip_count > _scapy_src_count:
+            _src_count = self.flow.aggregator.src_ip_count
+            _top_ips = [{"ip": ip, "packets": pkts}
+                        for ip, pkts in self.flow.aggregator.top_src_ips(20)]
+        if self.flow and len(self.flow.aggregator.top_dst_ports(20)) > len(_top_ports):
+            _top_ports_final = [{"port": p, "packets": pkts}
+                                for p, pkts in self.flow.aggregator.top_dst_ports(20)]
+
         self.api.resolve_incident(self.incident_uuid, {
             "duration_seconds": round(duration, 1),
             "peak_pps": round(self.peak_pps, 1),
@@ -2566,15 +2594,15 @@ class Agent:
             "spoofing_detected": self.analyser.spoofing_detected(),
             "botnet_detected": self.analyser.botnet_detected(),
             "total_packets": self.analyser.total_packets,
-            "source_ip_count": len(self.analyser.src_ips),
+            "source_ip_count": _src_count,
             "src_ip_entropy": self.analyser.src_ip_entropy(),
             "tcp_flag_breakdown": _flags,
             "dns_query_stats": self.analyser.dns_query_stats(),
             "pkt_length_histogram": self.analyser.pkt_length_histogram(),
             "ttl_distribution": self.analyser.ttl_distribution(),
             "velocity_curve": self.velocity_curve,
-            "top_src_ips": self.analyser.top_src_ips(),
-            "top_dst_ports": self.analyser.top_dst_ports(),
+            "top_src_ips": _top_ips,
+            "top_dst_ports": _top_ports_final,
             "avg_pkt_length": self.analyser.avg_pkt_length(),
         })
 
