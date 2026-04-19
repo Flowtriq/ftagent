@@ -2404,6 +2404,7 @@ class Agent:
                 _syn_est = _syn_c / (_syn_c + _ack_c)
 
         # tcpdump mode: parse ring files for protocol classification
+        _ring_total = _ring_tcp + _ring_udp + _ring_icmp
         if self.pcap.pcap_mode == "tcpdump" and _ring_total == 0 and self.pcap._ring_dir:
             try:
                 import glob, subprocess
