@@ -13,6 +13,7 @@ import math
 import os
 import re
 import signal
+import struct
 import sys
 import threading
 import time
@@ -20,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.8.4"
+VERSION = "1.9.0"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -43,6 +44,16 @@ DEFAULT_CONFIG = {
     "flow_bind": "0.0.0.0",
     "flow_sample_rate": 0,    # Override sample rate (0 = use what's in the packets)
     "flow_source_ips": [],    # Allowed source IPs (empty = accept all)
+    # GRE encapsulation deduplication (Feature 1)
+    # "auto"     = detect GRE interface automatically on startup; enable if found
+    # "enabled"  = always strip GRE headers before counting stats
+    # "disabled" = never strip (use for bare-metal interfaces, not GRE tunnels)
+    "gre_mode": "auto",
+    "gre_max_depth": 3,       # max nested GRE layers to strip (handles double/triple GRE)
+    # Hypervisor mode — per-VM/per-IP differentiation (Feature 2)
+    # When True + GRE mode active, tracks inner dst IP per customer VM
+    "hypervisor_mode": False,
+    "vm_labels": {},          # {"10.0.0.5": "Customer A", "10.0.0.6": "Customer B"}
 }
 
 # Flow collector (built-in, no extra deps)
@@ -56,7 +67,7 @@ except ImportError:
     REQUESTS_AVAILABLE = False
 
 try:
-    from scapy.all import IP, TCP, UDP, ICMP, DNS, Raw, PcapWriter, sniff
+    from scapy.all import IP, TCP, UDP, ICMP, DNS, Raw, PcapWriter, sniff, GRE
     SCAPY_AVAILABLE = True
 except ImportError:
     SCAPY_AVAILABLE = False
@@ -717,6 +728,7 @@ class TrafficAnalyser:
     MAX_DNS_QUERIES = 10_000    # max unique DNS query names
     MAX_IOC_HITS = 5_000        # max IOC match entries
     MAX_TTL_PER_IP = 10         # max unique TTLs per source IP
+    MAX_INNER_IPS = 1_000       # max inner dst IPs (VMs) tracked per hypervisor
 
     def reset(self) -> None:
         self.tcp_flags = {"SYN": 0, "ACK": 0, "RST": 0, "FIN": 0,
@@ -730,15 +742,39 @@ class TrafficAnalyser:
         self.total_packets = 0
         self.ioc_hits: list = []
         self._src_ip_overflow = False   # flag: True once we hit cap
+        # Per-VM tracking (Feature 2): inner dst IP after GRE decapsulation
+        self.inner_dst_ips: dict = {}  # inner_dst_ip -> packet count
+        self.per_vm_detail: dict = {}  # inner_dst_ip -> {pps, bps, tcp, udp, icmp, src_ips}
 
-    def process_packet(self, pkt, ioc_matcher=None) -> None:
+    def process_packet(self, pkt, ioc_matcher=None, gre_decap=None,
+                       hypervisor_mode: bool = False) -> None:
+        """
+        Analyse one packet for stats.
+
+        gre_decap: GREDecapsulator instance or None. When set, strips GRE
+                   headers from the stats packet. The original pkt is never
+                   modified — it's passed separately to PCAP for forensics.
+
+        hypervisor_mode: When True and GRE decapsulation happened, track inner
+                         destination IP to attribute traffic to individual VMs.
+        """
         self.total_packets += 1
 
         if not SCAPY_AVAILABLE:
             return
 
-        if pkt.haslayer(IP):
-            ip = pkt[IP]
+        # GRE decapsulation for stats (Feature 1).
+        # stats_pkt = inner packet (stripped of GRE headers).
+        # Original pkt is unchanged — caller writes it to PCAP as-is.
+        inner_dst_ip = None
+        stats_pkt = pkt
+        if gre_decap and gre_decap.enabled:
+            stats_pkt, was_gre = gre_decap.decapsulate_scapy(pkt)
+            if was_gre and hypervisor_mode and stats_pkt.haslayer(IP):
+                inner_dst_ip = stats_pkt[IP].dst
+
+        if stats_pkt.haslayer(IP):
+            ip = stats_pkt[IP]
             src = ip.src
 
             # Bounded src_ips: only track new IPs if under cap
@@ -751,9 +787,9 @@ class TrafficAnalyser:
                     self._src_ip_overflow = True
                     logger.warning("Source IP tracking cap reached (%d IPs) — additional IPs not individually tracked", self.MAX_SRC_IPS)
 
-            # Bounded packet length / TTL samples
+            # Bounded packet length / TTL samples (use inner packet length)
             if len(self.pkt_lengths) < self.MAX_PKT_SAMPLES:
-                self.pkt_lengths.append(len(pkt))
+                self.pkt_lengths.append(len(stats_pkt))
             if len(self.ttl_values) < self.MAX_PKT_SAMPLES:
                 self.ttl_values.append(ip.ttl)
 
@@ -767,21 +803,22 @@ class TrafficAnalyser:
                 d = None
 
             if d is not None:
-                d["bytes"] += len(pkt)
+                d["bytes"] += len(stats_pkt)
                 if len(d["ttls"]) < self.MAX_TTL_PER_IP:
                     d["ttls"].add(ip.ttl)
 
-            if pkt.haslayer(TCP):
-                tcp = pkt[TCP]
+            if stats_pkt.haslayer(TCP):
+                tcp = stats_pkt[TCP]
                 self.dst_ports[tcp.dport] = self.dst_ports.get(tcp.dport, 0) + 1
-                d["tcp"] += 1
+                if d is not None:
+                    d["tcp"] += 1
                 flags = tcp.flags
                 if flags & 0x02:
                     self.tcp_flags["SYN"] += 1
-                    d["syn"] += 1
+                    if d is not None: d["syn"] += 1
                 if flags & 0x10:
                     self.tcp_flags["ACK"] += 1
-                    d["ack"] += 1
+                    if d is not None: d["ack"] += 1
                 if flags & 0x04:
                     self.tcp_flags["RST"] += 1
                 if flags & 0x01:
@@ -791,21 +828,48 @@ class TrafficAnalyser:
                 if flags & 0x20:
                     self.tcp_flags["URG"] += 1
 
-            elif pkt.haslayer(UDP):
-                self.dst_ports[pkt[UDP].dport] = (
-                    self.dst_ports.get(pkt[UDP].dport, 0) + 1)
-                d["udp"] += 1
+            elif stats_pkt.haslayer(UDP):
+                self.dst_ports[stats_pkt[UDP].dport] = (
+                    self.dst_ports.get(stats_pkt[UDP].dport, 0) + 1)
+                if d is not None:
+                    d["udp"] += 1
 
-            elif pkt.haslayer(ICMP):
-                d["icmp"] += 1
+            elif stats_pkt.haslayer(ICMP):
+                if d is not None:
+                    d["icmp"] += 1
 
-            if pkt.haslayer(DNS) and pkt[DNS].qr == 0:
+            if stats_pkt.haslayer(DNS) and stats_pkt[DNS].qr == 0:
                 try:
-                    qname = pkt[DNS].qd.qname.decode(errors="ignore")
+                    qname = stats_pkt[DNS].qd.qname.decode(errors="ignore")
                     if qname in self.dns_queries or len(self.dns_queries) < self.MAX_DNS_QUERIES:
                         self.dns_queries[qname] = self.dns_queries.get(qname, 0) + 1
                 except Exception:
                     pass
+
+            # Per-VM inner dst IP tracking (Feature 2)
+            if inner_dst_ip:
+                if inner_dst_ip in self.inner_dst_ips:
+                    self.inner_dst_ips[inner_dst_ip] += 1
+                elif len(self.inner_dst_ips) < self.MAX_INNER_IPS:
+                    self.inner_dst_ips[inner_dst_ip] = 1
+                # Update per-VM protocol detail
+                if inner_dst_ip in self.per_vm_detail:
+                    vm = self.per_vm_detail[inner_dst_ip]
+                elif len(self.per_vm_detail) < self.MAX_INNER_IPS:
+                    vm = {"tcp": 0, "udp": 0, "icmp": 0, "bytes": 0, "src_ips": set()}
+                    self.per_vm_detail[inner_dst_ip] = vm
+                else:
+                    vm = None
+                if vm is not None:
+                    vm["bytes"] += len(stats_pkt)
+                    if src not in vm["src_ips"] and len(vm["src_ips"]) < 500:
+                        vm["src_ips"].add(src)
+                    if stats_pkt.haslayer(TCP):
+                        vm["tcp"] += 1
+                    elif stats_pkt.haslayer(UDP):
+                        vm["udp"] += 1
+                    elif stats_pkt.haslayer(ICMP):
+                        vm["icmp"] += 1
 
         if ioc_matcher and pkt.haslayer(Raw):
             hit = ioc_matcher.check(bytes(pkt[Raw].load))
@@ -953,6 +1017,50 @@ class TrafficAnalyser:
                           key=lambda x: x[1], reverse=True)[:10],
         }
 
+    def top_inner_dst_ips(self, n: int = 20) -> list:
+        """Top destination IPs inside GRE tunnels (per-VM targets). Feature 2."""
+        return [
+            {"inner_ip": ip, "count": c}
+            for ip, c in sorted(
+                self.inner_dst_ips.items(), key=lambda x: x[1], reverse=True
+            )[:n]
+        ]
+
+    def per_vm_breakdown(self, vm_labels: dict = None) -> list:
+        """
+        Per-VM traffic breakdown for hypervisor nodes. Feature 2.
+        Returns list of per-inner-IP stats, sorted by packet count descending.
+        vm_labels: optional {inner_ip: display_name} mapping from config.
+        """
+        labels = vm_labels or {}
+        result = []
+        total = max(1, sum(self.inner_dst_ips.values()))
+        for ip, count in sorted(
+            self.inner_dst_ips.items(), key=lambda x: x[1], reverse=True
+        )[:50]:
+            vm = self.per_vm_detail.get(ip, {})
+            entry = {
+                "inner_ip": ip,
+                "count": count,
+                "pct": round(count / total * 100, 1),
+                "src_ip_count": len(vm.get("src_ips", set())),
+                "bytes": vm.get("bytes", 0),
+                "tcp": vm.get("tcp", 0),
+                "udp": vm.get("udp", 0),
+                "icmp": vm.get("icmp", 0),
+            }
+            label = labels.get(ip)
+            if label:
+                entry["label"] = label
+            result.append(entry)
+        return result
+
+    def top_attacked_vm(self) -> str:
+        """Return the inner dst IP with the most traffic — the primary attack target. Feature 2."""
+        if not self.inner_dst_ips:
+            return ""
+        return max(self.inner_dst_ips.items(), key=lambda x: x[1])[0]
+
 
 # ---------------------------------------------------------------------------
 # IOC Matcher
@@ -977,12 +1085,192 @@ class IOCMatcher:
 
 
 # ---------------------------------------------------------------------------
+# GRE Decapsulator (Feature 1: GRE Encapsulation Traffic Deduplication)
+# ---------------------------------------------------------------------------
+
+class GREDecapsulator:
+    """
+    Strips GRE encapsulation before counting bytes/PPS for traffic stats.
+
+    Protocol: IP protocol 47 (GRE, RFC 2784/2890/3931)
+
+    Why this matters: On GRE tunnel interfaces the same traffic appears at
+    multiple layers — outer IP+GRE wrapper + inner payload. Without stripping,
+    bandwidth and PPS stats are inflated by 10-25% (GRE/IP header overhead)
+    or more with nested GRE.
+
+    PCAP forensics are NEVER stripped — the full original packet with all
+    encapsulation headers is always written to disk for forensic analysis.
+
+    Handles:
+    - Single GRE (standard hosting provider setup)
+    - Nested GRE-in-GRE (double/triple encapsulation, rare but real)
+    - Mixed traffic: non-GRE packets pass through unchanged
+    - Malformed GRE: falls back to original packet safely
+    """
+
+    GRE_PROTO = 47  # IP protocol number for GRE
+
+    def __init__(self, max_depth: int = 3):
+        self.max_depth = max_depth
+        self.enabled = False
+        # Stats for overhead ratio calculation (reset each tick)
+        self._outer_bytes = 0
+        self._inner_bytes = 0
+        self._gre_pkt_count = 0
+        self._total_pkt_count = 0
+
+    def decapsulate_scapy(self, pkt):
+        """
+        Strip GRE layers from a Scapy packet for stats.
+        Returns (inner_pkt, was_gre).
+        Original pkt is unchanged — caller passes original to PCAP.
+        """
+        self._total_pkt_count += 1
+
+        if not SCAPY_AVAILABLE or not pkt.haslayer(GRE):
+            return pkt, False
+
+        self._gre_pkt_count += 1
+        outer_len = len(pkt)
+
+        # Strip up to max_depth GRE layers
+        inner = pkt
+        for _ in range(self.max_depth):
+            if not inner.haslayer(GRE):
+                break
+            inner = inner[GRE].payload
+
+        inner_len = len(inner)
+        self._outer_bytes += outer_len
+        self._inner_bytes += inner_len
+        return inner, True
+
+    def decapsulate_raw(self, data: bytes):
+        """
+        Strip GRE from raw packet bytes (no Scapy dependency).
+        Used in tcpdump mode for BPS correction calculations.
+        Returns (inner_bytes, was_gre).
+        """
+        self._total_pkt_count += 1
+        original = data
+
+        for _ in range(self.max_depth):
+            if len(data) < 24:  # min: 20 IP + 4 GRE
+                break
+            # Parse IP header length and protocol
+            ihl = (data[0] & 0x0F) * 4
+            if len(data) < ihl + 4:
+                break
+            proto = data[9]
+            if proto != self.GRE_PROTO:
+                break
+            # Parse GRE header flags to find header length
+            if len(data) < ihl + 4:
+                break
+            gre_flags = struct.unpack('!H', data[ihl:ihl + 2])[0]
+            gre_hdr_len = 4
+            if gre_flags & 0x8000:  # Checksum + reserved (4 bytes)
+                gre_hdr_len += 4
+            if gre_flags & 0x2000:  # Key field (4 bytes)
+                gre_hdr_len += 4
+            if gre_flags & 0x1000:  # Sequence number (4 bytes)
+                gre_hdr_len += 4
+            inner_start = ihl + gre_hdr_len
+            if inner_start >= len(data):
+                break
+            data = data[inner_start:]
+
+        was_gre = data is not original
+        if was_gre:
+            self._gre_pkt_count += 1
+            self._outer_bytes += len(original)
+            self._inner_bytes += len(data)
+        return data, was_gre
+
+    @property
+    def overhead_ratio(self) -> float:
+        """Fraction of bytes that are GRE encapsulation overhead (0.0–1.0)."""
+        if self._outer_bytes == 0:
+            return 0.0
+        return max(0.0, (self._outer_bytes - self._inner_bytes) / self._outer_bytes)
+
+    @property
+    def gre_traffic_ratio(self) -> float:
+        """Fraction of packets that are GRE-encapsulated (0.0–1.0)."""
+        if self._total_pkt_count == 0:
+            return 0.0
+        return self._gre_pkt_count / self._total_pkt_count
+
+    def reset_window(self) -> None:
+        """Reset per-window stats (call each metrics tick)."""
+        self._outer_bytes = 0
+        self._inner_bytes = 0
+        self._gre_pkt_count = 0
+        self._total_pkt_count = 0
+
+
+def detect_gre_interface(iface: str) -> bool:
+    """
+    Return True if the given interface is a GRE tunnel.
+    Uses `ip -d link show` which shows interface type metadata.
+    Safe to call on any interface — returns False if indeterminate.
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["ip", "-d", "link", "show", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        lower = out.stdout.lower()
+        return any(t in lower for t in ("gre ", "gre\n", "gretap", "ip6gre", "ip6gretap"))
+    except Exception:
+        return False
+
+
+def detect_gre_tunnels() -> list:
+    """
+    Enumerate active GRE tunnel interfaces and their endpoints.
+    Returns list of dicts: [{name, remote, local, type}, ...]
+    Uses `ip tunnel show` (iproute2, standard on all modern Linux).
+    """
+    tunnels = []
+    try:
+        import subprocess
+        # ip tunnel show lists all GRE/IPIP tunnels with remote+local
+        out = subprocess.run(
+            ["ip", "tunnel", "show"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in out.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Pattern: "gre1: ip/gre remote 203.0.113.1 local 192.0.2.1 ..."
+            m = re.match(
+                r'(\S+):\s+(ip[/\w]*)(?:/gre|6gre)?\s+remote\s+([\d.a-fA-F:]+)\s+local\s+([\d.a-fA-F:]+)',
+                line, re.I,
+            )
+            if m:
+                tunnels.append({
+                    "name":   m.group(1),
+                    "type":   m.group(2),
+                    "remote": m.group(3),
+                    "local":  m.group(4),
+                })
+    except Exception as exc:
+        logger.debug("GRE tunnel detection failed: %s", exc)
+    return tunnels
+
+
+# ---------------------------------------------------------------------------
 # PCAP Capture
 # ---------------------------------------------------------------------------
 
 class PcapCapture:
     def __init__(self, cfg: dict, iface: str, analyser: TrafficAnalyser,
-                 ioc_matcher: IOCMatcher):
+                 ioc_matcher: IOCMatcher, gre_decap: "GREDecapsulator" = None,
+                 hypervisor_mode: bool = False):
         self.pcap_mode = cfg.get("pcap_mode", "tcpdump")
         self.enabled = cfg.get("pcap_enabled", True) and (SCAPY_AVAILABLE or self.pcap_mode == "tcpdump")
         self.config_path = cfg.get("_config_path", CONFIG_PATH)
@@ -992,6 +1280,8 @@ class PcapCapture:
         self._ring_dir = None
         self.analyser = analyser
         self.ioc_matcher = ioc_matcher
+        self._gre_decap = gre_decap
+        self._hypervisor_mode = hypervisor_mode
         self.ring_buffer: collections.deque = collections.deque(maxlen=1000)
         self.capture_packets: list = []
         self.capturing = False
@@ -1198,10 +1488,14 @@ class PcapCapture:
     def _ring_cb(self, pkt) -> None:
         self.ring_buffer.append(pkt)
         if self.capturing and len(self.capture_packets) < self.max_capture:
-            self.capture_packets.append(pkt)
+            self.capture_packets.append(pkt)  # always store original (unstripped) for forensics
             self._pkt_counter += 1
             if self._pkt_counter % self._analyse_every == 0:
-                self.analyser.process_packet(pkt, self.ioc_matcher)
+                self.analyser.process_packet(
+                    pkt, self.ioc_matcher,
+                    gre_decap=self._gre_decap,
+                    hypervisor_mode=self._hypervisor_mode,
+                )
 
     def start_capture(self, incident_uuid: str = "",
                        api_client=None) -> None:
@@ -2112,8 +2406,35 @@ class Agent:
             window=cfg.get("baseline_window", 300))
         self.analyser = TrafficAnalyser()
         self.ioc_matcher = IOCMatcher()
-        self.pcap = PcapCapture(cfg, self.monitor.interface,
-                                self.analyser, self.ioc_matcher)
+
+        # GRE deduplication (Feature 1)
+        self.gre_decap = GREDecapsulator(
+            max_depth=cfg.get("gre_max_depth", 3))
+        gre_mode = cfg.get("gre_mode", "auto")
+        if gre_mode == "enabled":
+            self.gre_decap.enabled = True
+            logger.info("GRE deduplication: enabled (forced via config)")
+        elif gre_mode == "auto":
+            # Auto-detect: check if monitored interface is a GRE tunnel
+            if detect_gre_interface(self.monitor.interface):
+                self.gre_decap.enabled = True
+                logger.info("GRE deduplication: auto-enabled (interface %s is a GRE tunnel)",
+                            self.monitor.interface)
+            else:
+                logger.debug("GRE deduplication: auto — interface %s is not GRE, disabled",
+                             self.monitor.interface)
+        else:
+            logger.debug("GRE deduplication: disabled via config")
+
+        # Hypervisor mode — per-VM tracking (Feature 2)
+        self.hypervisor_mode = bool(cfg.get("hypervisor_mode", False))
+        self.vm_labels: dict = cfg.get("vm_labels", {})
+        if self.hypervisor_mode:
+            logger.info("Hypervisor mode enabled — per-VM inner IP tracking active")
+
+        self.pcap = PcapCapture(
+            cfg, self.monitor.interface, self.analyser, self.ioc_matcher,
+            gre_decap=self.gre_decap, hypervisor_mode=self.hypervisor_mode)
 
         # Flow collector (sFlow/NetFlow/IPFIX)
         self.flow: Optional[FlowCollector] = None
@@ -2221,6 +2542,11 @@ class Agent:
 
         self._fetch_config()
 
+        # Detect and report GRE tunnels on startup (Features 1 & 3)
+        threading.Thread(
+            target=self._report_gre_tunnels, daemon=True,
+            name="gre-tunnel-detect").start()
+
         # Start L7 thread if enabled by server config
         if self.l7 and self.l7_enabled and not self.l7_thread_running:
             self.l7_thread_running = True
@@ -2266,6 +2592,16 @@ class Agent:
         pps = self.monitor.pps
         bps = self.monitor.bps
 
+        # GRE deduplication: subtract encapsulation overhead from BPS (Feature 1).
+        # PPS doesn't change (one outer packet = one inner packet).
+        # BPS is deflated by the GRE overhead ratio observed in the last window.
+        # This makes reported bandwidth match the actual inner traffic volume.
+        if self.gre_decap.enabled:
+            overhead = self.gre_decap.overhead_ratio
+            if overhead > 0:
+                bps = bps * (1.0 - overhead)
+            self.gre_decap.reset_window()
+
         # Merge flow collector data when active — flow data provides richer
         # protocol breakdown and source IP visibility from upstream routers.
         # Use flow PPS/BPS if higher than local /proc/net/dev (flow sees
@@ -2308,6 +2644,9 @@ class Agent:
         if now - self._last_metrics_push >= self._metrics_interval:
             self._last_metrics_push = now
             self._flush_metrics()
+            # Per-VM stats push (Feature 2) — only in hypervisor mode
+            if self.hypervisor_mode and self.analyser.inner_dst_ips:
+                self._flush_vm_stats()
 
         if not self.attacking:
             # Two detection paths:
@@ -2366,11 +2705,24 @@ class Agent:
         self._metrics_buffer = []
         self.api.send_metrics(agg)
 
+    def _flush_vm_stats(self) -> None:
+        """Send per-VM inner IP stats to the backend (Feature 2)."""
+        vm_stats = self.analyser.per_vm_breakdown(self.vm_labels)
+        if not vm_stats:
+            return
+        self.api._post("/agent/vm-stats", {
+            "vm_stats": vm_stats,
+            "gre_dedup_active": self.gre_decap.enabled,
+        }, timeout=5)
+
     def _begin_attack(self) -> None:
         self.attacking = True
         self.attack_start = time.time()
         self.peak_pps = self.monitor.pps
         self.peak_bps = self.monitor.bps
+        if self.flow and self.flow.aggregator.pps > self.peak_pps:
+            self.peak_pps = self.flow.aggregator.pps
+            self.peak_bps = self.flow.aggregator.bps
         self.below_count = 0
         self.velocity_curve = []
         self.analyser.reset()
@@ -2437,6 +2789,10 @@ class Agent:
             _init_tcp = round(_ring_tcp / _ring_total * 100, 1)
             _init_udp = round(_ring_udp / _ring_total * 100, 1)
             _init_icmp = round(_ring_icmp / _ring_total * 100, 1)
+        elif self.flow and self.flow.aggregator.flow_count > 0:
+            _init_tcp = self.flow.aggregator.tcp_pct
+            _init_udp = self.flow.aggregator.udp_pct
+            _init_icmp = self.flow.aggregator.icmp_pct
         else:
             _init_tcp = self.monitor.tcp_pct
             _init_udp = self.monitor.udp_pct
@@ -2446,8 +2802,21 @@ class Agent:
                                  syn_ratio=_syn_est)
         started_at = datetime.now(timezone.utc).isoformat()
 
-        logger.warning("ATTACK DETECTED — PPS=%.0f threshold=%.0f family=%s",
-                       self.peak_pps, self.threshold, family)
+        # Per-VM: identify which inner IP is being attacked (Feature 2)
+        target_vm_ip = ""
+        if self.hypervisor_mode and self.gre_decap.enabled:
+            target_vm_ip = self.analyser.top_attacked_vm()
+            if target_vm_ip:
+                vm_label = self.vm_labels.get(target_vm_ip, "")
+                label_str = f" ({vm_label})" if vm_label else ""
+                logger.warning("ATTACK DETECTED — PPS=%.0f threshold=%.0f family=%s target_vm=%s%s",
+                               self.peak_pps, self.threshold, family, target_vm_ip, label_str)
+            else:
+                logger.warning("ATTACK DETECTED — PPS=%.0f threshold=%.0f family=%s",
+                               self.peak_pps, self.threshold, family)
+        else:
+            logger.warning("ATTACK DETECTED — PPS=%.0f threshold=%.0f family=%s",
+                           self.peak_pps, self.threshold, family)
 
         # Alert-first: open incident before starting PCAP capture
         inc_data = {
@@ -2457,7 +2826,16 @@ class Agent:
             "attack_family": family,
             "baseline_pps": round(self.baseline.avg_pps, 1),
             "duration": 0,
+            # GRE / hypervisor metadata (Features 1 & 2)
+            "gre_dedup_active": self.gre_decap.enabled,
         }
+        if target_vm_ip:
+            inc_data["inner_ip"] = target_vm_ip
+            label = self.vm_labels.get(target_vm_ip, "")
+            if label:
+                inc_data["inner_ip_label"] = label
+        if self.hypervisor_mode and self.analyser.inner_dst_ips:
+            inc_data["vm_breakdown"] = self.analyser.per_vm_breakdown(self.vm_labels)
         # Include flow collector source IPs + ports for immediate visibility
         if self.flow and self.flow.aggregator.src_ip_count > 0:
             inc_data["top_src_ips"] = [
@@ -2529,7 +2907,7 @@ class Agent:
             _top_ports = [{"port": p, "packets": pkts}
                           for p, pkts in self.flow.aggregator.top_dst_ports(20)]
 
-        self.api.update_incident(self.incident_uuid, {
+        update_payload = {
             "peak_pps": round(self.peak_pps, 1),
             "peak_bps": round(self.peak_bps, 1),
             "attack_family": family,
@@ -2541,7 +2919,17 @@ class Agent:
             "ioc_hits": list(set(self.analyser.ioc_hits)),
             "spoofing_detected": self.analyser.spoofing_detected(),
             "botnet_detected": self.analyser.botnet_detected(),
-        })
+        }
+        # Per-VM breakdown update (Feature 2)
+        if self.hypervisor_mode and self.analyser.inner_dst_ips:
+            top_vm = self.analyser.top_attacked_vm()
+            if top_vm:
+                update_payload["inner_ip"] = top_vm
+                label = self.vm_labels.get(top_vm, "")
+                if label:
+                    update_payload["inner_ip_label"] = label
+            update_payload["vm_breakdown"] = self.analyser.per_vm_breakdown(self.vm_labels)
+        self.api.update_incident(self.incident_uuid, update_payload)
 
     def _end_attack(self) -> None:
         duration = time.time() - self.attack_start
@@ -2632,12 +3020,21 @@ class Agent:
                     "baseline_p99_pps": round(self.baseline.p99_pps, 1),
                     "circuit_breaker": self.api.circuit_breaker_state,
                     "retry_queue_size": len(self.api.retry_queue),
+                    # GRE dedup status (Feature 1)
+                    "gre_dedup_enabled": self.gre_decap.enabled,
+                    # Hypervisor mode status (Feature 2)
+                    "hypervisor_mode": self.hypervisor_mode,
+                    # Hybrid mode: report whether agent has PCAP active (Feature 5)
+                    "pcap_active": self.pcap.enabled,
+                    "flow_active": self.flow is not None,
                 }
                 # Export analyser overflow metrics
                 if hasattr(self, 'analyser'):
                     hb["src_ip_overflow"] = self.analyser._src_ip_overflow
                     hb["src_ip_count"] = len(self.analyser.src_ips)
                     hb["pkt_samples_count"] = len(self.analyser.pkt_lengths)
+                    if self.hypervisor_mode:
+                        hb["vm_count"] = len(self.analyser.inner_dst_ips)
                 # Export flow collector stats
                 if self.flow:
                     hb["flow_collector"] = self.flow.stats
@@ -2754,6 +3151,30 @@ class Agent:
                 self.ioc_matcher.load(data["ioc_patterns"])
             if "pcap_enabled" in data:
                 self.pcap.enabled = data["pcap_enabled"] and SCAPY_AVAILABLE
+            # GRE deduplication config from server (Feature 1)
+            if "gre_mode" in data:
+                gre_mode = data["gre_mode"]
+                if gre_mode == "enabled":
+                    if not self.gre_decap.enabled:
+                        logger.info("GRE dedup: enabled by server config")
+                    self.gre_decap.enabled = True
+                elif gre_mode == "disabled":
+                    if self.gre_decap.enabled:
+                        logger.info("GRE dedup: disabled by server config")
+                    self.gre_decap.enabled = False
+                elif gre_mode == "auto":
+                    self.gre_decap.enabled = detect_gre_interface(self.monitor.interface)
+            if "gre_max_depth" in data:
+                self.gre_decap.max_depth = int(data["gre_max_depth"])
+            # Hypervisor mode config from server (Feature 2)
+            if "hypervisor_mode" in data:
+                was = self.hypervisor_mode
+                self.hypervisor_mode = bool(data["hypervisor_mode"])
+                self.pcap._hypervisor_mode = self.hypervisor_mode
+                if not was and self.hypervisor_mode:
+                    logger.info("Hypervisor mode: enabled by server config")
+            if "vm_labels" in data and isinstance(data["vm_labels"], dict):
+                self.vm_labels = data["vm_labels"]
             # Process pending commands (iptables rules from dashboard)
             if "pending_commands" in data and data["pending_commands"]:
                 for cmd in data["pending_commands"]:
@@ -2806,6 +3227,40 @@ class Agent:
 
         except Exception as exc:
             logger.error("Config fetch error: %s", exc)
+
+    # ── GRE Tunnel Detection & Auto-Whitelisting (Feature 3) ───────────────
+
+    def _report_gre_tunnels(self) -> None:
+        """
+        Detect active GRE tunnels on this node and report them to the backend.
+        Backend will:
+          - Auto-whitelist tunnel endpoint IPs to prevent accidental blocking
+          - Store tunnel metadata for dashboard display
+          - Prompt the user to review the auto-whitelist
+
+        Called once on startup in a background thread. Safe to call if no GRE
+        tunnels exist — sends empty list, backend records nothing.
+        """
+        tunnels = detect_gre_tunnels()
+        if tunnels:
+            names = [t["name"] for t in tunnels]
+            remotes = [t["remote"] for t in tunnels]
+            logger.info("GRE tunnels detected: %s (remote endpoints: %s)",
+                        ", ".join(names), ", ".join(remotes))
+        else:
+            logger.debug("GRE tunnel detection: no tunnels found on this node")
+
+        # Report to backend regardless (empty list = no tunnels, backend clears stale)
+        try:
+            result = self.api._post("/agent/gre-tunnels", {
+                "tunnels": tunnels,
+                "gre_dedup_active": self.gre_decap.enabled,
+            }, timeout=10, retries=2)
+            if result and result.get("whitelisted"):
+                logger.info("Backend auto-whitelisted GRE endpoint(s): %s",
+                            ", ".join(result["whitelisted"]))
+        except Exception as exc:
+            logger.debug("GRE tunnel report failed (non-critical): %s", exc)
 
     # ── L7 Methods ─────────────────────────────────────────────────────────
 
@@ -3283,6 +3738,26 @@ def setup_wizard(config_path: str) -> None:
             print("  Using tcpdump mode. The agent will auto-install tcpdump if needed.")
         else:
             cfg["pcap_mode"] = "scapy"
+
+    # GRE interface check
+    print("\n  GRE Tunnel Setup:")
+    tunnels = detect_gre_tunnels()
+    if tunnels:
+        names = [t["name"] for t in tunnels]
+        print(f"  Detected GRE tunnel(s): {', '.join(names)}")
+        print("  GRE deduplication prevents stats inflation from encapsulation overhead.")
+        gre = input("  Enable GRE deduplication? [Y/n]: ").strip().lower()
+        cfg["gre_mode"] = "disabled" if gre == "n" else "enabled"
+        hyp = input("  Enable hypervisor mode (per-VM traffic breakdown)? [y/N]: ").strip().lower()
+        cfg["hypervisor_mode"] = hyp in ("y", "yes")
+    else:
+        detected = detect_gre_interface(cfg.get("interface", "auto"))
+        if detected:
+            print(f"  Interface {cfg['interface']} appears to be a GRE tunnel.")
+            gre = input("  Enable GRE deduplication? [Y/n]: ").strip().lower()
+            cfg["gre_mode"] = "disabled" if gre == "n" else "enabled"
+        else:
+            cfg["gre_mode"] = "auto"  # auto-detect at runtime
 
     save_config(config_path, cfg)
     print(f"\n  Config written to {config_path}")
