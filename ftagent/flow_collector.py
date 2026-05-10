@@ -110,11 +110,11 @@ def parse_sflow_v5(data: bytes) -> list[FlowRecord]:
     addr_len = 4 if addr_type == 1 else 16
     offset = 8 + addr_len  # skip agent address
 
-    if offset + 12 > len(data):
+    if offset + 16 > len(data):
         return records
 
-    _sub_agent_id, _seq, num_samples = struct.unpack_from("!III", data, offset)
-    offset += 12
+    _sub_agent_id, _seq, _uptime, num_samples = struct.unpack_from("!IIII", data, offset)
+    offset += 16
 
     for _ in range(min(num_samples, 200)):  # safety cap
         if offset + 8 > len(data):
@@ -149,9 +149,9 @@ def _parse_sflow_flow_sample(data: bytes, offset: int, length: int) -> list[Flow
     if offset + 32 > end:
         return records
 
-    (_seq, _src_id_type, _src_id_idx, sampling_rate, _sample_pool,
-     _drops, _input, _output, num_records) = struct.unpack_from("!IIIIIIIII", data, offset)
-    offset += 36
+    (_seq, _source_id, sampling_rate, _sample_pool,
+     _drops, _input, _output, num_records) = struct.unpack_from("!IIIIIIII", data, offset)
+    offset += 32
 
     for _ in range(min(num_records, 50)):
         if offset + 8 > end:
@@ -842,16 +842,15 @@ class FlowCollector:
         if len(data) < 4:
             return []
 
-        version = struct.unpack_from("!H", data, 0)[0]
+        # sFlow v5 version is a 32-bit field = 5 (first 2 bytes are 0x0000)
+        v32 = struct.unpack_from("!I", data, 0)[0]
+        if v32 == 5 and len(data) > 28:
+            return parse_sflow_v5(data)
 
-        if version == 5:
-            # Could be sFlow v5 (32-bit version) or NetFlow v5 (16-bit)
-            # sFlow uses 32-bit version field; check if first 4 bytes == 5
-            v32 = struct.unpack_from("!I", data, 0)[0]
-            if v32 == 5 and len(data) > 28:
-                return parse_sflow_v5(data)
-            elif version == 5 and len(data) >= 24:
-                return parse_netflow_v5(data)
+        # NetFlow v5/v9 and IPFIX use a 16-bit version field
+        version = struct.unpack_from("!H", data, 0)[0]
+        if version == 5 and len(data) >= 24:
+            return parse_netflow_v5(data)
         elif version == 9:
             return parse_netflow_v9(data, source_ip, self.template_cache)
         elif version == 10:
