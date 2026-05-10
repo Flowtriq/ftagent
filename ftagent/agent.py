@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -453,6 +453,13 @@ class APIClient:
 
                 logger.info("PCAP uploaded for incident %s (attempt %d)",
                             inc_uuid, attempt)
+                # Remove local file after successful upload
+                try:
+                    os.unlink(filepath)
+                    logger.debug("PCAP file removed after upload: %s", filepath)
+                except OSError as rm_err:
+                    logger.warning("Could not remove uploaded PCAP %s: %s",
+                                   filepath, rm_err)
                 return
             except Exception as exc:
                 logger.warning("PCAP upload attempt %d/%d failed for %s: %s",
@@ -1290,6 +1297,10 @@ class PcapCapture:
         self._stop_event = threading.Event()
         self._pkt_counter = 0
         self._analyse_every = 10  # deep-analyse every Nth packet during capture
+        # Retention / disk-cap settings
+        self.retention_days = cfg.get("pcap_retention_days", 7)
+        self.max_disk_mb = cfg.get("pcap_max_disk_mb", 2000)  # 2 GB default cap
+        self._last_cleanup = 0.0
 
     def background_ring(self, shutdown: threading.Event) -> None:
         if not self.enabled:
@@ -1589,6 +1600,68 @@ class PcapCapture:
         except Exception as exc:
             logger.error("PCAP chunk write failed: %s", exc)
             return None
+
+    def cleanup_pcaps(self) -> None:
+        """Remove old / excess pcap files to prevent disk exhaustion."""
+        try:
+            pcap_root = Path(self.pcap_dir)
+            if not pcap_root.is_dir():
+                return
+
+            # 1. Remove orphaned temp capture dirs older than 1 hour
+            for entry in pcap_root.iterdir():
+                if entry.is_dir() and entry.name.startswith("_capture_"):
+                    try:
+                        age_s = time.time() - entry.stat().st_mtime
+                        if age_s > 3600:
+                            import shutil
+                            shutil.rmtree(entry, ignore_errors=True)
+                            logger.info("Cleaned orphaned capture dir: %s", entry.name)
+                    except OSError:
+                        pass
+
+            # 2. Collect final pcap files (skip _ring/ and _capture_*/ dirs)
+            pcap_files = sorted(
+                (f for f in pcap_root.glob("*.pcap") if f.is_file()),
+                key=lambda f: f.stat().st_mtime,
+            )
+            if not pcap_files:
+                return
+
+            now = time.time()
+            max_age = self.retention_days * 86400
+            removed = 0
+
+            # 3. Delete files older than retention_days
+            remaining = []
+            for f in pcap_files:
+                try:
+                    if now - f.stat().st_mtime > max_age:
+                        f.unlink()
+                        removed += 1
+                    else:
+                        remaining.append(f)
+                except OSError:
+                    remaining.append(f)
+
+            # 4. Enforce disk cap (delete oldest first)
+            max_bytes = self.max_disk_mb * 1024 * 1024
+            total = sum(f.stat().st_size for f in remaining)
+            while remaining and total > max_bytes:
+                oldest = remaining.pop(0)
+                try:
+                    sz = oldest.stat().st_size
+                    oldest.unlink()
+                    total -= sz
+                    removed += 1
+                except OSError:
+                    pass
+
+            if removed:
+                logger.info("PCAP cleanup: removed %d file(s), %d remaining (%.1f MB)",
+                            removed, len(remaining), total / 1048576)
+        except Exception as exc:
+            logger.error("PCAP cleanup error: %s", exc)
 
     def stop_capture(self, incident_uuid: str) -> Optional[str]:
         self.capturing = False
@@ -2575,6 +2648,12 @@ class Agent:
                         daemon=True, name="pcap-ring")
                     self._sniffer_thread.start()
 
+            # Periodic pcap cleanup every 5 minutes
+            if (self.pcap.enabled
+                    and loop_start - self.pcap._last_cleanup >= 300):
+                self.pcap._last_cleanup = loop_start
+                self.pcap.cleanup_pcaps()
+
             elapsed = time.monotonic() - loop_start
             sleep_for = max(0, 1.0 - elapsed)
             self.shutdown.wait(sleep_for)
@@ -3002,6 +3081,7 @@ class Agent:
                     args=(self.incident_uuid, pcap_path),
                     daemon=True,
                 ).start()
+            self.pcap.cleanup_pcaps()
 
         self.attacking = False
         self.incident_uuid = ""
@@ -3454,7 +3534,14 @@ class Agent:
         # Stop PCAP capture
         try:
             if self.pcap.capturing:
-                self.pcap.stop_capture(self.l7_incident_uuid)
+                pcap_path = self.pcap.stop_capture(self.l7_incident_uuid)
+                if pcap_path:
+                    threading.Thread(
+                        target=self.api.upload_pcap,
+                        args=(self.l7_incident_uuid, pcap_path),
+                        daemon=True,
+                    ).start()
+                self.pcap.cleanup_pcaps()
         except Exception as exc:
             logger.error("L7: PCAP stop error: %s", exc)
 
