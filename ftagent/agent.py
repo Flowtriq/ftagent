@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.5"
+VERSION = "1.9.6"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -959,6 +959,10 @@ class TrafficAnalyser:
                 entry["icmp"] = d["icmp"]
                 entry["ttl_unique"] = len(d["ttls"])
                 entry["pct"] = round(pct * 100, 2)
+            # Check against threat intel blocklist
+            if hasattr(self, '_blocklist') and ip in self._blocklist:
+                entry["threat_intel"] = True
+                entry["confidence"] = max(entry.get("confidence", 0), 90)
             result.append(entry)
         return result
 
@@ -2483,6 +2487,7 @@ class Agent:
             window=cfg.get("baseline_window", 300))
         self.analyser = TrafficAnalyser()
         self.ioc_matcher = IOCMatcher()
+        self.ip_blocklist: set = set()  # threat intel IPs from server
 
         # GRE deduplication (Feature 1)
         self.gre_decap = GREDecapsulator(
@@ -3235,6 +3240,14 @@ class Agent:
                 self.ioc_matcher.load(data["ioc_patterns"])
             if "pcap_enabled" in data:
                 self.pcap.enabled = data["pcap_enabled"] and SCAPY_AVAILABLE
+            # Threat intel IP blocklist from server
+            if "ip_blocklist" in data and isinstance(data["ip_blocklist"], list):
+                new_bl = {entry["indicator"] for entry in data["ip_blocklist"]
+                          if isinstance(entry, dict) and entry.get("indicator")}
+                if new_bl != self.ip_blocklist:
+                    self.ip_blocklist = new_bl
+                    self.analyser._blocklist = new_bl
+                    logger.info("Threat intel blocklist: %d IPs loaded", len(new_bl))
             # GRE deduplication config from server (Feature 1)
             if "gre_mode" in data:
                 gre_mode = data["gre_mode"]
