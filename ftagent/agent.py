@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.3"
+VERSION = "1.9.4"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1050,15 +1050,15 @@ class TrafficAnalyser:
             self.inner_dst_ips.items(), key=lambda x: x[1], reverse=True
         )[:50]:
             vm = self.per_vm_detail.get(ip, {})
+            vm_total = max(1, vm.get("tcp", 0) + vm.get("udp", 0) + vm.get("icmp", 0))
             entry = {
                 "inner_ip": ip,
-                "count": count,
-                "pct": round(count / total * 100, 1),
+                "pps": count,
+                "bps": vm.get("bytes", 0),
+                "tcp_pct": round(vm.get("tcp", 0) / vm_total * 100, 2),
+                "udp_pct": round(vm.get("udp", 0) / vm_total * 100, 2),
+                "icmp_pct": round(vm.get("icmp", 0) / vm_total * 100, 2),
                 "src_ip_count": len(vm.get("src_ips", set())),
-                "bytes": vm.get("bytes", 0),
-                "tcp": vm.get("tcp", 0),
-                "udp": vm.get("udp", 0),
-                "icmp": vm.get("icmp", 0),
             }
             label = labels.get(ip)
             if label:
@@ -1264,10 +1264,10 @@ def detect_gre_tunnels() -> list:
             )
             if m:
                 tunnels.append({
-                    "name":   m.group(1),
-                    "type":   m.group(2),
-                    "remote": m.group(3),
-                    "local":  m.group(4),
+                    "name":      m.group(1),
+                    "type":      m.group(2),
+                    "remote_ip": m.group(3),
+                    "local_ip":  m.group(4),
                 })
     except Exception as exc:
         logger.debug("GRE tunnel detection failed: %s", exc)
@@ -2794,7 +2794,7 @@ class Agent:
         if not vm_stats:
             return
         self.api._post("/agent/vm-stats", {
-            "vm_stats": vm_stats,
+            "vms": vm_stats,
             "gre_dedup_active": self.gre_decap.enabled,
         }, timeout=5)
 
@@ -3328,7 +3328,7 @@ class Agent:
         tunnels = detect_gre_tunnels()
         if tunnels:
             names = [t["name"] for t in tunnels]
-            remotes = [t["remote"] for t in tunnels]
+            remotes = [t["remote_ip"] for t in tunnels]
             logger.info("GRE tunnels detected: %s (remote endpoints: %s)",
                         ", ".join(names), ", ".join(remotes))
         else:
@@ -3443,7 +3443,7 @@ class Agent:
         self.l7_velocity_curve = [{"t": 0, "rps": round(rps, 1)}]
         self.l7_attack_start = time.time()
         stats = info.get("stats", {})
-        result = self.api.open_incident({
+        payload = {
             "peak_pps": 0,
             "peak_bps": 0,
             "rps": round(rps),
@@ -3451,7 +3451,10 @@ class Agent:
             "started_at": datetime.now(timezone.utc).isoformat(),
             "attack_family": "http_flood",
             "attack_subtype": subtype,
-        })
+        }
+        if info.get("correlated_l3l4"):
+            payload["correlated_l3l4"] = True
+        result = self.api.open_incident(payload)
         if result and "uuid" in result:
             self.l7_incident_uuid = result["uuid"]
         else:
