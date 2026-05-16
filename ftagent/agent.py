@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.4"
+VERSION = "1.9.5"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -2922,11 +2922,11 @@ class Agent:
         # Include flow collector source IPs + ports for immediate visibility
         if self.flow and self.flow.aggregator.src_ip_count > 0:
             inc_data["top_src_ips"] = [
-                {"ip": ip, "packets": pkts}
+                {"ip": ip, "count": pkts}
                 for ip, pkts in self.flow.aggregator.top_src_ips(20)
             ]
             inc_data["top_dst_ports"] = [
-                {"port": port, "packets": pkts}
+                {"port": port, "count": pkts}
                 for port, pkts in self.flow.aggregator.top_dst_ports(20)
             ]
             inc_data["source_ip_count"] = self.flow.aggregator.src_ip_count
@@ -2984,10 +2984,10 @@ class Agent:
         _top_ports = _scapy_top_ports
         if self.flow and self.flow.aggregator.src_ip_count > _scapy_src_count:
             _src_count = self.flow.aggregator.src_ip_count
-            _top_ips = [{"ip": ip, "packets": pkts}
+            _top_ips = [{"ip": ip, "count": pkts}
                         for ip, pkts in self.flow.aggregator.top_src_ips(20)]
         if self.flow and len(self.flow.aggregator.top_dst_ports(20)) > len(_scapy_top_ports):
-            _top_ports = [{"port": p, "packets": pkts}
+            _top_ports = [{"port": p, "count": pkts}
                           for p, pkts in self.flow.aggregator.top_dst_ports(20)]
 
         update_payload = {
@@ -3048,10 +3048,10 @@ class Agent:
         _top_ports_final = _top_ports
         if self.flow and self.flow.aggregator.src_ip_count > _scapy_src_count:
             _src_count = self.flow.aggregator.src_ip_count
-            _top_ips = [{"ip": ip, "packets": pkts}
+            _top_ips = [{"ip": ip, "count": pkts}
                         for ip, pkts in self.flow.aggregator.top_src_ips(20)]
         if self.flow and len(self.flow.aggregator.top_dst_ports(20)) > len(_top_ports):
-            _top_ports_final = [{"port": p, "packets": pkts}
+            _top_ports_final = [{"port": p, "count": pkts}
                                 for p, pkts in self.flow.aggregator.top_dst_ports(20)]
 
         self.api.resolve_incident(self.incident_uuid, {
