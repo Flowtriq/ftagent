@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -266,6 +266,10 @@ class APIClient:
         self.base = cfg["api_base"].rstrip("/")
         self.api_key = cfg["api_key"]
         self.node_uuid = cfg["node_uuid"]
+        if not self.api_key or not self.node_uuid:
+            raise ValueError(
+                "API key and node UUID are required. Run 'sudo ftagent --setup' to configure."
+            )
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {self.api_key}",
@@ -1686,17 +1690,17 @@ class PcapCapture:
 
             if all_files:
                 try:
-                    # Use mergecap if available, else simple concat
+                    # Use mergecap if available, else copy first valid file
                     import subprocess
                     merge_result = subprocess.run(
                         ["mergecap", "-w", filepath] + all_files,
                         capture_output=True, timeout=30)
                     if merge_result.returncode != 0:
-                        # Fallback: concatenate (works for pcap, not pcapng)
-                        with open(filepath, "wb") as out:
-                            for f in all_files:
-                                with open(f, "rb") as inp:
-                                    out.write(inp.read())
+                        # Fallback: use the largest individual PCAP file
+                        # (concatenation corrupts the PCAP global header)
+                        best = max(all_files, key=lambda f: os.path.getsize(f))
+                        import shutil
+                        shutil.copy2(best, filepath)
                     logger.info("PCAP merged: %s (%d source files)", filepath, len(all_files))
                 except FileNotFoundError:
                     # No mergecap, just use the attack file
@@ -3414,13 +3418,11 @@ class Agent:
                 attack_info = self.l7.check_attack(stats)
                 if not attack_info:
                     continue
-                # Suppress L7 detection when an L3/L4 attack is already active —
-                # web server stress during a volumetric flood is a side effect,
-                # not a separate L7 attack.
+                # When L3/L4 attack is active, still report L7 but flag as correlated
+                # so the dashboard can show the full picture of multi-vector attacks.
                 if attack_info["type"] == "l7_flood" and self.attacking:
-                    logger.debug("L7: suppressed — L3/L4 attack already active")
-                    self.l7._attack_active = False
-                    continue
+                    logger.info("L7: detected during active L3/L4 attack — reporting as correlated")
+                    attack_info["correlated_l3l4"] = True
                 if attack_info["type"] == "l7_flood":
                     self._l7_begin_attack(attack_info)
                 elif attack_info["type"] == "l7_flood_end":
