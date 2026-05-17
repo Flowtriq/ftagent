@@ -433,15 +433,18 @@ class APIClient:
     def upload_pcap(self, inc_uuid: str, filepath: str,
                     retries: int = 3) -> None:
         url = f"{self.base}/agent/incidents/{inc_uuid}/pcap"
-
-        # Enforce size limit: truncate to a representative sample if too large
-        self._truncate_pcap(filepath)
-
-        file_size = os.path.getsize(filepath)
         chunk_size = 2 * 1024 * 1024  # 2 MB chunks
         # Unique upload ID prevents server-side chunk directory collisions
         # when multiple pcap files are uploaded for the same incident
         upload_id = uuid.uuid4().hex[:16]
+
+        # Enforce size limit: truncate to a representative sample if too large
+        try:
+            self._truncate_pcap(filepath)
+            file_size = os.path.getsize(filepath)
+        except FileNotFoundError:
+            logger.warning("PCAP file not found for upload, skipping: %s", filepath)
+            return
 
         for attempt in range(1, retries + 1):
             try:
