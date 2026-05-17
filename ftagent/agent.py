@@ -424,18 +424,8 @@ class APIClient:
             return filepath
         logger.warning("PCAP too large (%.1f MB), truncating to %.0f MB sample: %s",
                        file_size / 1048576, self.MAX_PCAP_UPLOAD_BYTES / 1048576, filepath)
-        truncated_path = filepath + ".truncated"
-        with open(filepath, "rb") as src, open(truncated_path, "wb") as dst:
-            # Copy up to the size limit (PCAP header + as many full packets as fit)
-            remaining = self.MAX_PCAP_UPLOAD_BYTES
-            while remaining > 0:
-                chunk = src.read(min(65536, remaining))
-                if not chunk:
-                    break
-                dst.write(chunk)
-                remaining -= len(chunk)
-        # Replace original with truncated version
-        os.replace(truncated_path, filepath)
+        with open(filepath, "r+b") as f:
+            f.truncate(self.MAX_PCAP_UPLOAD_BYTES)
         logger.info("PCAP truncated: %s now %.1f MB",
                     filepath, os.path.getsize(filepath) / 1048576)
         return filepath
@@ -1755,15 +1745,6 @@ class PcapCapture:
             shutil.rmtree(self._tcpdump_capture_dir, ignore_errors=True)
 
             if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                # Cap merged pcap to max upload size so we always have a sample
-                max_bytes = self._api_client.MAX_PCAP_UPLOAD_BYTES if hasattr(self, '_api_client') and self._api_client else 500 * 1024 * 1024
-                fsize = os.path.getsize(filepath)
-                if fsize > max_bytes:
-                    logger.warning("Merged PCAP %.1f MB exceeds cap, truncating to %.0f MB sample",
-                                   fsize / 1048576, max_bytes / 1048576)
-                    # Truncate in place - keeps pcap header + initial packets as sample
-                    with open(filepath, "r+b") as f:
-                        f.truncate(max_bytes)
                 return filepath
             return None
 
