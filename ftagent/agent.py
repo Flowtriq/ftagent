@@ -1319,6 +1319,7 @@ class PcapCapture:
         self.enabled = cfg.get("pcap_enabled", True) and (SCAPY_AVAILABLE or self.pcap_mode == "tcpdump")
         self.config_path = cfg.get("_config_path", CONFIG_PATH)
         self.pcap_dir = cfg.get("pcap_dir", "/var/lib/ftagent/pcaps")
+        self.snaplen = cfg.get("pcap_snaplen", 0)  # 0 = full packet, or set to e.g. 256 for high-traffic links
         self.iface = iface
         self._tcpdump_proc = None
         self._ring_dir = None
@@ -1434,9 +1435,10 @@ class PcapCapture:
         self._ring_dir = ring_dir
 
         ring_file = os.path.join(ring_dir, "ring_%Y%m%d_%H%M%S.pcap")
+        snaplen = str(self.snaplen) if self.snaplen else "0"
         tcpdump_cmd = [
             "tcpdump", "-i", self.iface, "-w", ring_file,
-            "-G", "30", "-W", "3", "-s", "0", "-q",
+            "-G", "30", "-W", "3", "-s", snaplen, "-q",
         ]
 
         logger.info("PCAP ring buffer active on %s (tcpdump mode)", self.iface)
@@ -1545,6 +1547,10 @@ class PcapCapture:
                     hypervisor_mode=self._hypervisor_mode,
                 )
 
+    # Max total size for pre-attack ring snapshot: 100MB
+    # This prevents copying multi-GB ring files on high-traffic links
+    _MAX_RING_SNAPSHOT_BYTES = 100 * 1024 * 1024
+
     def start_capture(self, incident_uuid: str = "",
                        api_client=None) -> None:
         if self.pcap_mode == "tcpdump" and self._ring_dir:
@@ -1553,18 +1559,40 @@ class PcapCapture:
             import shutil
             self._tcpdump_capture_dir = os.path.join(self.pcap_dir, f"_capture_{incident_uuid[:8]}")
             os.makedirs(self._tcpdump_capture_dir, exist_ok=True)
-            for rf in sorted(glob.glob(os.path.join(self._ring_dir, "ring*"))):
+            # Copy ring files newest-first, up to snapshot size limit
+            ring_files = sorted(
+                glob.glob(os.path.join(self._ring_dir, "ring*")),
+                key=lambda f: os.path.getmtime(f), reverse=True)
+            copied_bytes = 0
+            for rf in ring_files:
                 try:
+                    rf_size = os.path.getsize(rf)
+                    if copied_bytes + rf_size > self._MAX_RING_SNAPSHOT_BYTES:
+                        if copied_bytes == 0:
+                            # At least copy one ring file even if oversized, but truncate it
+                            dst = os.path.join(self._tcpdump_capture_dir, os.path.basename(rf))
+                            with open(rf, "rb") as src_f, open(dst, "wb") as dst_f:
+                                remaining = self._MAX_RING_SNAPSHOT_BYTES
+                                while remaining > 0:
+                                    chunk = src_f.read(min(65536, remaining))
+                                    if not chunk:
+                                        break
+                                    dst_f.write(chunk)
+                                    remaining -= len(chunk)
+                            copied_bytes = self._MAX_RING_SNAPSHOT_BYTES
+                        break
                     shutil.copy2(rf, self._tcpdump_capture_dir)
+                    copied_bytes += rf_size
                 except Exception:
                     pass
             # Start a dedicated tcpdump for this incident
             import subprocess
             self._capture_file = os.path.join(self._tcpdump_capture_dir, "attack.pcap")
             try:
+                _snaplen = str(self.snaplen) if self.snaplen else "0"
                 self._capture_proc = subprocess.Popen(
                     ["tcpdump", "-i", self.iface, "-w", self._capture_file,
-                     "-s", "0", "-Z", "root", "-c", str(self.max_capture), "-q"],
+                     "-s", _snaplen, "-Z", "root", "-c", str(self.max_capture), "-q"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except FileNotFoundError:
                 self._capture_proc = None
@@ -1748,6 +1776,11 @@ class PcapCapture:
             shutil.rmtree(self._tcpdump_capture_dir, ignore_errors=True)
 
             if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                # Truncate merged output if still oversized (safety net)
+                max_bytes = self._api_client.MAX_PCAP_UPLOAD_BYTES if hasattr(self, '_api_client') and self._api_client else 500 * 1024 * 1024
+                if os.path.getsize(filepath) > max_bytes:
+                    with open(filepath, "r+b") as f:
+                        f.truncate(max_bytes)
                 return filepath
             return None
 
