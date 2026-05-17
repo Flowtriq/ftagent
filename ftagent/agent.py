@@ -412,11 +412,46 @@ class APIClient:
         self._post(f"/agent/incidents/{inc_uuid}/resolve", data, timeout=15,
                    retries=3)
 
+    # Max PCAP size to upload (500 MB); files larger than this get truncated
+    # to preserve a representative sample while staying within server limits.
+    MAX_PCAP_UPLOAD_BYTES = 500 * 1024 * 1024
+
+    def _truncate_pcap(self, filepath: str) -> str:
+        """Truncate an oversized PCAP to MAX_PCAP_UPLOAD_BYTES while keeping
+        a valid PCAP header so the sample remains usable for analysis."""
+        file_size = os.path.getsize(filepath)
+        if file_size <= self.MAX_PCAP_UPLOAD_BYTES:
+            return filepath
+        logger.warning("PCAP too large (%.1f MB), truncating to %.0f MB sample: %s",
+                       file_size / 1048576, self.MAX_PCAP_UPLOAD_BYTES / 1048576, filepath)
+        truncated_path = filepath + ".truncated"
+        with open(filepath, "rb") as src, open(truncated_path, "wb") as dst:
+            # Copy up to the size limit (PCAP header + as many full packets as fit)
+            remaining = self.MAX_PCAP_UPLOAD_BYTES
+            while remaining > 0:
+                chunk = src.read(min(65536, remaining))
+                if not chunk:
+                    break
+                dst.write(chunk)
+                remaining -= len(chunk)
+        # Replace original with truncated version
+        os.replace(truncated_path, filepath)
+        logger.info("PCAP truncated: %s now %.1f MB",
+                    filepath, os.path.getsize(filepath) / 1048576)
+        return filepath
+
     def upload_pcap(self, inc_uuid: str, filepath: str,
                     retries: int = 3) -> None:
         url = f"{self.base}/agent/incidents/{inc_uuid}/pcap"
+
+        # Enforce size limit: truncate to a representative sample if too large
+        self._truncate_pcap(filepath)
+
         file_size = os.path.getsize(filepath)
         chunk_size = 2 * 1024 * 1024  # 2 MB chunks
+        # Unique upload ID prevents server-side chunk directory collisions
+        # when multiple pcap files are uploaded for the same incident
+        upload_id = uuid.uuid4().hex[:16]
 
         for attempt in range(1, retries + 1):
             try:
@@ -448,6 +483,7 @@ class APIClient:
                                     "Content-Type": "application/octet-stream",
                                     "X-Chunk-Index": str(i),
                                     "X-Chunk-Total": str(total_chunks),
+                                    "X-Upload-Id": upload_id,
                                 },
                                 timeout=60,
                             )
@@ -1719,6 +1755,15 @@ class PcapCapture:
             shutil.rmtree(self._tcpdump_capture_dir, ignore_errors=True)
 
             if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                # Cap merged pcap to max upload size so we always have a sample
+                max_bytes = self._api_client.MAX_PCAP_UPLOAD_BYTES if hasattr(self, '_api_client') and self._api_client else 500 * 1024 * 1024
+                fsize = os.path.getsize(filepath)
+                if fsize > max_bytes:
+                    logger.warning("Merged PCAP %.1f MB exceeds cap, truncating to %.0f MB sample",
+                                   fsize / 1048576, max_bytes / 1048576)
+                    # Truncate in place - keeps pcap header + initial packets as sample
+                    with open(filepath, "r+b") as f:
+                        f.truncate(max_bytes)
                 return filepath
             return None
 
