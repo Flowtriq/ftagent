@@ -575,9 +575,14 @@ class FlowAggregator:
 
     Thread-safe: the UDP receiver thread calls `ingest()`, the agent's
     main tick loop calls `read()` to consume the latest window.
+
+    When per_dst_ip_mode is True (mirror/unrestricted mode), also tracks
+    per-destination-IP counters for independent per-IP detection.
     """
 
-    def __init__(self):
+    MAX_DST_IPS = 100_000  # cap per-dst-IP tracking
+
+    def __init__(self, per_dst_ip_mode: bool = False):
         self._lock = threading.Lock()
         # Accumulator for current window
         self._packets = 0
@@ -594,6 +599,10 @@ class FlowAggregator:
         # Destination IP filter: only process flow records destined for this node
         self._node_ip: str = ""
         self._records_filtered = 0
+        # Per-destination-IP tracking (mirror/unrestricted mode)
+        self._per_dst_ip_mode = per_dst_ip_mode
+        self._per_dst: dict[str, dict] = {}       # dst_ip -> {packets, octets, tcp, udp, icmp, src_ips, dst_ports, tcp_flags}
+        self._snap_per_dst: dict[str, dict] = {}   # snapshot from last read()
         # Snapshot from last read()
         self._snap_packets = 0
         self._snap_octets = 0
@@ -646,6 +655,35 @@ class FlowAggregator:
                     self._dst_ports[rec.dst_port] = (
                         self._dst_ports.get(rec.dst_port, 0) + rec.packets)
 
+                # Per-destination-IP tracking for mirror/unrestricted mode
+                if self._per_dst_ip_mode and rec.dst_ip:
+                    dst = self._per_dst.get(rec.dst_ip)
+                    if dst is None:
+                        if len(self._per_dst) >= self.MAX_DST_IPS:
+                            continue
+                        dst = {"packets": 0, "octets": 0, "tcp": 0, "udp": 0, "icmp": 0,
+                               "src_ips": {}, "dst_ports": {}, "tcp_flags": {
+                                   "SYN": 0, "ACK": 0, "RST": 0, "FIN": 0, "PSH": 0, "URG": 0}}
+                        self._per_dst[rec.dst_ip] = dst
+                    dst["packets"] += rec.packets
+                    dst["octets"] += rec.octets
+                    if rec.protocol == PROTO_TCP:
+                        dst["tcp"] += rec.packets
+                        if rec.tcp_flags & 0x02: dst["tcp_flags"]["SYN"] += rec.packets
+                        if rec.tcp_flags & 0x10: dst["tcp_flags"]["ACK"] += rec.packets
+                        if rec.tcp_flags & 0x04: dst["tcp_flags"]["RST"] += rec.packets
+                        if rec.tcp_flags & 0x01: dst["tcp_flags"]["FIN"] += rec.packets
+                        if rec.tcp_flags & 0x08: dst["tcp_flags"]["PSH"] += rec.packets
+                        if rec.tcp_flags & 0x20: dst["tcp_flags"]["URG"] += rec.packets
+                    elif rec.protocol == PROTO_UDP:
+                        dst["udp"] += rec.packets
+                    elif rec.protocol == PROTO_ICMP:
+                        dst["icmp"] += rec.packets
+                    if rec.src_ip and (len(dst["src_ips"]) < 5000 or rec.src_ip in dst["src_ips"]):
+                        dst["src_ips"][rec.src_ip] = dst["src_ips"].get(rec.src_ip, 0) + rec.packets
+                    if rec.dst_port:
+                        dst["dst_ports"][rec.dst_port] = dst["dst_ports"].get(rec.dst_port, 0) + rec.packets
+
     def read(self, dt: float) -> bool:
         """Snapshot the current window, reset accumulators, compute rates.
         Returns True if any data was received. Called from agent _tick() @ 1Hz."""
@@ -664,6 +702,13 @@ class FlowAggregator:
                 self._snap_icmp_pct = round(self._icmp_packets / total_proto * 100, 1)
             else:
                 self._snap_tcp_pct = self._snap_udp_pct = self._snap_icmp_pct = 0.0
+
+            # Snapshot per-dst-IP data
+            if self._per_dst_ip_mode:
+                self._snap_per_dst = dict(self._per_dst)
+                self._per_dst.clear()
+            else:
+                self._snap_per_dst = {}
 
             # Reset accumulators
             self._packets = 0
@@ -727,6 +772,16 @@ class FlowAggregator:
     def node_ip(self, value: str) -> None:
         with self._lock:
             self._node_ip = value
+
+    @property
+    def per_dst_ip_data(self) -> dict[str, dict]:
+        """Per-destination-IP data from the last snapshot (mirror/unrestricted mode).
+        Returns dict[dst_ip -> {packets, octets, tcp, udp, icmp, src_ips, dst_ports, tcp_flags}]."""
+        return self._snap_per_dst
+
+    def per_dst_ip_pps(self) -> dict[str, float]:
+        """Returns dict[dst_ip -> PPS] from last snapshot."""
+        return {ip: float(d["packets"]) for ip, d in self._snap_per_dst.items()}
 
 
 # ═══════════════════════════════════════════════════════════════════════
