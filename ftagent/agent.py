@@ -813,13 +813,14 @@ class PerIPBaselineManager:
         """Returns True if this IP's PPS exceeds its threshold."""
         bl = self._baselines.get(ip)
         if bl is None:
-            # No baseline yet — use absolute floor
+            # No baseline yet -- use absolute floor
             return pps >= 10000
-        threshold = bl.threshold
-        # Also check absolute floor if baseline not ready
-        if not bl.baseline_ready and pps >= 10000:
-            return True
-        return pps > threshold
+        if not bl.baseline_ready:
+            # Baseline still building -- only trigger on absolute floor
+            # (don't use the 150 PPS default floor, it's too low for mirror mode
+            # where many IPs will have legitimate low-level traffic)
+            return pps >= 10000
+        return pps > bl.threshold
 
     def get_threshold(self, ip: str) -> float:
         """Returns current threshold for an IP (0 if unknown)."""
@@ -4392,6 +4393,7 @@ class MirrorAgent(Agent):
 
     def _start_ip_pcap(self, ip: str, incident_uuid: str) -> None:
         """Start a BPF-filtered tcpdump capture for a specific attacked IP."""
+        import subprocess
         if not self.pcap.enabled:
             return
         pcap_dir = self.pcap.pcap_dir
@@ -4416,6 +4418,7 @@ class MirrorAgent(Agent):
 
     def _stop_ip_pcap(self, ip: str, incident_uuid: str) -> None:
         """Stop per-IP PCAP capture and upload."""
+        import subprocess
         proc = self._ip_pcap_procs.pop(ip, None)
         if proc:
             try:
