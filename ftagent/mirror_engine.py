@@ -47,6 +47,7 @@ ETH_P_8021AD = 0x88A8   # QinQ outer tag
 # AF_PACKET fanout
 PACKET_FANOUT       = 18
 PACKET_FANOUT_HASH  = 0
+SOL_PACKET          = getattr(socket, "SOL_PACKET", 263)  # 263 on Linux, not in all Python builds
 
 # Memory caps
 MAX_DST_IPS_PER_WINDOW = 100_000
@@ -476,7 +477,7 @@ class MirrorCaptureEngine:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
                                     8 * 1024 * 1024)
                     sock.bind((self.interface, ETH_P_ALL))
-                    sock.setsockopt(socket.SOL_PACKET, PACKET_FANOUT, fanout_arg)
+                    sock.setsockopt(SOL_PACKET, PACKET_FANOUT, fanout_arg)
                     sock.settimeout(1.0)
 
                     t = threading.Thread(
