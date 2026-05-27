@@ -54,6 +54,14 @@ DEFAULT_CONFIG = {
     # When True + GRE mode active, tracks inner dst IP per customer VM
     "hypervisor_mode": False,
     "vm_labels": {},          # {"10.0.0.5": "Customer A", "10.0.0.6": "Customer B"}
+    # Mirror/SPAN mode — monitor an entire network segment from a SPAN port
+    # Instead of monitoring this server's own traffic, capture mirrored packets
+    # and run per-destination-IP detection (like FastNetMon's mirror mode).
+    "mirror_mode": False,
+    "mirror_interface": "",        # NIC connected to SPAN/mirror port (required when mirror_mode=True)
+    "mirror_subnets": [],          # Only monitor these destination CIDRs ["10.0.0.0/24"]
+    "mirror_ip_labels": {},        # {"10.0.0.5": "Web Server", "10.0.0.6": "DB Server"}
+    "mirror_capture_mode": "af_packet",  # "af_packet" (Linux, high perf) or "tcpdump" (fallback)
 }
 
 # Flow collector (built-in, no extra deps)
@@ -412,11 +420,39 @@ class APIClient:
         self._post(f"/agent/incidents/{inc_uuid}/resolve", data, timeout=15,
                    retries=3)
 
+    # Max PCAP size to upload (500 MB); files larger than this get truncated
+    # to preserve a representative sample while staying within server limits.
+    MAX_PCAP_UPLOAD_BYTES = 500 * 1024 * 1024
+
+    def _truncate_pcap(self, filepath: str) -> str:
+        """Truncate an oversized PCAP to MAX_PCAP_UPLOAD_BYTES while keeping
+        a valid PCAP header so the sample remains usable for analysis."""
+        file_size = os.path.getsize(filepath)
+        if file_size <= self.MAX_PCAP_UPLOAD_BYTES:
+            return filepath
+        logger.warning("PCAP too large (%.1f MB), truncating to %.0f MB sample: %s",
+                       file_size / 1048576, self.MAX_PCAP_UPLOAD_BYTES / 1048576, filepath)
+        with open(filepath, "r+b") as f:
+            f.truncate(self.MAX_PCAP_UPLOAD_BYTES)
+        logger.info("PCAP truncated: %s now %.1f MB",
+                    filepath, os.path.getsize(filepath) / 1048576)
+        return filepath
+
     def upload_pcap(self, inc_uuid: str, filepath: str,
                     retries: int = 3) -> None:
         url = f"{self.base}/agent/incidents/{inc_uuid}/pcap"
-        file_size = os.path.getsize(filepath)
         chunk_size = 2 * 1024 * 1024  # 2 MB chunks
+        # Unique upload ID prevents server-side chunk directory collisions
+        # when multiple pcap files are uploaded for the same incident
+        upload_id = uuid.uuid4().hex[:16]
+
+        # Enforce size limit: truncate to a representative sample if too large
+        try:
+            self._truncate_pcap(filepath)
+            file_size = os.path.getsize(filepath)
+        except FileNotFoundError:
+            logger.warning("PCAP file not found for upload, skipping: %s", filepath)
+            return
 
         for attempt in range(1, retries + 1):
             try:
@@ -448,6 +484,7 @@ class APIClient:
                                     "Content-Type": "application/octet-stream",
                                     "X-Chunk-Index": str(i),
                                     "X-Chunk-Total": str(total_chunks),
+                                    "X-Upload-Id": upload_id,
                                 },
                                 timeout=60,
                             )
@@ -723,6 +760,111 @@ class BaselineManager:
 
         if n >= self.WINDOW:
             self.baseline_ready = True
+
+
+# ---------------------------------------------------------------------------
+# Per-IP Baseline Manager (Mirror Mode)
+# ---------------------------------------------------------------------------
+
+class PerIPBaselineManager:
+    """Maintains independent BaselineManager instances per destination IP.
+
+    Used by MirrorAgent to detect DDoS attacks on individual IPs within
+    a monitored network segment (SPAN/mirror port).
+
+    Memory bounded: LRU eviction at max_ips, stale eviction after 10 min.
+    """
+
+    def __init__(self, window: int = 300, max_ips: int = 50_000,
+                 stale_seconds: float = 600.0):
+        self._window = window
+        self._max_ips = max_ips
+        self._stale_seconds = stale_seconds
+        self._baselines: collections.OrderedDict[str, BaselineManager] = (
+            collections.OrderedDict())
+        self._last_seen: dict[str, float] = {}
+        self._last_prune: float = 0.0
+
+    def add(self, ip: str, pps: float) -> None:
+        """Feed a PPS sample for this IP into its baseline."""
+        now = time.monotonic()
+        self._last_seen[ip] = now
+
+        bl = self._baselines.get(ip)
+        if bl is None:
+            # Evict if at capacity
+            while len(self._baselines) >= self._max_ips:
+                oldest_ip, _ = self._baselines.popitem(last=False)
+                self._last_seen.pop(oldest_ip, None)
+            bl = BaselineManager(window=self._window)
+            self._baselines[ip] = bl
+        else:
+            # LRU touch
+            self._baselines.move_to_end(ip)
+
+        bl.add(pps)
+
+        # Periodic stale eviction (every 60s)
+        if now - self._last_prune >= 60:
+            self._last_prune = now
+            self._prune_stale(now)
+
+    def check(self, ip: str, pps: float) -> bool:
+        """Returns True if this IP's PPS exceeds its threshold."""
+        bl = self._baselines.get(ip)
+        if bl is None:
+            # No baseline yet -- use absolute floor
+            return pps >= 10000
+        if not bl.baseline_ready:
+            # Baseline still building -- only trigger on absolute floor
+            # (don't use the 150 PPS default floor, it's too low for mirror mode
+            # where many IPs will have legitimate low-level traffic)
+            return pps >= 10000
+        return pps > bl.threshold
+
+    def get_threshold(self, ip: str) -> float:
+        """Returns current threshold for an IP (0 if unknown)."""
+        bl = self._baselines.get(ip)
+        if bl is None:
+            return 0.0
+        return bl.threshold
+
+    def get_baseline(self, ip: str) -> dict:
+        """Returns baseline stats for an IP."""
+        bl = self._baselines.get(ip)
+        if bl is None:
+            return {"ready": False, "avg_pps": 0, "p99_pps": 0, "threshold": 0}
+        return {
+            "ready": bl.baseline_ready,
+            "avg_pps": round(bl.avg_pps, 1),
+            "p99_pps": round(bl.p99_pps, 1),
+            "threshold": round(bl.threshold, 1),
+        }
+
+    def _prune_stale(self, now: float) -> None:
+        """Remove IPs with no traffic for stale_seconds."""
+        cutoff = now - self._stale_seconds
+        stale = [ip for ip, ts in self._last_seen.items() if ts < cutoff]
+        for ip in stale:
+            self._baselines.pop(ip, None)
+            self._last_seen.pop(ip, None)
+        if stale:
+            logger.debug("PerIPBaseline: pruned %d stale IPs", len(stale))
+
+    @property
+    def ip_count(self) -> int:
+        return len(self._baselines)
+
+    def baseline_summary(self, n: int = 20) -> list[dict]:
+        """Top N IPs by threshold for health/debugging."""
+        items = [(ip, bl) for ip, bl in self._baselines.items()
+                 if bl.baseline_ready]
+        items.sort(key=lambda x: x[1].threshold, reverse=True)
+        return [
+            {"ip": ip, "threshold": round(bl.threshold, 1),
+             "avg_pps": round(bl.avg_pps, 1), "p99_pps": round(bl.p99_pps, 1)}
+            for ip, bl in items[:n]
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1290,6 +1432,7 @@ class PcapCapture:
         self.enabled = cfg.get("pcap_enabled", True) and (SCAPY_AVAILABLE or self.pcap_mode == "tcpdump")
         self.config_path = cfg.get("_config_path", CONFIG_PATH)
         self.pcap_dir = cfg.get("pcap_dir", "/var/lib/ftagent/pcaps")
+        self.snaplen = cfg.get("pcap_snaplen", 0)  # 0 = full packet, or set to e.g. 256 for high-traffic links
         self.iface = iface
         self._tcpdump_proc = None
         self._ring_dir = None
@@ -1405,9 +1548,10 @@ class PcapCapture:
         self._ring_dir = ring_dir
 
         ring_file = os.path.join(ring_dir, "ring_%Y%m%d_%H%M%S.pcap")
+        snaplen = str(self.snaplen) if self.snaplen else "0"
         tcpdump_cmd = [
             "tcpdump", "-i", self.iface, "-w", ring_file,
-            "-G", "30", "-W", "3", "-s", "0", "-q",
+            "-G", "30", "-W", "3", "-s", snaplen, "-q",
         ]
 
         logger.info("PCAP ring buffer active on %s (tcpdump mode)", self.iface)
@@ -1516,6 +1660,10 @@ class PcapCapture:
                     hypervisor_mode=self._hypervisor_mode,
                 )
 
+    # Max total size for pre-attack ring snapshot: 100MB
+    # This prevents copying multi-GB ring files on high-traffic links
+    _MAX_RING_SNAPSHOT_BYTES = 100 * 1024 * 1024
+
     def start_capture(self, incident_uuid: str = "",
                        api_client=None) -> None:
         if self.pcap_mode == "tcpdump" and self._ring_dir:
@@ -1524,18 +1672,40 @@ class PcapCapture:
             import shutil
             self._tcpdump_capture_dir = os.path.join(self.pcap_dir, f"_capture_{incident_uuid[:8]}")
             os.makedirs(self._tcpdump_capture_dir, exist_ok=True)
-            for rf in sorted(glob.glob(os.path.join(self._ring_dir, "ring*"))):
+            # Copy ring files newest-first, up to snapshot size limit
+            ring_files = sorted(
+                glob.glob(os.path.join(self._ring_dir, "ring*")),
+                key=lambda f: os.path.getmtime(f), reverse=True)
+            copied_bytes = 0
+            for rf in ring_files:
                 try:
+                    rf_size = os.path.getsize(rf)
+                    if copied_bytes + rf_size > self._MAX_RING_SNAPSHOT_BYTES:
+                        if copied_bytes == 0:
+                            # At least copy one ring file even if oversized, but truncate it
+                            dst = os.path.join(self._tcpdump_capture_dir, os.path.basename(rf))
+                            with open(rf, "rb") as src_f, open(dst, "wb") as dst_f:
+                                remaining = self._MAX_RING_SNAPSHOT_BYTES
+                                while remaining > 0:
+                                    chunk = src_f.read(min(65536, remaining))
+                                    if not chunk:
+                                        break
+                                    dst_f.write(chunk)
+                                    remaining -= len(chunk)
+                            copied_bytes = self._MAX_RING_SNAPSHOT_BYTES
+                        break
                     shutil.copy2(rf, self._tcpdump_capture_dir)
+                    copied_bytes += rf_size
                 except Exception:
                     pass
             # Start a dedicated tcpdump for this incident
             import subprocess
             self._capture_file = os.path.join(self._tcpdump_capture_dir, "attack.pcap")
             try:
+                _snaplen = str(self.snaplen) if self.snaplen else "0"
                 self._capture_proc = subprocess.Popen(
                     ["tcpdump", "-i", self.iface, "-w", self._capture_file,
-                     "-s", "0", "-Z", "root", "-c", str(self.max_capture), "-q"],
+                     "-s", _snaplen, "-Z", "root", "-c", str(self.max_capture), "-q"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except FileNotFoundError:
                 self._capture_proc = None
@@ -1719,6 +1889,11 @@ class PcapCapture:
             shutil.rmtree(self._tcpdump_capture_dir, ignore_errors=True)
 
             if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                # Truncate merged output if still oversized (safety net)
+                max_bytes = self._api_client.MAX_PCAP_UPLOAD_BYTES if hasattr(self, '_api_client') and self._api_client else 500 * 1024 * 1024
+                if os.path.getsize(filepath) > max_bytes:
+                    with open(filepath, "r+b") as f:
+                        f.truncate(max_bytes)
                 return filepath
             return None
 
@@ -3808,6 +3983,564 @@ class Agent:
 
 
 # ---------------------------------------------------------------------------
+# Mirror Agent (SPAN/TAP per-IP detection)
+# ---------------------------------------------------------------------------
+
+class MirrorAgent(Agent):
+    """DDoS detection agent for SPAN/mirror port monitoring.
+
+    Instead of monitoring a single server's own traffic (Agent mode), this
+    captures mirrored traffic from an entire network segment and runs
+    independent baseline + threshold detection per destination IP.
+
+    Architecture:
+      - MirrorCaptureEngine (AF_PACKET or tcpdump) feeds PerIPCounter
+      - PerIPBaselineManager tracks baselines per destination IP
+      - Multiple concurrent incidents (one per attacked IP)
+      - Reuses parent Agent's API client, heartbeat, config, and command execution
+    """
+
+    def __init__(self, cfg: dict):
+        # Initialize parent — sets up API, baseline (aggregate), analyser, pcap, etc.
+        super().__init__(cfg)
+
+        # Mirror-specific config
+        self.mirror_interface = cfg.get("mirror_interface", "")
+        if not self.mirror_interface:
+            logger.error("mirror_mode=True but mirror_interface not set. "
+                         "Set it to the NIC connected to your SPAN/mirror port.")
+            raise SystemExit(1)
+
+        self.mirror_ip_labels: dict = cfg.get("mirror_ip_labels", {})
+        mirror_subnets = cfg.get("mirror_subnets", [])
+        gre_strip = self.gre_decap.enabled
+
+        # Per-IP tracking
+        from ftagent.mirror_engine import PerIPCounter, MirrorCaptureEngine
+        self.mirror_counter = PerIPCounter()
+        self.mirror_engine = MirrorCaptureEngine(
+            interface=self.mirror_interface,
+            counter=self.mirror_counter,
+            mode=cfg.get("mirror_capture_mode", "af_packet"),
+            subnets=mirror_subnets if mirror_subnets else None,
+            gre_strip=gre_strip,
+        )
+        self.per_ip_baseline = PerIPBaselineManager(
+            window=cfg.get("baseline_window", 300))
+
+        # Active attacks: dict[dst_ip -> IPAttackState]
+        self.active_attacks: dict[str, dict] = {}
+        # Per-IP PCAP processes (BPF-filtered per attacked IP)
+        self._ip_pcap_procs: dict[str, subprocess.Popen] = {}
+
+        # Enable per-dst-IP tracking on flow collector if available
+        if self.flow:
+            self.flow.aggregator._per_dst_ip_mode = True
+            self.flow.aggregator._node_ip = ""  # unrestricted
+
+        # Override: disable the parent's single-IP PPSMonitor-based detection
+        # (mirror mode doesn't monitor /proc/net/dev for its own traffic)
+        self.attacking = False
+
+        # Latest snapshot for aggregate metrics
+        self._last_snapshot: dict = {}
+        self._last_aggregate_pps: float = 0.0
+        self._last_aggregate_bps: float = 0.0
+
+    def run(self) -> None:
+        logger.info("Flowtriq Mirror Agent %s starting on SPAN interface %s",
+                     VERSION, self.mirror_interface)
+
+        check_for_updates()
+
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+        threads = [
+            threading.Thread(target=self._heartbeat_loop, daemon=True,
+                             name="heartbeat"),
+            threading.Thread(target=self._config_loop, daemon=True,
+                             name="config"),
+            threading.Thread(target=self._command_poll_loop, daemon=True,
+                             name="command-poll"),
+        ]
+
+        # Mirror capture engine thread
+        threads.append(threading.Thread(
+            target=self.mirror_engine.start, args=(self.shutdown,),
+            daemon=True, name="mirror-capture"))
+
+        # Health check
+        health_port = self.cfg.get("health_port", 9100)
+        if health_port:
+            health = HealthCheckHandler(self, port=health_port)
+            threads.append(threading.Thread(
+                target=health.start, daemon=True, name="health-check"))
+
+        # Flow collector (can supplement mirror capture with flow data)
+        if self.flow:
+            threads.append(threading.Thread(
+                target=self.flow.start, args=(self.shutdown,),
+                daemon=True, name="flow-collector"))
+
+        # Auto-update
+        if self.cfg.get("auto_update", False):
+            threads.append(threading.Thread(
+                target=self._auto_update_loop, daemon=True,
+                name="auto-update"))
+
+        for t in threads:
+            t.start()
+
+        self._fetch_config()
+
+        logger.info("Entering mirror monitoring loop")
+        while not self.shutdown.is_set():
+            loop_start = time.monotonic()
+            try:
+                self._tick()
+            except Exception as exc:
+                logger.error("Mirror tick error: %s", exc)
+
+            elapsed = time.monotonic() - loop_start
+            sleep_for = max(0, 1.0 - elapsed)
+            self.shutdown.wait(sleep_for)
+
+        # Graceful shutdown: resolve any open incidents
+        for ip in list(self.active_attacks.keys()):
+            try:
+                self._end_ip_attack(ip)
+            except Exception:
+                pass
+
+        logger.info("Mirror Agent shutting down")
+
+    def _tick(self) -> None:
+        # 1. Snapshot per-IP counters from mirror capture engine
+        ip_snapshots = self.mirror_counter.snapshot_and_reset()
+
+        # Merge flow collector per-IP data when available (takes higher PPS per IP)
+        if self.flow and self.flow.aggregator.read(dt=1.0):
+            flow_per_ip = self.flow.aggregator.per_dst_ip_data
+            if flow_per_ip:
+                from ftagent.mirror_engine import IPSnapshot, IPStats
+                for dst_ip, fdata in flow_per_ip.items():
+                    existing = ip_snapshots.get(dst_ip)
+                    if existing is None or fdata["packets"] > existing.packets:
+                        # Build IPSnapshot from flow data
+                        stats = IPStats()
+                        stats.packets = fdata["packets"]
+                        stats.octets = fdata["octets"]
+                        stats.tcp_packets = fdata.get("tcp", 0)
+                        stats.udp_packets = fdata.get("udp", 0)
+                        stats.icmp_packets = fdata.get("icmp", 0)
+                        stats.src_ips = fdata.get("src_ips", {})
+                        stats.dst_ports = fdata.get("dst_ports", {})
+                        stats.tcp_flags = fdata.get("tcp_flags", {
+                            "SYN": 0, "ACK": 0, "RST": 0, "FIN": 0, "PSH": 0, "URG": 0})
+                        ip_snapshots[dst_ip] = IPSnapshot(dst_ip, stats)
+
+        self._last_snapshot = ip_snapshots
+
+        if not ip_snapshots:
+            return
+
+        # 2. Compute aggregate PPS/BPS for node-level metrics
+        total_pps = sum(s.pps for s in ip_snapshots.values())
+        total_bps = sum(s.bps for s in ip_snapshots.values())
+        self._last_aggregate_pps = total_pps
+        self._last_aggregate_bps = total_bps
+
+        # Also update parent's aggregate baseline for overall node monitoring
+        if not self.active_attacks:
+            self.baseline.add(total_pps)
+
+        # 3. Feed each non-attacking IP into per-IP baselines
+        for ip, snap in ip_snapshots.items():
+            if ip not in self.active_attacks:
+                _abs_floor = self.server_threshold or 10000
+                bl = self.per_ip_baseline._baselines.get(ip)
+                if bl is None or bl.baseline_ready or snap.pps < _abs_floor:
+                    self.per_ip_baseline.add(ip, snap.pps)
+
+        # 4. Per-IP detection
+        for ip, snap in ip_snapshots.items():
+            if ip not in self.active_attacks:
+                if self.per_ip_baseline.check(ip, snap.pps):
+                    self._begin_ip_attack(ip, snap)
+            else:
+                # Update existing attack
+                state = self.active_attacks[ip]
+                if snap.pps > state["peak_pps"]:
+                    state["peak_pps"] = snap.pps
+                if snap.bps > state["peak_bps"]:
+                    state["peak_bps"] = snap.bps
+
+                threshold = self.per_ip_baseline.get_threshold(ip)
+                if threshold <= 0:
+                    threshold = self.server_threshold or 10000
+
+                if snap.pps < threshold:
+                    state["below_count"] += 1
+                else:
+                    state["below_count"] = 0
+
+                if state["below_count"] >= 10:
+                    self._end_ip_attack(ip)
+                elif time.monotonic() - state["last_update"] >= 5:
+                    self._update_ip_attack(ip, snap)
+
+        # Check for attacks that have had no traffic at all this window
+        for ip in list(self.active_attacks.keys()):
+            if ip not in ip_snapshots:
+                state = self.active_attacks[ip]
+                state["below_count"] += 1
+                if state["below_count"] >= 10:
+                    self._end_ip_attack(ip)
+
+        # 5. Buffer aggregate metrics (same format as parent)
+        # Use weighted protocol breakdown from all IPs
+        total_tcp = sum(s.tcp_pct * s.packets for s in ip_snapshots.values())
+        total_udp = sum(s.udp_pct * s.packets for s in ip_snapshots.values())
+        total_icmp = sum(s.icmp_pct * s.packets for s in ip_snapshots.values())
+        total_pkts = sum(s.packets for s in ip_snapshots.values())
+        tcp_pct = round(total_tcp / total_pkts, 1) if total_pkts > 0 else 0
+        udp_pct = round(total_udp / total_pkts, 1) if total_pkts > 0 else 0
+        icmp_pct = round(total_icmp / total_pkts, 1) if total_pkts > 0 else 0
+
+        self._metrics_buffer.append({
+            "pps": round(total_pps, 1),
+            "bps": round(total_bps, 1),
+            "tcp_pct": tcp_pct,
+            "udp_pct": udp_pct,
+            "icmp_pct": icmp_pct,
+            "conn_count": 0,
+            "threshold": round(self.baseline.threshold, 1),
+        })
+
+        now = time.monotonic()
+        if now - self._last_metrics_push >= self._metrics_interval:
+            self._last_metrics_push = now
+            self._flush_metrics()
+            # Push per-IP stats for top IPs (reuse vm-stats endpoint)
+            self._flush_mirror_ip_stats(ip_snapshots)
+
+    def _begin_ip_attack(self, ip: str, snap) -> None:
+        """Open a new incident for a specific destination IP."""
+        from ftagent.mirror_engine import IPSnapshot
+
+        baseline = self.per_ip_baseline.get_baseline(ip)
+        label = self.mirror_ip_labels.get(ip, "")
+        label_str = f" ({label})" if label else ""
+
+        logger.warning("MIRROR ATTACK DETECTED on %s%s -- PPS=%.0f threshold=%.0f",
+                       ip, label_str, snap.pps, baseline.get("threshold", 0))
+
+        # Classify from snapshot protocol data
+        family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct)
+
+        started_at = datetime.now(timezone.utc).isoformat()
+
+        inc_data = {
+            "peak_pps": round(snap.pps, 1),
+            "peak_bps": round(snap.bps, 1),
+            "started_at": started_at,
+            "attack_family": family,
+            "baseline_pps": round(baseline.get("avg_pps", 0), 1),
+            "duration": 0,
+            "inner_ip": ip,
+            "mirror_mode": True,
+            "source_ip_count": snap.src_ip_count,
+        }
+        if label:
+            inc_data["inner_ip_label"] = label
+        if snap.top_src_ips:
+            inc_data["top_src_ips"] = [
+                {"ip": sip, "count": cnt} for sip, cnt in snap.top_src_ips
+            ]
+        if snap.top_dst_ports:
+            inc_data["top_dst_ports"] = [
+                {"port": p, "count": cnt} for p, cnt in snap.top_dst_ports
+            ]
+
+        result = self.api.open_incident(inc_data)
+        incident_uuid = ""
+        if result and "uuid" in result:
+            incident_uuid = result["uuid"]
+            logger.info("Mirror incident opened for %s: %s", ip, incident_uuid)
+            if "pending_commands" in result and result["pending_commands"]:
+                for cmd in result["pending_commands"]:
+                    self._execute_command(cmd)
+        else:
+            incident_uuid = str(uuid.uuid4())
+            logger.warning("Using local mirror incident UUID for %s: %s",
+                           ip, incident_uuid)
+
+        self.active_attacks[ip] = {
+            "incident_uuid": incident_uuid,
+            "attack_start": time.time(),
+            "peak_pps": snap.pps,
+            "peak_bps": snap.bps,
+            "below_count": 0,
+            "last_update": time.monotonic(),
+            "velocity_curve": [{"t": 0, "pps": round(snap.pps, 1)}],
+            "family": family,
+        }
+
+        # Start BPF-filtered PCAP for this IP
+        self._start_ip_pcap(ip, incident_uuid)
+
+        # Fetch config for mitigation commands
+        threading.Thread(target=self._fetch_config, daemon=True,
+                         name=f"attack-config-{ip}").start()
+
+    def _update_ip_attack(self, ip: str, snap) -> None:
+        """Send periodic update for an ongoing per-IP attack."""
+        state = self.active_attacks.get(ip)
+        if not state or not state["incident_uuid"]:
+            return
+
+        state["last_update"] = time.monotonic()
+        elapsed = time.time() - state["attack_start"]
+        state["velocity_curve"].append({
+            "t": round(elapsed, 1),
+            "pps": round(snap.pps, 1),
+        })
+
+        family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct)
+
+        update_payload = {
+            "peak_pps": round(state["peak_pps"], 1),
+            "peak_bps": round(state["peak_bps"], 1),
+            "attack_family": family,
+            "protocol_breakdown": {
+                "tcp": snap.tcp_pct,
+                "udp": snap.udp_pct,
+                "icmp": snap.icmp_pct,
+            },
+            "source_ip_count": snap.src_ip_count,
+            "top_src_ips": [
+                {"ip": sip, "count": cnt} for sip, cnt in snap.top_src_ips
+            ],
+            "top_dst_ports": [
+                {"port": p, "count": cnt} for p, cnt in snap.top_dst_ports
+            ],
+            "inner_ip": ip,
+            "mirror_mode": True,
+            "tcp_flag_breakdown": snap.tcp_flags,
+        }
+        label = self.mirror_ip_labels.get(ip, "")
+        if label:
+            update_payload["inner_ip_label"] = label
+
+        self.api.update_incident(state["incident_uuid"], update_payload)
+
+    def _end_ip_attack(self, ip: str) -> None:
+        """Resolve an incident for a specific destination IP."""
+        state = self.active_attacks.get(ip)
+        if not state:
+            return
+
+        duration = time.time() - state["attack_start"]
+        family = state.get("family", "unknown")
+
+        # Get last known snapshot for subtype classification
+        last_snap = self._last_snapshot.get(ip)
+        tcp_flags = last_snap.tcp_flags if last_snap else {}
+        avg_pkt = last_snap.avg_pkt_size if last_snap else 0
+        top_ports = []
+        if last_snap and last_snap.top_dst_ports:
+            top_ports = [{"port": p, "count": c} for p, c in last_snap.top_dst_ports]
+
+        subtype = classify_subtype(family, top_ports, tcp_flags, avg_pkt)
+
+        label = self.mirror_ip_labels.get(ip, "")
+        label_str = f" ({label})" if label else ""
+        logger.warning("MIRROR ATTACK ENDED on %s%s -- duration=%.0fs peak_pps=%.0f family=%s subtype=%s",
+                       ip, label_str, duration, state["peak_pps"], family, subtype or "none")
+
+        if state["incident_uuid"]:
+            resolve_data = {
+                "duration_seconds": round(duration, 1),
+                "peak_pps": round(state["peak_pps"], 1),
+                "peak_bps": round(state["peak_bps"], 1),
+                "attack_family": family,
+                "attack_subtype": subtype or None,
+                "inner_ip": ip,
+                "mirror_mode": True,
+                "velocity_curve": state["velocity_curve"],
+            }
+            if last_snap:
+                resolve_data["protocol_breakdown"] = {
+                    "tcp": last_snap.tcp_pct,
+                    "udp": last_snap.udp_pct,
+                    "icmp": last_snap.icmp_pct,
+                }
+                resolve_data["source_ip_count"] = last_snap.src_ip_count
+                resolve_data["top_src_ips"] = [
+                    {"ip": sip, "count": cnt} for sip, cnt in last_snap.top_src_ips
+                ]
+                resolve_data["top_dst_ports"] = top_ports
+                resolve_data["tcp_flag_breakdown"] = tcp_flags
+                resolve_data["avg_pkt_length"] = avg_pkt
+
+            self.api.resolve_incident(state["incident_uuid"], resolve_data)
+
+        # Stop per-IP PCAP
+        self._stop_ip_pcap(ip, state.get("incident_uuid", ""))
+
+        del self.active_attacks[ip]
+
+    def _start_ip_pcap(self, ip: str, incident_uuid: str) -> None:
+        """Start a BPF-filtered tcpdump capture for a specific attacked IP."""
+        import subprocess
+        if not self.pcap.enabled:
+            return
+        pcap_dir = self.pcap.pcap_dir
+        os.makedirs(pcap_dir, exist_ok=True)
+        pcap_path = os.path.join(pcap_dir, f"mirror_{incident_uuid}.pcap")
+
+        try:
+            cmd = [
+                "tcpdump", "-i", self.mirror_interface,
+                "-nn", "-w", pcap_path,
+                "-s", str(self.pcap.snaplen or 0),
+                "-c", str(self.pcap.max_capture),
+                f"dst host {ip}",
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            self._ip_pcap_procs[ip] = proc
+            logger.info("Mirror PCAP started for %s (pid=%d, file=%s)",
+                        ip, proc.pid, pcap_path)
+        except Exception as e:
+            logger.warning("Could not start mirror PCAP for %s: %s", ip, e)
+
+    def _stop_ip_pcap(self, ip: str, incident_uuid: str) -> None:
+        """Stop per-IP PCAP capture and upload."""
+        import subprocess
+        proc = self._ip_pcap_procs.pop(ip, None)
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        if incident_uuid:
+            pcap_path = os.path.join(self.pcap.pcap_dir,
+                                     f"mirror_{incident_uuid}.pcap")
+            if os.path.exists(pcap_path) and os.path.getsize(pcap_path) > 24:
+                threading.Thread(
+                    target=self.api.upload_pcap,
+                    args=(incident_uuid, pcap_path),
+                    daemon=True,
+                ).start()
+
+    def _flush_mirror_ip_stats(self, ip_snapshots: dict) -> None:
+        """Push per-IP stats to backend (top N IPs + all attacking IPs)."""
+        if not ip_snapshots:
+            return
+
+        # Build list: always include attacking IPs, then fill with top by PPS
+        ip_stats = []
+        attacking_ips = set(self.active_attacks.keys())
+
+        # First: all attacking IPs
+        for ip in attacking_ips:
+            snap = ip_snapshots.get(ip)
+            if snap:
+                bl = self.per_ip_baseline.get_baseline(ip)
+                ip_stats.append({
+                    "ip": ip,
+                    "label": self.mirror_ip_labels.get(ip, ""),
+                    "pps": round(snap.pps, 1),
+                    "bps": round(snap.bps, 1),
+                    "tcp_pct": snap.tcp_pct,
+                    "udp_pct": snap.udp_pct,
+                    "icmp_pct": snap.icmp_pct,
+                    "baseline_pps": bl.get("avg_pps", 0),
+                    "threshold_pps": bl.get("threshold", 0),
+                    "status": "attack",
+                    "src_ip_count": snap.src_ip_count,
+                })
+
+        # Then: top IPs by PPS (exclude already-added attacking IPs)
+        remaining = sorted(
+            [(ip, s) for ip, s in ip_snapshots.items() if ip not in attacking_ips],
+            key=lambda x: x[1].pps, reverse=True,
+        )[:100]
+
+        for ip, snap in remaining:
+            bl = self.per_ip_baseline.get_baseline(ip)
+            threshold = bl.get("threshold", 0)
+            status = "normal"
+            if threshold > 0 and snap.pps > threshold * 0.7:
+                status = "elevated"
+            ip_stats.append({
+                "ip": ip,
+                "label": self.mirror_ip_labels.get(ip, ""),
+                "pps": round(snap.pps, 1),
+                "bps": round(snap.bps, 1),
+                "tcp_pct": snap.tcp_pct,
+                "udp_pct": snap.udp_pct,
+                "icmp_pct": snap.icmp_pct,
+                "baseline_pps": bl.get("avg_pps", 0),
+                "threshold_pps": bl.get("threshold", 0),
+                "status": status,
+                "src_ip_count": snap.src_ip_count,
+            })
+
+        self.api._post("/agent/mirror-metrics", {
+            "ips": ip_stats,
+            "total_pps": round(self._last_aggregate_pps, 1),
+            "total_bps": round(self._last_aggregate_bps, 1),
+            "tracked_ip_count": len(ip_snapshots),
+            "active_attacks": len(self.active_attacks),
+            "mirror_engine": self.mirror_engine.stats,
+        }, timeout=10)
+
+    def _heartbeat_loop(self) -> None:
+        """Override heartbeat to include mirror-specific stats."""
+        _last_update_check = time.monotonic()
+        while not self.shutdown.is_set():
+            self.shutdown.wait(30)
+            if self.shutdown.is_set():
+                break
+            try:
+                hb = {
+                    "version": VERSION,
+                    "baseline_ready": self.baseline.baseline_ready,
+                    "baseline_avg_pps": round(self.baseline.avg_pps, 1),
+                    "baseline_p99_pps": round(self.baseline.p99_pps, 1),
+                    "circuit_breaker": self.api.circuit_breaker_state,
+                    "retry_queue_size": len(self.api.retry_queue),
+                    "gre_dedup_enabled": self.gre_decap.enabled,
+                    "hypervisor_mode": False,
+                    "pcap_active": self.pcap.enabled,
+                    "flow_active": self.flow is not None,
+                    # Mirror-specific
+                    "mirror_mode": True,
+                    "mirror_interface": self.mirror_interface,
+                    "mirror_tracked_ips": self.per_ip_baseline.ip_count,
+                    "mirror_active_attacks": len(self.active_attacks),
+                    "mirror_engine": self.mirror_engine.stats,
+                }
+                if self.flow:
+                    hb["flow_collector"] = self.flow.stats
+                self.api.heartbeat(hb)
+            except Exception as exc:
+                logger.error("Heartbeat error: %s", exc)
+
+            if time.monotonic() - _last_update_check >= 21600:
+                _last_update_check = time.monotonic()
+                check_for_updates()
+
+
+# ---------------------------------------------------------------------------
 # CLI: Setup Wizard
 # ---------------------------------------------------------------------------
 
@@ -3843,6 +4576,29 @@ def setup_wizard(config_path: str) -> None:
             print("  Using tcpdump mode. The agent will auto-install tcpdump if needed.")
         else:
             cfg["pcap_mode"] = "scapy"
+
+    # Mirror/SPAN mode
+    print("\n  Monitoring Mode:")
+    print("    1. Agent mode (default) - Monitor this server's own traffic")
+    print("    2. Mirror/SPAN mode    - Monitor mirrored traffic from a switch/router")
+    print("                             Detects attacks on any IP in the monitored segment")
+    mode_choice = input("  Choose [1/2, default=1]: ").strip()
+    if mode_choice == "2":
+        cfg["mirror_mode"] = True
+        mirror_iface = input("  Mirror interface (NIC connected to SPAN port): ").strip()
+        if mirror_iface:
+            cfg["mirror_interface"] = mirror_iface
+        else:
+            print("  Warning: mirror_interface is required for mirror mode.")
+        subnets_input = input("  Monitored subnets (comma-separated CIDRs, blank=all): ").strip()
+        if subnets_input:
+            cfg["mirror_subnets"] = [s.strip() for s in subnets_input.split(",") if s.strip()]
+        capture_mode = input("  Capture mode [af_packet/tcpdump, default=af_packet]: ").strip().lower()
+        if capture_mode == "tcpdump":
+            cfg["mirror_capture_mode"] = "tcpdump"
+        else:
+            cfg["mirror_capture_mode"] = "af_packet"
+        print("  Mirror mode configured. Per-IP DDoS detection will be active.")
 
     # GRE interface check
     print("\n  GRE Tunnel Setup:")
@@ -3989,7 +4745,10 @@ def main() -> None:
     if not args.no_update_check:
         check_for_updates(force=False, interactive=False)
 
-    agent = Agent(cfg)
+    if cfg.get("mirror_mode"):
+        agent = MirrorAgent(cfg)
+    else:
+        agent = Agent(cfg)
     agent.run()
 
 
