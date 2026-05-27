@@ -3497,6 +3497,19 @@ class Agent:
                 self.l7 = None
                 self.l7_enabled = False
 
+            # Mirror mode config from server
+            if data.get("mirror_blocked"):
+                if hasattr(self, 'mirror_engine'):
+                    logger.warning("Mirror mode blocked by server: %s",
+                                   data.get("mirror_message", 'subscription required'))
+            if "mirror_ip_limit" in data and hasattr(self, 'mirror_counter'):
+                ip_limit = int(data["mirror_ip_limit"])
+                if ip_limit > 0:
+                    self.mirror_counter._max_ips = min(ip_limit, 100000)
+                    logger.debug("Mirror IP limit set to %d", ip_limit)
+            if "mirror_ip_labels" in data and hasattr(self, 'mirror_ip_labels'):
+                self.mirror_ip_labels = data["mirror_ip_labels"]
+
         except Exception as exc:
             logger.error("Config fetch error: %s", exc)
 
