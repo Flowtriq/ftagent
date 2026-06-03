@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.13"
+VERSION = "1.9.14"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1537,6 +1537,32 @@ class PcapCapture:
             )
             self.enabled = False
 
+    def _cleanup_ring_dir(self, keep_latest: int = 3) -> None:
+        """Hard-enforce ring buffer size: keep only the newest `keep_latest`
+        files and delete everything else.  Called on startup, before each
+        tcpdump restart, and periodically from cleanup_pcaps()."""
+        ring_dir = getattr(self, '_ring_dir', None)
+        if not ring_dir:
+            ring_dir = os.path.join(self.pcap_dir, "_ring")
+        try:
+            ring_path = Path(ring_dir)
+            if not ring_path.is_dir():
+                return
+            files = sorted(ring_path.glob("*.pcap"), key=lambda f: f.stat().st_mtime)
+            to_delete = files[:-keep_latest] if len(files) > keep_latest else []
+            for f in to_delete:
+                try:
+                    sz = f.stat().st_size
+                    f.unlink()
+                    logger.info("Ring cleanup: deleted %s (%.1f MB)", f.name, sz / 1048576)
+                except OSError:
+                    pass
+            if to_delete:
+                logger.info("Ring cleanup: removed %d old file(s), kept %d",
+                            len(to_delete), min(len(files), keep_latest))
+        except Exception as exc:
+            logger.error("Ring cleanup error: %s", exc)
+
     def _background_ring_tcpdump(self, shutdown: threading.Event) -> None:
         """Use tcpdump for continuous capture. Native speed, near-zero CPU.
         Rotates files every 30s, keeps last 3 as a ring buffer.
@@ -1546,6 +1572,9 @@ class PcapCapture:
         os.makedirs(ring_dir, mode=0o777, exist_ok=True)
         os.chmod(ring_dir, 0o777)  # writable by any user (tcpdump may drop privs)
         self._ring_dir = ring_dir
+
+        # Clean up any orphaned ring files from previous runs on startup
+        self._cleanup_ring_dir(keep_latest=3)
 
         ring_file = os.path.join(ring_dir, "ring_%Y%m%d_%H%M%S.pcap")
         snaplen = str(self.snaplen) if self.snaplen else "0"
@@ -1620,6 +1649,8 @@ class PcapCapture:
                         return
                     shutdown.wait(5)
                     if not shutdown.is_set():
+                        # Clean orphaned files before restart
+                        self._cleanup_ring_dir(keep_latest=3)
                         logger.info("Restarting tcpdump (attempt %d)...", _restarts)
                         self._tcpdump_proc = subprocess.Popen(
                             tcpdump_cmd, stdout=subprocess.DEVNULL,
@@ -1798,7 +1829,10 @@ class PcapCapture:
                     except OSError:
                         pass
 
-            # 2. Collect final pcap files (skip _ring/ and _capture_*/ dirs)
+            # 2. Enforce ring buffer cap (tcpdump -W can fail on restart)
+            self._cleanup_ring_dir(keep_latest=3)
+
+            # 3. Collect final pcap files (skip _ring/ and _capture_*/ dirs)
             pcap_files = sorted(
                 (f for f in pcap_root.glob("*.pcap") if f.is_file()),
                 key=lambda f: f.stat().st_mtime,
@@ -1810,7 +1844,7 @@ class PcapCapture:
             max_age = self.retention_days * 86400
             removed = 0
 
-            # 3. Delete files older than retention_days
+            # 4. Delete files older than retention_days
             remaining = []
             for f in pcap_files:
                 try:
@@ -1822,7 +1856,7 @@ class PcapCapture:
                 except OSError:
                     remaining.append(f)
 
-            # 4. Enforce disk cap (delete oldest first)
+            # 5. Enforce disk cap (delete oldest first)
             max_bytes = self.max_disk_mb * 1024 * 1024
             total = sum(f.stat().st_size for f in remaining)
             while remaining and total > max_bytes:
