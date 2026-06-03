@@ -2665,6 +2665,7 @@ class ServicePortDetector:
     CHAIN_BLOCK   = "FT_SP_BLOCK"
 
     def __init__(self):
+        self._lock = threading.RLock()
         self.enabled = False
         self.ports: list = []           # [{"protocol":"tcp","port_value":"80,443"}]
         self.sensitivity = "standard"
@@ -2691,31 +2692,32 @@ class ServicePortDetector:
 
     def configure(self, sp_cfg: dict) -> None:
         """Apply config from server. Rebuilds accounting rules if ports changed."""
-        if not sp_cfg or not sp_cfg.get("enabled"):
-            if self.enabled:
-                self.cleanup()
-                self.enabled = False
-            return
+        with self._lock:
+            if not sp_cfg or not sp_cfg.get("enabled"):
+                if self.enabled:
+                    self.cleanup()
+                    self.enabled = False
+                return
 
-        new_version = self._cfg_hash(sp_cfg)
-        was_enabled = self.enabled
+            new_version = self._cfg_hash(sp_cfg)
+            was_enabled = self.enabled
 
-        self.enabled = True
-        self.ports = sp_cfg.get("ports", [])
-        self.sensitivity = sp_cfg.get("sensitivity", "standard")
-        self.pps_threshold = max(1, int(sp_cfg.get("pps_threshold", 100)))
-        self.response_mode = sp_cfg.get("response_mode", "full")
-        self.block_cooldown = max(60, int(sp_cfg.get("block_cooldown", 300)))
-        self.block_scope = sp_cfg.get("block_scope", "non_service")
+            self.enabled = True
+            self.ports = sp_cfg.get("ports", [])
+            self.sensitivity = sp_cfg.get("sensitivity", "standard")
+            self.pps_threshold = max(1, int(sp_cfg.get("pps_threshold", 100)))
+            self.response_mode = sp_cfg.get("response_mode", "full")
+            self.block_cooldown = max(60, int(sp_cfg.get("block_cooldown", 300)))
+            self.block_scope = sp_cfg.get("block_scope", "non_service")
 
-        if new_version != self._config_version:
-            logger.info("Service ports config changed, rebuilding accounting rules")
-            self._teardown_accounting()
-            self._setup_accounting()
-            self._config_version = new_version
-        elif not self._rules_installed:
-            self._setup_accounting()
-            self._config_version = new_version
+            if new_version != self._config_version:
+                logger.info("Service ports config changed, rebuilding accounting rules")
+                self._teardown_accounting()
+                self._setup_accounting()
+                self._config_version = new_version
+            elif not self._rules_installed:
+                self._setup_accounting()
+                self._config_version = new_version
 
     def _cfg_hash(self, cfg: dict) -> str:
         """Hash the port config to detect changes."""
@@ -2832,74 +2834,75 @@ class ServicePortDetector:
     def read_counters(self) -> bool:
         """Read iptables packet/byte counters for service vs non-service traffic.
         Returns True if counters were read successfully."""
-        if not self._rules_installed:
-            return False
-
-        import subprocess
-        now = time.monotonic()
-        dt = now - self._last_read
-        if dt < 0.5:
-            return False
-        self._last_read = now
-
-        try:
-            result = subprocess.run(
-                ["iptables", "-L", self.CHAIN_ACCOUNT, "-nvx"],
-                capture_output=True, text=True, timeout=5)
-            if result.returncode != 0:
+        with self._lock:
+            if not self._rules_installed:
                 return False
 
-            lines = result.stdout.strip().split("\n")
-            service_pkts = 0
-            service_bytes = 0
-            non_service_pkts = 0
-            non_service_bytes = 0
+            import subprocess
+            now = time.monotonic()
+            dt = now - self._last_read
+            if dt < 0.5:
+                return False
+            self._last_read = now
 
-            for line in lines:
-                if "ft_sp_service" in line:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        service_pkts += int(parts[0])
-                        service_bytes += int(parts[1])
-                elif "ft_sp_non_service" in line:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        non_service_pkts += int(parts[0])
-                        non_service_bytes += int(parts[1])
-
-            # Calculate rates
-            self.service_pps = max(0, round((service_pkts - self._prev_service_pkts) / dt))
-            self.service_bps = max(0, round((service_bytes - self._prev_service_bytes) * 8 / dt))
-            self.non_service_pps = max(0, round((non_service_pkts - self._prev_non_service_pkts) / dt))
-            self.non_service_bps = max(0, round((non_service_bytes - self._prev_non_service_bytes) * 8 / dt))
-
-            self._prev_service_pkts = service_pkts
-            self._prev_non_service_pkts = non_service_pkts
-            self._prev_service_bytes = service_bytes
-            self._prev_non_service_bytes = non_service_bytes
-
-            # Read blocked counter
             try:
-                br = subprocess.run(
-                    ["iptables", "-L", self.CHAIN_BLOCK, "-nvx"],
+                result = subprocess.run(
+                    ["iptables", "-L", self.CHAIN_ACCOUNT, "-nvx"],
                     capture_output=True, text=True, timeout=5)
-                if br.returncode == 0:
-                    blocked_total = 0
-                    for bline in br.stdout.strip().split("\n"):
-                        if "ft_sp_block" in bline:
-                            bparts = bline.split()
-                            if len(bparts) >= 1:
-                                blocked_total += int(bparts[0])
-                    self.blocked_pps = max(0, round((blocked_total - self._prev_blocked_pkts) / dt))
-                    self._prev_blocked_pkts = blocked_total
-            except Exception:
-                pass
+                if result.returncode != 0:
+                    return False
 
-            return True
+                lines = result.stdout.strip().split("\n")
+                service_pkts = 0
+                service_bytes = 0
+                non_service_pkts = 0
+                non_service_bytes = 0
 
-        except Exception as e:
-            logger.debug("Service port counter read failed: %s", e)
-            return False
+                for line in lines:
+                    if "ft_sp_service" in line:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            service_pkts += int(parts[0])
+                            service_bytes += int(parts[1])
+                    elif "ft_sp_non_service" in line:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            non_service_pkts += int(parts[0])
+                            non_service_bytes += int(parts[1])
+
+                # Calculate rates
+                self.service_pps = max(0, round((service_pkts - self._prev_service_pkts) / dt))
+                self.service_bps = max(0, round((service_bytes - self._prev_service_bytes) * 8 / dt))
+                self.non_service_pps = max(0, round((non_service_pkts - self._prev_non_service_pkts) / dt))
+                self.non_service_bps = max(0, round((non_service_bytes - self._prev_non_service_bytes) * 8 / dt))
+
+                self._prev_service_pkts = service_pkts
+                self._prev_non_service_pkts = non_service_pkts
+                self._prev_service_bytes = service_bytes
+                self._prev_non_service_bytes = non_service_bytes
+
+                # Read blocked counter
+                try:
+                    br = subprocess.run(
+                        ["iptables", "-L", self.CHAIN_BLOCK, "-nvx"],
+                        capture_output=True, text=True, timeout=5)
+                    if br.returncode == 0:
+                        blocked_total = 0
+                        for bline in br.stdout.strip().split("\n"):
+                            if "ft_sp_block" in bline:
+                                bparts = bline.split()
+                                if len(bparts) >= 1:
+                                    blocked_total += int(bparts[0])
+                        self.blocked_pps = max(0, round((blocked_total - self._prev_blocked_pkts) / dt))
+                        self._prev_blocked_pkts = blocked_total
+                except Exception:
+                    pass
+
+                return True
+
+            except Exception as e:
+                logger.debug("Service port counter read failed: %s", e)
+                return False
 
     def check_threshold(self) -> bool:
         """Check if non-service traffic exceeds the threshold.
@@ -2996,89 +2999,100 @@ class ServicePortDetector:
         self._attack_sources = result
         return result
 
-    def deploy_blocks(self, sources: list) -> int:
+    def deploy_blocks(self, sources: list) -> list:
         """Deploy on-node iptables blocks against offending source IPs.
-        Returns number of blocks deployed."""
-        if self.response_mode == "pipeline":
-            return 0
+        Returns list of source dicts that were actually blocked."""
+        with self._lock:
+            if self.response_mode == "pipeline":
+                return []
 
-        deployed = 0
-        now = time.monotonic()
-        expires = now + self.block_cooldown
+            blocked = []
+            now = time.monotonic()
+            expires = now + self.block_cooldown
 
-        for src in sources[:50]:
-            ip = src.get("ip", "")
-            if not ip or ip in self._block_rules:
-                continue
+            for src in sources[:50]:
+                ip = src.get("ip", "")
+                if not ip or ip in self._block_rules:
+                    continue
 
-            if self.block_scope == "non_service":
-                # Block only non-service ports: drop packets from this IP
-                # that don't match service ports
-                port_matches = self._build_port_match()
-                # First, allow service port traffic from this IP
-                for proto, ports in port_matches:
+                if self.block_scope == "non_service":
+                    # Block only non-service ports: drop packets from this IP
+                    # that don't match service ports
+                    port_matches = self._build_port_match()
+                    # First, allow service port traffic from this IP
+                    for proto, ports in port_matches:
+                        self._run_ipt([
+                            "-I", self.CHAIN_BLOCK, "1",
+                            "-s", ip, "-p", proto,
+                            "-m", "multiport", "--dports", ports,
+                            "-m", "comment", "--comment", f"ft_sp_block_allow_{ip}",
+                            "-j", "RETURN",
+                        ])
+                    # Then drop everything else from this IP
                     self._run_ipt([
-                        "-I", self.CHAIN_BLOCK, "1",
-                        "-s", ip, "-p", proto,
-                        "-m", "multiport", "--dports", ports,
-                        "-m", "comment", "--comment", f"ft_sp_block_allow_{ip}",
-                        "-j", "RETURN",
+                        "-A", self.CHAIN_BLOCK,
+                        "-s", ip,
+                        "-m", "comment", "--comment", f"ft_sp_block_{ip}",
+                        "-j", "DROP",
                     ])
-                # Then drop everything else from this IP
-                self._run_ipt([
-                    "-A", self.CHAIN_BLOCK,
-                    "-s", ip,
-                    "-m", "comment", "--comment", f"ft_sp_block_{ip}",
-                    "-j", "DROP",
-                ])
-            else:
-                # Full IP block
-                self._run_ipt([
-                    "-A", self.CHAIN_BLOCK,
-                    "-s", ip,
-                    "-m", "comment", "--comment", f"ft_sp_block_{ip}",
-                    "-j", "DROP",
-                ])
+                else:
+                    # Full IP block
+                    self._run_ipt([
+                        "-A", self.CHAIN_BLOCK,
+                        "-s", ip,
+                        "-m", "comment", "--comment", f"ft_sp_block_{ip}",
+                        "-j", "DROP",
+                    ])
 
-            self._block_rules[ip] = expires
-            deployed += 1
-            logger.info("Service port block: %s (scope=%s, cooldown=%ds)",
-                        ip, self.block_scope, self.block_cooldown)
+                self._block_rules[ip] = expires
+                blocked.append(src)
+                logger.info("Service port block: %s (scope=%s, cooldown=%ds)",
+                            ip, self.block_scope, self.block_cooldown)
 
-        return deployed
+            return blocked
 
     def expire_blocks(self) -> int:
         """Remove expired block rules. Returns number removed."""
-        now = time.monotonic()
-        expired = []
-        for ip, exp_time in list(self._block_rules.items()):
-            if now >= exp_time:
-                expired.append(ip)
+        with self._lock:
+            import subprocess
+            now = time.monotonic()
+            expired = []
+            for ip, exp_time in list(self._block_rules.items()):
+                if now >= exp_time:
+                    expired.append(ip)
 
-        for ip in expired:
-            # Remove all rules mentioning this IP from block chain
-            # Keep removing until no more matches (handles allow + drop rules)
-            for _ in range(5):
-                if not self._run_ipt(["-D", self.CHAIN_BLOCK, "-s", ip,
-                                      "-m", "comment", "--comment", f"ft_sp_block_{ip}",
-                                      "-j", "DROP"], check=True):
-                    break
-            for _ in range(5):
-                if not self._run_ipt(["-D", self.CHAIN_BLOCK, "-s", ip,
-                                      "-m", "comment", "--comment", f"ft_sp_block_allow_{ip}"], check=True):
-                    break
-            del self._block_rules[ip]
-            logger.info("Service port block expired: %s", ip)
+            for ip in expired:
+                # Delete all rules for this IP by line number (reverse order)
+                try:
+                    r = subprocess.run(
+                        ["iptables", "-L", self.CHAIN_BLOCK, "-n", "--line-numbers"],
+                        capture_output=True, text=True, timeout=5)
+                    if r.returncode == 0:
+                        # Collect line numbers for this IP (both allow and block rules)
+                        to_delete = []
+                        for line in r.stdout.strip().split("\n"):
+                            if f"ft_sp_block_{ip}" in line or f"ft_sp_block_allow_{ip}" in line:
+                                num = line.split()[0]
+                                if num.isdigit():
+                                    to_delete.append(int(num))
+                        # Delete in reverse order so line numbers don't shift
+                        for num in sorted(to_delete, reverse=True):
+                            self._run_ipt(["-D", self.CHAIN_BLOCK, str(num)])
+                except Exception as e:
+                    logger.debug("Block expiry rule cleanup for %s: %s", ip, e)
+                del self._block_rules[ip]
+                logger.info("Service port block expired: %s", ip)
 
-        return len(expired)
+            return len(expired)
 
     def cleanup(self) -> None:
         """Remove all accounting and block rules. Called on shutdown/disable."""
-        if self._rules_installed:
-            self._teardown_accounting()
-        self._block_rules.clear()
-        self._attacking = False
-        logger.info("Service port detector cleaned up")
+        with self._lock:
+            if self._rules_installed:
+                self._teardown_accounting()
+            self._block_rules.clear()
+            self._attacking = False
+            logger.info("Service port detector cleaned up")
 
     def cleanup_stale(self) -> None:
         """Check for and remove stale rules from previous runs."""
@@ -3398,15 +3412,18 @@ class Agent:
                 sources = self.sp_detector.identify_sources()
 
                 # Deploy on-node blocks (if response mode includes on-node)
-                blocks_deployed = 0
+                blocked_sources = []
                 if self.sp_detector.response_mode in ("onnode", "full"):
-                    blocks_deployed = self.sp_detector.deploy_blocks(sources)
-                    if blocks_deployed > 0:
-                        self._report_sp_blocks(sources[:blocks_deployed])
+                    blocked_sources = self.sp_detector.deploy_blocks(sources)
+                blocks_deployed = len(blocked_sources)
 
                 # Open pipeline incident (if response mode includes pipeline)
                 if self.sp_detector.response_mode in ("pipeline", "full") and not self.attacking:
                     self._begin_sp_attack(sources, blocks_deployed)
+
+                # Report blocks AFTER incident opens so we have the UUID
+                if blocked_sources:
+                    self._report_sp_blocks(blocked_sources)
 
             elif self.sp_detector._attacking and not self.sp_detector.check_threshold():
                 # Non-service traffic dropped below threshold
@@ -3686,8 +3703,10 @@ class Agent:
         Flows through the standard incident pipeline."""
         self.attacking = True
         self.attack_start = time.time()
-        self.peak_pps = self.monitor.pps
-        self.peak_bps = self.monitor.bps
+        # Use the higher of aggregate PPS or non-service PPS as peak
+        # (non-service PPS is from iptables counters which may be more accurate)
+        self.peak_pps = max(self.monitor.pps, self.sp_detector.non_service_pps)
+        self.peak_bps = max(self.monitor.bps, self.sp_detector.non_service_bps)
         self.below_count = 0
         self.velocity_curve = []
         self.analyser.reset()
