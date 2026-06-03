@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.6"
+VERSION = "1.9.11"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -2649,6 +2649,462 @@ class HealthCheckHandler:
 
 
 # ---------------------------------------------------------------------------
+# Service Port Detection Engine
+# ---------------------------------------------------------------------------
+
+class ServicePortDetector:
+    """Port-aware traffic classification and on-node blocking.
+
+    Sets up iptables accounting chains to split inbound traffic into
+    service-port and non-service-port streams. Detects threshold crossings
+    on non-service traffic, identifies offending source IPs, and deploys
+    surgical firewall blocks.
+    """
+
+    CHAIN_ACCOUNT = "FT_SP_ACCOUNT"
+    CHAIN_BLOCK   = "FT_SP_BLOCK"
+
+    def __init__(self):
+        self.enabled = False
+        self.ports: list = []           # [{"protocol":"tcp","port_value":"80,443"}]
+        self.sensitivity = "standard"
+        self.pps_threshold = 100
+        self.response_mode = "full"     # onnode, pipeline, full
+        self.block_cooldown = 300       # seconds
+        self.block_scope = "non_service"
+        self._rules_installed = False
+        self._block_rules: dict = {}    # {source_ip: expires_at_monotonic}
+        self._prev_service_pkts = 0
+        self._prev_non_service_pkts = 0
+        self._prev_service_bytes = 0
+        self._prev_non_service_bytes = 0
+        self._last_read: float = 0.0
+        self.service_pps = 0
+        self.service_bps = 0
+        self.non_service_pps = 0
+        self.non_service_bps = 0
+        self.blocked_pps = 0
+        self._prev_blocked_pkts = 0
+        self._attacking = False
+        self._attack_sources: list = []
+        self._config_version = ""
+
+    def configure(self, sp_cfg: dict) -> None:
+        """Apply config from server. Rebuilds accounting rules if ports changed."""
+        if not sp_cfg or not sp_cfg.get("enabled"):
+            if self.enabled:
+                self.cleanup()
+                self.enabled = False
+            return
+
+        new_version = self._cfg_hash(sp_cfg)
+        was_enabled = self.enabled
+
+        self.enabled = True
+        self.ports = sp_cfg.get("ports", [])
+        self.sensitivity = sp_cfg.get("sensitivity", "standard")
+        self.pps_threshold = max(1, int(sp_cfg.get("pps_threshold", 100)))
+        self.response_mode = sp_cfg.get("response_mode", "full")
+        self.block_cooldown = max(60, int(sp_cfg.get("block_cooldown", 300)))
+        self.block_scope = sp_cfg.get("block_scope", "non_service")
+
+        if new_version != self._config_version:
+            logger.info("Service ports config changed, rebuilding accounting rules")
+            self._teardown_accounting()
+            self._setup_accounting()
+            self._config_version = new_version
+        elif not self._rules_installed:
+            self._setup_accounting()
+            self._config_version = new_version
+
+    def _cfg_hash(self, cfg: dict) -> str:
+        """Hash the port config to detect changes."""
+        import hashlib
+        raw = json.dumps(cfg.get("ports", []), sort_keys=True)
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    def _build_port_match(self) -> list:
+        """Build iptables multiport match args from port entries.
+        Returns list of (protocol, ports_csv) tuples."""
+        tcp_ports = []
+        udp_ports = []
+        for entry in self.ports:
+            proto = entry.get("protocol", "both")
+            val = str(entry.get("port_value", "")).strip()
+            if not val:
+                continue
+            if proto in ("tcp", "both"):
+                tcp_ports.append(val)
+            if proto in ("udp", "both"):
+                udp_ports.append(val)
+
+        result = []
+        if tcp_ports:
+            result.append(("tcp", ",".join(tcp_ports)))
+        if udp_ports:
+            result.append(("udp", ",".join(udp_ports)))
+        return result
+
+    def _run_ipt(self, args: list, check: bool = False) -> bool:
+        """Run an iptables command. Returns True on success."""
+        import subprocess
+        cmd = ["iptables"] + args
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if check and r.returncode != 0:
+                return False
+            return r.returncode == 0
+        except Exception as e:
+            logger.debug("iptables %s failed: %s", " ".join(args), e)
+            return False
+
+    def _setup_accounting(self) -> None:
+        """Install iptables accounting chains for traffic splitting."""
+        if not self.ports:
+            logger.warning("Service ports: no ports configured, skipping setup")
+            return
+
+        # Create chains
+        self._run_ipt(["-N", self.CHAIN_ACCOUNT])
+        self._run_ipt(["-N", self.CHAIN_BLOCK])
+
+        # Flush any existing rules
+        self._run_ipt(["-F", self.CHAIN_ACCOUNT])
+        self._run_ipt(["-F", self.CHAIN_BLOCK])
+
+        # Insert block chain check first (drops blocked IPs)
+        self._run_ipt(["-I", "INPUT", "1", "-j", self.CHAIN_BLOCK])
+
+        # Insert accounting chain after block chain
+        self._run_ipt(["-I", "INPUT", "2", "-j", self.CHAIN_ACCOUNT])
+
+        # Accounting rules: match service ports (just count, no action)
+        port_matches = self._build_port_match()
+        for proto, ports in port_matches:
+            # Service traffic counter (RETURN so it doesn't double-count)
+            self._run_ipt([
+                "-A", self.CHAIN_ACCOUNT,
+                "-p", proto, "-m", "multiport", "--dports", ports,
+                "-m", "comment", "--comment", "ft_sp_service",
+                "-j", "RETURN",
+            ])
+
+        # Non-service traffic counter: everything that didn't match above
+        # (also RETURN - these are just counters, no drops)
+        self._run_ipt([
+            "-A", self.CHAIN_ACCOUNT,
+            "-m", "comment", "--comment", "ft_sp_non_service",
+            "-j", "RETURN",
+        ])
+
+        self._rules_installed = True
+        self._reset_counters()
+        logger.info("Service port accounting installed: %d port entries",
+                     len(self.ports))
+
+    def _teardown_accounting(self) -> None:
+        """Remove accounting chains from INPUT."""
+        if not self._rules_installed:
+            return
+        # Remove jump rules from INPUT
+        self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_BLOCK])
+        self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_ACCOUNT])
+        # Flush and delete chains
+        self._run_ipt(["-F", self.CHAIN_ACCOUNT])
+        self._run_ipt(["-X", self.CHAIN_ACCOUNT])
+        self._run_ipt(["-F", self.CHAIN_BLOCK])
+        self._run_ipt(["-X", self.CHAIN_BLOCK])
+        self._rules_installed = False
+        logger.info("Service port accounting removed")
+
+    def _reset_counters(self) -> None:
+        """Reset baseline counters after rule setup."""
+        self._prev_service_pkts = 0
+        self._prev_non_service_pkts = 0
+        self._prev_service_bytes = 0
+        self._prev_non_service_bytes = 0
+        self._prev_blocked_pkts = 0
+        self._last_read = time.monotonic()
+        # Zero the iptables counters
+        self._run_ipt(["-Z", self.CHAIN_ACCOUNT])
+        self._run_ipt(["-Z", self.CHAIN_BLOCK])
+
+    def read_counters(self) -> bool:
+        """Read iptables packet/byte counters for service vs non-service traffic.
+        Returns True if counters were read successfully."""
+        if not self._rules_installed:
+            return False
+
+        import subprocess
+        now = time.monotonic()
+        dt = now - self._last_read
+        if dt < 0.5:
+            return False
+        self._last_read = now
+
+        try:
+            result = subprocess.run(
+                ["iptables", "-L", self.CHAIN_ACCOUNT, "-nvx"],
+                capture_output=True, text=True, timeout=5)
+            if result.returncode != 0:
+                return False
+
+            lines = result.stdout.strip().split("\n")
+            service_pkts = 0
+            service_bytes = 0
+            non_service_pkts = 0
+            non_service_bytes = 0
+
+            for line in lines:
+                if "ft_sp_service" in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        service_pkts += int(parts[0])
+                        service_bytes += int(parts[1])
+                elif "ft_sp_non_service" in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        non_service_pkts += int(parts[0])
+                        non_service_bytes += int(parts[1])
+
+            # Calculate rates
+            self.service_pps = max(0, round((service_pkts - self._prev_service_pkts) / dt))
+            self.service_bps = max(0, round((service_bytes - self._prev_service_bytes) * 8 / dt))
+            self.non_service_pps = max(0, round((non_service_pkts - self._prev_non_service_pkts) / dt))
+            self.non_service_bps = max(0, round((non_service_bytes - self._prev_non_service_bytes) * 8 / dt))
+
+            self._prev_service_pkts = service_pkts
+            self._prev_non_service_pkts = non_service_pkts
+            self._prev_service_bytes = service_bytes
+            self._prev_non_service_bytes = non_service_bytes
+
+            # Read blocked counter
+            try:
+                br = subprocess.run(
+                    ["iptables", "-L", self.CHAIN_BLOCK, "-nvx"],
+                    capture_output=True, text=True, timeout=5)
+                if br.returncode == 0:
+                    blocked_total = 0
+                    for bline in br.stdout.strip().split("\n"):
+                        if "ft_sp_block" in bline:
+                            bparts = bline.split()
+                            if len(bparts) >= 1:
+                                blocked_total += int(bparts[0])
+                    self.blocked_pps = max(0, round((blocked_total - self._prev_blocked_pkts) / dt))
+                    self._prev_blocked_pkts = blocked_total
+            except Exception:
+                pass
+
+            return True
+
+        except Exception as e:
+            logger.debug("Service port counter read failed: %s", e)
+            return False
+
+    def check_threshold(self) -> bool:
+        """Check if non-service traffic exceeds the threshold.
+        Returns True if threshold is crossed."""
+        return self.non_service_pps > self.pps_threshold
+
+    def identify_sources(self) -> list:
+        """Identify top source IPs responsible for non-service traffic.
+        Uses conntrack or ss to find active connections to non-service ports."""
+        import subprocess
+
+        # Build a set of service ports for filtering
+        service_ports = set()
+        for entry in self.ports:
+            val = str(entry.get("port_value", ""))
+            for part in val.split(","):
+                part = part.strip()
+                if "-" in part:
+                    try:
+                        lo, hi = part.split("-", 1)
+                        for p in range(int(lo), int(hi) + 1):
+                            service_ports.add(p)
+                    except ValueError:
+                        pass
+                elif part.isdigit():
+                    service_ports.add(int(part))
+
+        sources: dict = {}  # {ip: {"pps": approx_count, "ports": set()}}
+
+        # Try conntrack first (most accurate for active connections)
+        try:
+            r = subprocess.run(
+                ["conntrack", "-L", "-o", "extended", "--src-nat"],
+                capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                # Fallback: try without --src-nat
+                r = subprocess.run(
+                    ["conntrack", "-L", "-o", "extended"],
+                    capture_output=True, text=True, timeout=10)
+
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    # Parse: tcp 6 ... src=1.2.3.4 dst=5.6.7.8 sport=12345 dport=22
+                    dport_match = re.search(r'dport=(\d+)', line)
+                    src_match = re.search(r'src=(\d+\.\d+\.\d+\.\d+)', line)
+                    if dport_match and src_match:
+                        dport = int(dport_match.group(1))
+                        src_ip = src_match.group(1)
+                        if dport not in service_ports:
+                            if src_ip not in sources:
+                                sources[src_ip] = {"pps": 0, "ports": set()}
+                            sources[src_ip]["pps"] += 1
+                            sources[src_ip]["ports"].add(dport)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug("conntrack source identification failed: %s", e)
+
+        # Fallback to ss if conntrack gave nothing
+        if not sources:
+            try:
+                r = subprocess.run(
+                    ["ss", "-ntu", "state", "established"],
+                    capture_output=True, text=True, timeout=10)
+                if r.returncode == 0:
+                    for line in r.stdout.splitlines()[1:]:
+                        parts = line.split()
+                        if len(parts) >= 5:
+                            local_addr = parts[3]
+                            peer_addr = parts[4]
+                            # Parse local port
+                            lport_str = local_addr.rsplit(":", 1)[-1]
+                            if lport_str.isdigit():
+                                lport = int(lport_str)
+                                if lport not in service_ports:
+                                    peer_ip = peer_addr.rsplit(":", 1)[0]
+                                    if peer_ip not in sources:
+                                        sources[peer_ip] = {"pps": 0, "ports": set()}
+                                    sources[peer_ip]["pps"] += 1
+                                    sources[peer_ip]["ports"].add(lport)
+            except Exception as e:
+                logger.debug("ss source identification failed: %s", e)
+
+        # Sort by connection count descending, take top 50
+        top = sorted(sources.items(), key=lambda x: x[1]["pps"], reverse=True)[:50]
+
+        result = []
+        for ip, data in top:
+            result.append({
+                "ip": ip,
+                "pps": data["pps"],
+                "ports": sorted(data["ports"])[:20],
+            })
+        self._attack_sources = result
+        return result
+
+    def deploy_blocks(self, sources: list) -> int:
+        """Deploy on-node iptables blocks against offending source IPs.
+        Returns number of blocks deployed."""
+        if self.response_mode == "pipeline":
+            return 0
+
+        deployed = 0
+        now = time.monotonic()
+        expires = now + self.block_cooldown
+
+        for src in sources[:50]:
+            ip = src.get("ip", "")
+            if not ip or ip in self._block_rules:
+                continue
+
+            if self.block_scope == "non_service":
+                # Block only non-service ports: drop packets from this IP
+                # that don't match service ports
+                port_matches = self._build_port_match()
+                # First, allow service port traffic from this IP
+                for proto, ports in port_matches:
+                    self._run_ipt([
+                        "-I", self.CHAIN_BLOCK, "1",
+                        "-s", ip, "-p", proto,
+                        "-m", "multiport", "--dports", ports,
+                        "-m", "comment", "--comment", f"ft_sp_block_allow_{ip}",
+                        "-j", "RETURN",
+                    ])
+                # Then drop everything else from this IP
+                self._run_ipt([
+                    "-A", self.CHAIN_BLOCK,
+                    "-s", ip,
+                    "-m", "comment", "--comment", f"ft_sp_block_{ip}",
+                    "-j", "DROP",
+                ])
+            else:
+                # Full IP block
+                self._run_ipt([
+                    "-A", self.CHAIN_BLOCK,
+                    "-s", ip,
+                    "-m", "comment", "--comment", f"ft_sp_block_{ip}",
+                    "-j", "DROP",
+                ])
+
+            self._block_rules[ip] = expires
+            deployed += 1
+            logger.info("Service port block: %s (scope=%s, cooldown=%ds)",
+                        ip, self.block_scope, self.block_cooldown)
+
+        return deployed
+
+    def expire_blocks(self) -> int:
+        """Remove expired block rules. Returns number removed."""
+        now = time.monotonic()
+        expired = []
+        for ip, exp_time in list(self._block_rules.items()):
+            if now >= exp_time:
+                expired.append(ip)
+
+        for ip in expired:
+            # Remove all rules mentioning this IP from block chain
+            # Keep removing until no more matches (handles allow + drop rules)
+            for _ in range(5):
+                if not self._run_ipt(["-D", self.CHAIN_BLOCK, "-s", ip,
+                                      "-m", "comment", "--comment", f"ft_sp_block_{ip}",
+                                      "-j", "DROP"], check=True):
+                    break
+            for _ in range(5):
+                if not self._run_ipt(["-D", self.CHAIN_BLOCK, "-s", ip,
+                                      "-m", "comment", "--comment", f"ft_sp_block_allow_{ip}"], check=True):
+                    break
+            del self._block_rules[ip]
+            logger.info("Service port block expired: %s", ip)
+
+        return len(expired)
+
+    def cleanup(self) -> None:
+        """Remove all accounting and block rules. Called on shutdown/disable."""
+        if self._rules_installed:
+            self._teardown_accounting()
+        self._block_rules.clear()
+        self._attacking = False
+        logger.info("Service port detector cleaned up")
+
+    def cleanup_stale(self) -> None:
+        """Check for and remove stale rules from previous runs."""
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["iptables", "-L", "INPUT", "-n", "--line-numbers"],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                lines = r.stdout.strip().split("\n")
+                for line in reversed(lines):
+                    if self.CHAIN_ACCOUNT in line or self.CHAIN_BLOCK in line:
+                        num = line.split()[0]
+                        if num.isdigit():
+                            self._run_ipt(["-D", "INPUT", num])
+                            logger.info("Removed stale INPUT jump to %s (rule #%s)",
+                                        self.CHAIN_ACCOUNT if self.CHAIN_ACCOUNT in line else self.CHAIN_BLOCK, num)
+            # Try to flush and remove stale chains
+            for chain in [self.CHAIN_ACCOUNT, self.CHAIN_BLOCK]:
+                self._run_ipt(["-F", chain])
+                self._run_ipt(["-X", chain])
+        except Exception as e:
+            logger.debug("Stale rule cleanup: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Agent Core
 # ---------------------------------------------------------------------------
 
@@ -2704,6 +3160,11 @@ class Agent:
         self.l7_thread_running = False
         self.l7_incident_uuid = ""
         self.l7_last_metric_push: float = 0.0
+
+        # Service Port Detection
+        self.sp_detector = ServicePortDetector()
+        self._sp_last_metrics_push: float = 0.0
+        self._sp_metrics_interval = 5  # push split metrics every 5s
 
         self.attacking = False
         self.attack_start: float = 0.0
@@ -2799,6 +3260,9 @@ class Agent:
 
         self._fetch_config()
 
+        # Service ports: clean up stale rules from previous runs
+        self.sp_detector.cleanup_stale()
+
         # Detect and report GRE tunnels on startup (Features 1 & 3)
         threading.Thread(
             target=self._report_gre_tunnels, daemon=True,
@@ -2846,6 +3310,9 @@ class Agent:
 
     def _signal_handler(self, signum, frame) -> None:
         logger.info("Received signal %d, shutting down...", signum)
+        # Clean up service port firewall rules before exit
+        if self.sp_detector.enabled:
+            self.sp_detector.cleanup()
         self.shutdown.set()
 
     def _tick(self) -> None:
@@ -2910,6 +3377,42 @@ class Agent:
             # Per-VM stats push (Feature 2) — only in hypervisor mode
             if self.hypervisor_mode and self.analyser.inner_dst_ips:
                 self._flush_vm_stats()
+
+        # ── Service Port Detection ──────────────────────────────────
+        if self.sp_detector.enabled:
+            self.sp_detector.read_counters()
+            self.sp_detector.expire_blocks()
+
+            # Push split metrics periodically
+            if now - self._sp_last_metrics_push >= self._sp_metrics_interval:
+                self._sp_last_metrics_push = now
+                self._flush_sp_metrics()
+
+            # Check non-service threshold
+            if not self.sp_detector._attacking and self.sp_detector.check_threshold():
+                self.sp_detector._attacking = True
+                logger.warning("SERVICE PORT THRESHOLD CROSSED — non-service PPS=%d threshold=%d",
+                               self.sp_detector.non_service_pps, self.sp_detector.pps_threshold)
+
+                # Identify offending sources
+                sources = self.sp_detector.identify_sources()
+
+                # Deploy on-node blocks (if response mode includes on-node)
+                blocks_deployed = 0
+                if self.sp_detector.response_mode in ("onnode", "full"):
+                    blocks_deployed = self.sp_detector.deploy_blocks(sources)
+                    if blocks_deployed > 0:
+                        self._report_sp_blocks(sources[:blocks_deployed])
+
+                # Open pipeline incident (if response mode includes pipeline)
+                if self.sp_detector.response_mode in ("pipeline", "full") and not self.attacking:
+                    self._begin_sp_attack(sources, blocks_deployed)
+
+            elif self.sp_detector._attacking and not self.sp_detector.check_threshold():
+                # Non-service traffic dropped below threshold
+                self.sp_detector._attacking = False
+                logger.info("Service port non-service traffic returned to normal (PPS=%d)",
+                            self.sp_detector.non_service_pps)
 
         if not self.attacking:
             # Two detection paths:
@@ -3140,6 +3643,120 @@ class Agent:
         # queued by the server in response to the incident we just opened
         threading.Thread(target=self._fetch_config, daemon=True,
                          name="attack-config-fetch").start()
+
+    # ── Service Port helpers ─────────────────────────────────────────
+
+    def _flush_sp_metrics(self) -> None:
+        """Push split traffic metrics to the API."""
+        if not self.sp_detector.enabled:
+            return
+        try:
+            self.api._post("/agent/sp/metrics", {
+                "service_pps": self.sp_detector.service_pps,
+                "service_bps": self.sp_detector.service_bps,
+                "non_service_pps": self.sp_detector.non_service_pps,
+                "non_service_bps": self.sp_detector.non_service_bps,
+                "blocked_pps": self.sp_detector.blocked_pps,
+                "active_blocks": len(self.sp_detector._block_rules),
+            }, timeout=5)
+        except Exception as e:
+            logger.debug("SP metrics push failed: %s", e)
+
+    def _report_sp_blocks(self, sources: list) -> None:
+        """Report deployed on-node blocks to the API."""
+        blocks = []
+        for src in sources:
+            blocks.append({
+                "source_ip": src["ip"],
+                "block_scope": self.sp_detector.block_scope,
+                "src_pps": src.get("pps", 0),
+                "dst_ports": src.get("ports", []),
+                "cooldown": self.sp_detector.block_cooldown,
+            })
+        try:
+            self.api._post("/agent/sp/blocks", {
+                "incident_uuid": self.incident_uuid if self.attacking else None,
+                "blocks": blocks,
+            }, timeout=10)
+        except Exception as e:
+            logger.debug("SP blocks report failed: %s", e)
+
+    def _begin_sp_attack(self, sources: list, blocks_deployed: int) -> None:
+        """Open an incident triggered by non-service port threshold crossing.
+        Flows through the standard incident pipeline."""
+        self.attacking = True
+        self.attack_start = time.time()
+        self.peak_pps = self.monitor.pps
+        self.peak_bps = self.monitor.bps
+        self.below_count = 0
+        self.velocity_curve = []
+        self.analyser.reset()
+        self.last_update = time.monotonic()
+
+        # Determine zone: check if regular volumetric threshold is also crossed
+        regular_trigger = self.monitor.pps > self.threshold
+        sp_zone = "both" if regular_trigger else "non_service"
+
+        family = "udp_flood"  # most non-service port attacks are UDP
+        proto = self._proto_breakdown()
+        family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"])
+
+        started_at = datetime.now(timezone.utc).isoformat()
+
+        logger.warning("SP INCIDENT OPENING — zone=%s non_service_pps=%d service_pps=%d blocks=%d",
+                        sp_zone, self.sp_detector.non_service_pps,
+                        self.sp_detector.service_pps, blocks_deployed)
+
+        # Build source IP list for incident
+        sp_top_sources = [
+            {"ip": s["ip"], "pps": s.get("pps", 0), "ports": s.get("ports", [])}
+            for s in sources[:50]
+        ]
+
+        inc_data = {
+            "peak_pps": round(self.peak_pps, 1),
+            "peak_bps": round(self.peak_bps, 1),
+            "started_at": started_at,
+            "attack_family": family,
+            "baseline_pps": round(self.baseline.avg_pps, 1),
+            "duration": 0,
+            "gre_dedup_active": self.gre_decap.enabled,
+            # Service port zone metadata
+            "sp_zone": sp_zone,
+            "sp_service_pps": self.sp_detector.service_pps,
+            "sp_non_service_pps": self.sp_detector.non_service_pps,
+            "sp_top_sources": sp_top_sources,
+            "sp_blocks_deployed": blocks_deployed,
+            # Include source IPs in standard format too
+            "top_src_ips": [{"ip": s["ip"], "count": s.get("pps", 0)} for s in sources[:20]],
+            "source_ip_count": len(sources),
+        }
+
+        result = self.api.open_incident(inc_data)
+
+        if result and "uuid" in result:
+            self.incident_uuid = result["uuid"]
+            logger.info("SP incident opened: %s", self.incident_uuid)
+            if "pending_commands" in result and result["pending_commands"]:
+                logger.info("Applying %d auto-mitigation command(s)",
+                            len(result["pending_commands"]))
+                for cmd in result["pending_commands"]:
+                    self._execute_command(cmd)
+        else:
+            self.incident_uuid = str(uuid.uuid4())
+            logger.warning("SP using local incident UUID: %s", self.incident_uuid)
+
+        if self.pcap.enabled:
+            self.pcap.start_capture(
+                incident_uuid=self.incident_uuid,
+                api_client=self.api)
+
+        self.velocity_curve.append({"t": 0, "pps": round(self.peak_pps, 1)})
+
+        threading.Thread(target=self._fetch_config, daemon=True,
+                         name="sp-attack-config-fetch").start()
+
+    # ── Standard attack lifecycle ─────────────────────────────────
 
     def _update_attack(self) -> None:
         if not self.incident_uuid:
@@ -3496,6 +4113,10 @@ class Agent:
                 logger.info("L7: disabled by server config")
                 self.l7 = None
                 self.l7_enabled = False
+
+            # Service Ports config from server
+            sp_cfg = data.get("service_ports", {})
+            self.sp_detector.configure(sp_cfg)
 
             # Mirror mode config from server
             if data.get("mirror_blocked"):
