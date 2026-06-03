@@ -2689,6 +2689,7 @@ class ServicePortDetector:
         self._attacking = False
         self._attack_sources: list = []
         self._config_version = ""
+        self.ip_safelist: set = set()
 
     def configure(self, sp_cfg: dict) -> None:
         """Apply config from server. Rebuilds accounting rules if ports changed."""
@@ -2709,6 +2710,7 @@ class ServicePortDetector:
             self.response_mode = sp_cfg.get("response_mode", "full")
             self.block_cooldown = max(60, int(sp_cfg.get("block_cooldown", 300)))
             self.block_scope = sp_cfg.get("block_scope", "non_service")
+            self.ip_safelist = set(sp_cfg.get("ip_safelist", []))
 
             if new_version != self._config_version:
                 logger.info("Service ports config changed, rebuilding accounting rules")
@@ -2986,6 +2988,10 @@ class ServicePortDetector:
             except Exception as e:
                 logger.debug("ss source identification failed: %s", e)
 
+        # Remove safelisted IPs before ranking
+        for safe_ip in self.ip_safelist:
+            sources.pop(safe_ip, None)
+
         # Sort by connection count descending, take top 50
         top = sorted(sources.items(), key=lambda x: x[1]["pps"], reverse=True)[:50]
 
@@ -3013,6 +3019,10 @@ class ServicePortDetector:
             for src in sources[:50]:
                 ip = src.get("ip", "")
                 if not ip or ip in self._block_rules:
+                    continue
+                # Never block safelisted IPs
+                if ip in self.ip_safelist:
+                    logger.info("Service port block skipped (safelisted): %s", ip)
                     continue
 
                 if self.block_scope == "non_service":
