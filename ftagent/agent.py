@@ -3258,10 +3258,10 @@ class Agent:
         for t in threads:
             t.start()
 
-        self._fetch_config()
-
-        # Service ports: clean up stale rules from previous runs
+        # Service ports: clean up stale rules from previous runs BEFORE first config fetch
         self.sp_detector.cleanup_stale()
+
+        self._fetch_config()
 
         # Detect and report GRE tunnels on startup (Features 1 & 3)
         threading.Thread(
