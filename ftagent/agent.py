@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.14"
+VERSION = "1.9.15"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1797,13 +1797,28 @@ class PcapCapture:
             logger.info("PCAP chunk %d written: %s (%d packets)",
                         self._chunk_index, filepath, len(chunk_pkts))
             self._chunk_index += 1
-            # Upload in background
+            # Upload in background, then delete the chunk file from disk
             if self._api_client:
+                def _upload_and_delete(api, uuid, path):
+                    try:
+                        api.upload_pcap(uuid, path)
+                    except Exception:
+                        pass
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
                 threading.Thread(
-                    target=self._api_client.upload_pcap,
-                    args=(self._incident_uuid, filepath),
+                    target=_upload_and_delete,
+                    args=(self._api_client, self._incident_uuid, filepath),
                     daemon=True,
                 ).start()
+            else:
+                # No API client; delete immediately (no point keeping chunks)
+                try:
+                    os.unlink(filepath)
+                except OSError:
+                    pass
             self._uploaded_chunks.append(filepath)
             return filepath
         except Exception as exc:
@@ -1931,9 +1946,16 @@ class PcapCapture:
                 return filepath
             return None
 
-        # Stop chunk upload thread
+        # Stop chunk upload thread and clean up leftover chunk files
         if hasattr(self, '_chunk_stop'):
             self._chunk_stop.set()
+        for chunk_path in getattr(self, '_uploaded_chunks', []):
+            try:
+                if os.path.exists(chunk_path):
+                    os.unlink(chunk_path)
+            except OSError:
+                pass
+        self._uploaded_chunks = []
         if not self.capture_packets:
             return None
         Path(self.pcap_dir).mkdir(parents=True, exist_ok=True)
@@ -2154,7 +2176,9 @@ class L7Monitor:
         sensitivity = cfg.get("sensitivity", "medium")
         self._sensitivity_multiplier = {"low": 8, "medium": 5, "high": 3}.get(sensitivity, 5)
         self._min_rps = {"low": 250, "medium": 150, "high": 75}.get(sensitivity, 150)
-        # Accumulated attack-wide stats
+        # Accumulated attack-wide stats (capped to prevent memory bloat
+        # from attackers rotating user-agents, paths, or source IPs)
+        self._MAX_ATTACK_KEYS = 10_000
         self._attack_ua_counts: dict = {}
         self._attack_threat_hits: dict = {}
         self._attack_status_totals: dict = {}
@@ -2204,6 +2228,9 @@ class L7Monitor:
 
         cutoff = now - self._window
         self._requests = [r for r in self._requests if r[0] >= cutoff]
+        # Hard safety cap in case clock skew breaks window filtering
+        if len(self._requests) > 100_000:
+            self._requests = self._requests[-50_000:]
 
         if not self._requests:
             return None
@@ -2447,19 +2474,23 @@ class L7Monitor:
         self._attack_ip_totals = {}
         self._attack_total_requests = 0
 
+    def _capped_merge(self, target: dict, source: dict) -> None:
+        """Merge counts into target dict, ignoring new keys once cap is hit."""
+        cap = self._MAX_ATTACK_KEYS
+        for key, cnt in source.items():
+            if key in target:
+                target[key] += cnt
+            elif len(target) < cap:
+                target[key] = cnt
+
     def _accumulate_attack_stats(self, stats: dict):
         """Merge per-window stats into attack-wide accumulators."""
         self._attack_total_requests += stats.get("total_requests", 0)
-        for ua, cnt in stats.get("top_user_agents", {}).items():
-            self._attack_ua_counts[ua] = self._attack_ua_counts.get(ua, 0) + cnt
-        for pat, cnt in stats.get("threat_patterns", {}).items():
-            self._attack_threat_hits[pat] = self._attack_threat_hits.get(pat, 0) + cnt
-        for code, cnt in stats.get("status_codes", {}).items():
-            self._attack_status_totals[code] = self._attack_status_totals.get(code, 0) + cnt
-        for path, cnt in stats.get("top_paths", {}).items():
-            self._attack_path_totals[path] = self._attack_path_totals.get(path, 0) + cnt
-        for ip, cnt in stats.get("top_ips", {}).items():
-            self._attack_ip_totals[ip] = self._attack_ip_totals.get(ip, 0) + cnt
+        self._capped_merge(self._attack_ua_counts, stats.get("top_user_agents", {}))
+        self._capped_merge(self._attack_threat_hits, stats.get("threat_patterns", {}))
+        self._capped_merge(self._attack_status_totals, stats.get("status_codes", {}))
+        self._capped_merge(self._attack_path_totals, stats.get("top_paths", {}))
+        self._capped_merge(self._attack_ip_totals, stats.get("top_ips", {}))
 
     def get_attack_summary(self) -> dict:
         """Return accumulated attack-wide data for incident enrichment."""
@@ -3231,6 +3262,7 @@ class Agent:
         self.peak_bps: float = 0.0
         self.below_count: int = 0
         self.velocity_curve: list = []
+        self._MAX_VELOCITY_POINTS = 2000
         self.last_update: float = 0.0
         self.server_threshold: float | None = None
 
@@ -3827,10 +3859,14 @@ class Agent:
             return
         self.last_update = time.monotonic()
         elapsed = time.time() - self.attack_start
-        self.velocity_curve.append({
-            "t": round(elapsed, 1),
-            "pps": round(self.monitor.pps, 1),
-        })
+        if len(self.velocity_curve) < self._MAX_VELOCITY_POINTS:
+            self.velocity_curve.append({
+                "t": round(elapsed, 1),
+                "pps": round(self.monitor.pps, 1),
+            })
+        else:
+            # Past cap: update the last point so we always have the latest reading
+            self.velocity_curve[-1] = {"t": round(elapsed, 1), "pps": round(self.monitor.pps, 1)}
 
         proto = self._proto_breakdown()
         family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"])
@@ -4379,10 +4415,13 @@ class Agent:
         stats = info.get("stats", {})
         subtype = _classify_l7_subtype(stats) if stats else "l7_flood"
 
-        # Track RPS velocity curve
+        # Track RPS velocity curve (capped to prevent memory bloat on long attacks)
         elapsed = time.time() - getattr(self, 'l7_attack_start', time.time())
         curve = getattr(self, 'l7_velocity_curve', [])
-        curve.append({"t": round(elapsed, 1), "rps": round(rps, 1)})
+        if len(curve) < self._MAX_VELOCITY_POINTS:
+            curve.append({"t": round(elapsed, 1), "rps": round(rps, 1)})
+        else:
+            curve[-1] = {"t": round(elapsed, 1), "rps": round(rps, 1)}
         self.l7_velocity_curve = curve
 
         bot_pct = stats.get("bot_request_pct", 0)
@@ -4999,10 +5038,13 @@ class MirrorAgent(Agent):
 
         state["last_update"] = time.monotonic()
         elapsed = time.time() - state["attack_start"]
-        state["velocity_curve"].append({
-            "t": round(elapsed, 1),
-            "pps": round(snap.pps, 1),
-        })
+        if len(state["velocity_curve"]) < 2000:
+            state["velocity_curve"].append({
+                "t": round(elapsed, 1),
+                "pps": round(snap.pps, 1),
+            })
+        else:
+            state["velocity_curve"][-1] = {"t": round(elapsed, 1), "pps": round(snap.pps, 1)}
 
         family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct)
 
@@ -5088,10 +5130,16 @@ class MirrorAgent(Agent):
 
         del self.active_attacks[ip]
 
+    _MAX_IP_PCAP_PROCS = 50  # prevent subprocess explosion during wide DDoS
+
     def _start_ip_pcap(self, ip: str, incident_uuid: str) -> None:
         """Start a BPF-filtered tcpdump capture for a specific attacked IP."""
         import subprocess
         if not self.pcap.enabled:
+            return
+        if len(self._ip_pcap_procs) >= self._MAX_IP_PCAP_PROCS:
+            logger.warning("Mirror PCAP cap reached (%d), skipping %s",
+                           self._MAX_IP_PCAP_PROCS, ip)
             return
         pcap_dir = self.pcap.pcap_dir
         os.makedirs(pcap_dir, exist_ok=True)
