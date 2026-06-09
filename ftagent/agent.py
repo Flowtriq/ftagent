@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.15"
+VERSION = "1.9.16"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1631,15 +1631,14 @@ class PcapCapture:
             self._tcpdump_proc = subprocess.Popen(
                 tcpdump_cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
             )
             _restarts = 0
             while not shutdown.is_set():
                 shutdown.wait(1)
                 if self._tcpdump_proc.poll() is not None:
-                    stderr = self._tcpdump_proc.stderr.read().decode(errors="replace")
-                    logger.warning("tcpdump exited (code %d): %s",
-                                   self._tcpdump_proc.returncode, stderr[:200])
+                    logger.warning("tcpdump exited (code %d)",
+                                   self._tcpdump_proc.returncode)
                     _restarts += 1
                     if _restarts > 5:
                         self._tcpdump_unavailable(
@@ -1654,7 +1653,7 @@ class PcapCapture:
                         logger.info("Restarting tcpdump (attempt %d)...", _restarts)
                         self._tcpdump_proc = subprocess.Popen(
                             tcpdump_cmd, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE)
+                            stderr=subprocess.DEVNULL)
 
             self._tcpdump_proc.terminate()
             try:
@@ -2794,7 +2793,8 @@ class ServicePortDetector:
 
     def _build_port_match(self) -> list:
         """Build iptables multiport match args from port entries.
-        Returns list of (protocol, ports_csv) tuples."""
+        Returns list of (protocol, ports_csv) tuples.
+        Splits into multiple rules if > 15 port entries (iptables multiport limit)."""
         tcp_ports = []
         udp_ports = []
         for entry in self.ports:
@@ -2803,15 +2803,17 @@ class ServicePortDetector:
             if not val:
                 continue
             if proto in ("tcp", "both"):
-                tcp_ports.append(val)
+                tcp_ports.extend(p.strip() for p in val.split(",") if p.strip())
             if proto in ("udp", "both"):
-                udp_ports.append(val)
+                udp_ports.extend(p.strip() for p in val.split(",") if p.strip())
 
         result = []
-        if tcp_ports:
-            result.append(("tcp", ",".join(tcp_ports)))
-        if udp_ports:
-            result.append(("udp", ",".join(udp_ports)))
+        # iptables multiport allows max 15 port entries per rule; split into chunks
+        for proto, ports in [("tcp", tcp_ports), ("udp", udp_ports)]:
+            for i in range(0, len(ports), 15):
+                chunk = ports[i:i+15]
+                if chunk:
+                    result.append((proto, ",".join(chunk)))
         return result
 
     def _run_ipt(self, args: list, check: bool = False) -> bool:
@@ -2827,11 +2829,29 @@ class ServicePortDetector:
             logger.debug("iptables %s failed: %s", " ".join(args), e)
             return False
 
+    def _input_has_jump(self, chain: str) -> bool:
+        """Check if INPUT already has a jump to the given chain."""
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["iptables", "-L", "INPUT", "-n"],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                for line in r.stdout.strip().split("\n"):
+                    if chain in line:
+                        return True
+        except Exception:
+            pass
+        return False
+
     def _setup_accounting(self) -> None:
         """Install iptables accounting chains for traffic splitting."""
         if not self.ports:
             logger.warning("Service ports: no ports configured, skipping setup")
             return
+
+        # Clean up any stale rules first to prevent duplicate jumps
+        self.cleanup_stale()
 
         # Create chains
         self._run_ipt(["-N", self.CHAIN_ACCOUNT])
@@ -2841,22 +2861,45 @@ class ServicePortDetector:
         self._run_ipt(["-F", self.CHAIN_ACCOUNT])
         self._run_ipt(["-F", self.CHAIN_BLOCK])
 
-        # Insert block chain check first (drops blocked IPs)
-        self._run_ipt(["-I", "INPUT", "1", "-j", self.CHAIN_BLOCK])
-
-        # Insert accounting chain after block chain
-        self._run_ipt(["-I", "INPUT", "2", "-j", self.CHAIN_ACCOUNT])
+        # Insert jumps only if not already present (prevents duplicates on restart)
+        if not self._input_has_jump(self.CHAIN_BLOCK):
+            self._run_ipt(["-I", "INPUT", "1", "-j", self.CHAIN_BLOCK])
+        if not self._input_has_jump(self.CHAIN_ACCOUNT):
+            self._run_ipt(["-I", "INPUT", "2", "-j", self.CHAIN_ACCOUNT])
 
         # Accounting rules: match service ports (just count, no action)
         port_matches = self._build_port_match()
+        if not port_matches:
+            logger.error("Service ports: no valid port matches built, aborting setup")
+            # Remove the jumps we just added to avoid empty chains catching all traffic
+            self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_BLOCK])
+            self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_ACCOUNT])
+            self._run_ipt(["-F", self.CHAIN_ACCOUNT])
+            self._run_ipt(["-X", self.CHAIN_ACCOUNT])
+            self._run_ipt(["-F", self.CHAIN_BLOCK])
+            self._run_ipt(["-X", self.CHAIN_BLOCK])
+            return
+        rules_ok = True
         for proto, ports in port_matches:
             # Service traffic counter (RETURN so it doesn't double-count)
-            self._run_ipt([
+            if not self._run_ipt([
                 "-A", self.CHAIN_ACCOUNT,
                 "-p", proto, "-m", "multiport", "--dports", ports,
                 "-m", "comment", "--comment", "ft_sp_service",
                 "-j", "RETURN",
-            ])
+            ]):
+                logger.error("Service ports: failed to install accounting rule for %s %s", proto, ports)
+                rules_ok = False
+
+        if not rules_ok:
+            logger.error("Service ports: accounting rule install failed, rolling back")
+            self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_BLOCK])
+            self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_ACCOUNT])
+            self._run_ipt(["-F", self.CHAIN_ACCOUNT])
+            self._run_ipt(["-X", self.CHAIN_ACCOUNT])
+            self._run_ipt(["-F", self.CHAIN_BLOCK])
+            self._run_ipt(["-X", self.CHAIN_BLOCK])
+            return
 
         # Non-service traffic counter: everything that didn't match above
         # (also RETURN - these are just counters, no drops)
@@ -2875,9 +2918,11 @@ class ServicePortDetector:
         """Remove accounting chains from INPUT."""
         if not self._rules_installed:
             return
-        # Remove jump rules from INPUT
-        self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_BLOCK])
-        self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_ACCOUNT])
+        # Remove ALL jump rules from INPUT (loop to catch duplicates from past bugs)
+        for chain in [self.CHAIN_BLOCK, self.CHAIN_ACCOUNT]:
+            for _ in range(5):  # Remove up to 5 duplicates
+                if not self._run_ipt(["-D", "INPUT", "-j", chain]):
+                    break
         # Flush and delete chains
         self._run_ipt(["-F", self.CHAIN_ACCOUNT])
         self._run_ipt(["-X", self.CHAIN_ACCOUNT])
@@ -2908,7 +2953,7 @@ class ServicePortDetector:
             import subprocess
             now = time.monotonic()
             dt = now - self._last_read
-            if dt < 0.5:
+            if dt < 5.0:
                 return False
             self._last_read = now
 
@@ -2982,8 +3027,12 @@ class ServicePortDetector:
         import subprocess
 
         # Build a set of service ports for filtering
+        with self._lock:
+            ports_snapshot = list(self.ports)
+            safelist_snapshot = set(self.ip_safelist)
+
         service_ports = set()
-        for entry in self.ports:
+        for entry in ports_snapshot:
             val = str(entry.get("port_value", ""))
             for part in val.split(","):
                 part = part.strip()
@@ -3000,15 +3049,16 @@ class ServicePortDetector:
         sources: dict = {}  # {ip: {"pps": approx_count, "ports": set()}}
 
         # Try conntrack first (most accurate for active connections)
+        # Use short timeouts to avoid blocking the main detection loop
         try:
             r = subprocess.run(
                 ["conntrack", "-L", "-o", "extended", "--src-nat"],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True, text=True, timeout=3)
             if r.returncode != 0:
                 # Fallback: try without --src-nat
                 r = subprocess.run(
                     ["conntrack", "-L", "-o", "extended"],
-                    capture_output=True, text=True, timeout=10)
+                    capture_output=True, text=True, timeout=3)
 
             if r.returncode == 0:
                 for line in r.stdout.splitlines():
@@ -3033,7 +3083,7 @@ class ServicePortDetector:
             try:
                 r = subprocess.run(
                     ["ss", "-ntu", "state", "established"],
-                    capture_output=True, text=True, timeout=10)
+                    capture_output=True, text=True, timeout=3)
                 if r.returncode == 0:
                     for line in r.stdout.splitlines()[1:]:
                         parts = line.split()
@@ -3054,7 +3104,7 @@ class ServicePortDetector:
                 logger.debug("ss source identification failed: %s", e)
 
         # Remove safelisted IPs before ranking
-        for safe_ip in self.ip_safelist:
+        for safe_ip in safelist_snapshot:
             sources.pop(safe_ip, None)
 
         # Sort by connection count descending, take top 50
@@ -3070,6 +3120,8 @@ class ServicePortDetector:
         self._attack_sources = result
         return result
 
+    MAX_ACTIVE_BLOCKS = 200  # Safety cap: never exceed this many active blocks
+
     def deploy_blocks(self, sources: list) -> list:
         """Deploy on-node iptables blocks against offending source IPs.
         Returns list of source dicts that were actually blocked."""
@@ -3081,7 +3133,14 @@ class ServicePortDetector:
             now = time.monotonic()
             expires = now + self.block_cooldown
 
-            for src in sources[:50]:
+            # Safety cap: don't add blocks if we're already at the limit
+            remaining_capacity = max(0, self.MAX_ACTIVE_BLOCKS - len(self._block_rules))
+            if remaining_capacity == 0:
+                logger.warning("Service port blocks at capacity (%d), skipping new blocks",
+                               self.MAX_ACTIVE_BLOCKS)
+                return []
+
+            for src in sources[:min(50, remaining_capacity)]:
                 ip = src.get("ip", "")
                 if not ip or ip in self._block_rules:
                     continue
@@ -3131,30 +3190,40 @@ class ServicePortDetector:
         with self._lock:
             import subprocess
             now = time.monotonic()
-            expired = []
+            expired = set()
             for ip, exp_time in list(self._block_rules.items()):
                 if now >= exp_time:
-                    expired.append(ip)
+                    expired.add(ip)
 
-            for ip in expired:
-                # Delete all rules for this IP by line number (reverse order)
-                try:
-                    r = subprocess.run(
-                        ["iptables", "-L", self.CHAIN_BLOCK, "-n", "--line-numbers"],
-                        capture_output=True, text=True, timeout=5)
-                    if r.returncode == 0:
-                        # Collect line numbers for this IP (both allow and block rules)
-                        to_delete = []
-                        for line in r.stdout.strip().split("\n"):
-                            if f"ft_sp_block_{ip}" in line or f"ft_sp_block_allow_{ip}" in line:
+            if not expired:
+                return 0
+
+            # Single iptables call to list all rules, then batch-delete
+            try:
+                r = subprocess.run(
+                    ["iptables", "-L", self.CHAIN_BLOCK, "-n", "--line-numbers"],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    to_delete = []
+                    for line in r.stdout.strip().split("\n"):
+                        for ip in expired:
+                            # Use exact comment match to avoid substring collisions
+                            # (e.g. 1.2.3.4 matching 1.2.3.40)
+                            if (f"ft_sp_block_{ip} " in line
+                                    or f"ft_sp_block_allow_{ip} " in line
+                                    or line.endswith(f"ft_sp_block_{ip}")
+                                    or line.endswith(f"ft_sp_block_allow_{ip}")):
                                 num = line.split()[0]
                                 if num.isdigit():
                                     to_delete.append(int(num))
-                        # Delete in reverse order so line numbers don't shift
-                        for num in sorted(to_delete, reverse=True):
-                            self._run_ipt(["-D", self.CHAIN_BLOCK, str(num)])
-                except Exception as e:
-                    logger.debug("Block expiry rule cleanup for %s: %s", ip, e)
+                                break
+                    # Delete in reverse order so line numbers don't shift
+                    for num in sorted(to_delete, reverse=True):
+                        self._run_ipt(["-D", self.CHAIN_BLOCK, str(num)])
+            except Exception as e:
+                logger.debug("Block expiry rule cleanup: %s", e)
+
+            for ip in expired:
                 del self._block_rules[ip]
                 logger.info("Service port block expired: %s", ip)
 
@@ -3272,6 +3341,9 @@ class Agent:
         self._last_metrics_push: float = 0.0
         self._start_mono: float = time.monotonic()
 
+        # Command deduplication: track executed command IDs
+        self._executed_command_ids: set = set()
+
     @property
     def threshold(self) -> float:
         if self.server_threshold is not None:
@@ -3348,8 +3420,15 @@ class Agent:
         for t in threads:
             t.start()
 
-        # Service ports: clean up stale rules from previous runs BEFORE first config fetch
+        # Clean up stale firewall rules from previous runs BEFORE first config fetch
         self.sp_detector.cleanup_stale()
+        try:
+            import subprocess
+            subprocess.run(
+                ["nft", "delete", "table", "inet", "flowtriq_xdp"],
+                capture_output=True, timeout=5)
+        except Exception:
+            pass
 
         self._fetch_config()
 
@@ -3401,8 +3480,19 @@ class Agent:
     def _signal_handler(self, signum, frame) -> None:
         logger.info("Received signal %d, shutting down...", signum)
         # Clean up service port firewall rules before exit
-        if self.sp_detector.enabled:
-            self.sp_detector.cleanup()
+        try:
+            if self.sp_detector.enabled:
+                self.sp_detector.cleanup()
+        except Exception as e:
+            logger.error("Service port cleanup failed during shutdown: %s", e)
+        # Clean up nftables XDP rules if any were deployed
+        try:
+            import subprocess
+            subprocess.run(
+                ["nft", "delete", "table", "inet", "flowtriq_xdp"],
+                capture_output=True, timeout=5)
+        except Exception:
+            pass
         self.shutdown.set()
 
     def _tick(self) -> None:
@@ -4103,10 +4193,17 @@ class Agent:
             try:
                 data = self.api.get_config()
                 if data and "pending_commands" in data and data["pending_commands"]:
+                    executed = 0
                     for cmd in data["pending_commands"]:
+                        cmd_id = cmd.get("id", 0)
+                        if cmd_id and cmd_id in self._executed_command_ids:
+                            continue
                         self._execute_command(cmd)
-                    logger.info("Command poll: processed %d commands",
-                                len(data["pending_commands"]))
+                        if cmd_id:
+                            self._executed_command_ids.add(cmd_id)
+                        executed += 1
+                    if executed:
+                        logger.info("Command poll: processed %d commands", executed)
             except Exception as exc:
                 logger.error("Command poll error: %s", exc)
 
@@ -4164,9 +4261,18 @@ class Agent:
             if "vm_labels" in data and isinstance(data["vm_labels"], dict):
                 self.vm_labels = data["vm_labels"]
             # Process pending commands (iptables rules from dashboard)
+            # Note: _command_poll_loop also processes these, so deduplicate by command ID
             if "pending_commands" in data and data["pending_commands"]:
                 for cmd in data["pending_commands"]:
+                    cmd_id = cmd.get("id", 0)
+                    if cmd_id and cmd_id in self._executed_command_ids:
+                        continue
                     self._execute_command(cmd)
+                    if cmd_id:
+                        self._executed_command_ids.add(cmd_id)
+                        # Prevent unbounded growth: keep only last 500 IDs
+                        if len(self._executed_command_ids) > 500:
+                            self._executed_command_ids = set(list(self._executed_command_ids)[-250:])
 
             # Flow collector config from server (dashboard can enable/configure per node)
             flow_cfg = data.get("flow", {})
