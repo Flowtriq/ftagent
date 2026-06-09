@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.17"
+VERSION = "1.9.18"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1807,6 +1807,19 @@ class PcapCapture:
             if pkt_count >= threshold:
                 self._flush_chunk()
 
+    def _check_disk_space(self, min_mb: int = 500) -> bool:
+        """Check if enough disk space is available for PCAP writes."""
+        try:
+            import shutil
+            usage = shutil.disk_usage(self.pcap_dir)
+            free_mb = usage.free // (1024 * 1024)
+            if free_mb < min_mb:
+                logger.warning("PCAP write skipped: only %d MB free (minimum %d MB)", free_mb, min_mb)
+                return False
+        except Exception:
+            pass  # If we can't check, proceed cautiously
+        return True
+
     def _flush_chunk(self) -> Optional[str]:
         """Write current packets to a chunk file and upload it."""
         start_idx = self._chunk_index * self._chunk_size
@@ -1814,6 +1827,8 @@ class PcapCapture:
         with self._capture_lock:
             chunk_pkts = self.capture_packets[start_idx:end_idx]
         if not chunk_pkts:
+            return None
+        if not self._check_disk_space():
             return None
         Path(self.pcap_dir).mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1991,6 +2006,8 @@ class PcapCapture:
             packets_copy = list(self.capture_packets)
             self.capture_packets = []
         if not packets_copy:
+            return None
+        if not self._check_disk_space():
             return None
         Path(self.pcap_dir).mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -2238,7 +2255,11 @@ class L7Monitor:
             current_inode = os.stat(self.log_path).st_ino
             if current_inode != self.inode:
                 logger.info("L7: log rotated, reopening %s", self.log_path)
-                self.file.close()
+                try:
+                    self.file.close()
+                except Exception:
+                    pass
+                self.file = None
                 self.open()
         except OSError:
             pass
@@ -2785,6 +2806,7 @@ class ServicePortDetector:
         self.blocked_pps = 0
         self._prev_blocked_pkts = 0
         self._attacking = False
+        self._sp_below_count = 0  # hysteresis: require N ticks below threshold
         self._attack_sources: list = []
         self._config_version = ""
         self.ip_safelist: set = set()
@@ -3626,10 +3648,16 @@ class Agent:
                     self._report_sp_blocks(blocked_sources)
 
             elif self.sp_detector._attacking and not self.sp_detector.check_threshold():
-                # Non-service traffic dropped below threshold
-                self.sp_detector._attacking = False
-                logger.info("Service port non-service traffic returned to normal (PPS=%d)",
-                            self.sp_detector.non_service_pps)
+                # Require 5 consecutive ticks below threshold (hysteresis)
+                self.sp_detector._sp_below_count += 1
+                if self.sp_detector._sp_below_count >= 5:
+                    self.sp_detector._attacking = False
+                    self.sp_detector._sp_below_count = 0
+                    logger.info("Service port non-service traffic returned to normal (PPS=%d)",
+                                self.sp_detector.non_service_pps)
+            elif self.sp_detector._attacking:
+                # Still above threshold, reset below counter
+                self.sp_detector._sp_below_count = 0
 
         if not self.attacking:
             # Two detection paths:
@@ -4685,6 +4713,12 @@ class Agent:
             if not any(line.startswith(p) for p in allowed_prefixes):
                 errors.append(f"Blocked unsafe command: {line}")
                 logger.warning("Blocked unsafe command: %s", line)
+                continue
+            # Block semicolons and backticks - the most dangerous injection vectors
+            # (&&, |, $, > are allowed as they're used in legitimate templates)
+            if ';' in line or '`' in line:
+                errors.append(f"Blocked command with shell injection chars: {line}")
+                logger.warning("Blocked shell injection in command: %s", line)
                 continue
             try:
                 import subprocess
