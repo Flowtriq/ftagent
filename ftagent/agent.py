@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.22"
+VERSION = "1.9.23"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -719,7 +719,7 @@ class BaselineManager:
     _RECALC_EVERY = 10  # recalculate percentiles every N samples
     # Use a low default floor (150 PPS) only before baseline is established.
     # Once baseline is ready, threshold is purely data-driven (p99 * 3).
-    _DEFAULT_FLOOR = 150
+    _DEFAULT_FLOOR = 5000
 
     def __init__(self, window: int = 300):
         self.WINDOW = window
