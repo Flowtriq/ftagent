@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.18"
+VERSION = "1.9.19"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -3486,6 +3486,22 @@ class Agent:
         except Exception:
             pass
 
+        # Register atexit handler as backup cleanup for iptables/nft rules.
+        # Runs on normal exit and unhandled exceptions (not SIGKILL/OOM).
+        import atexit
+        def _atexit_cleanup():
+            try:
+                self.sp_detector.cleanup_stale()
+            except Exception:
+                pass
+            try:
+                subprocess.run(
+                    ["nft", "delete", "table", "inet", "flowtriq_xdp"],
+                    capture_output=True, timeout=5)
+            except Exception:
+                pass
+        atexit.register(_atexit_cleanup)
+
         self._fetch_config()
 
         # Detect and report GRE tunnels on startup (Features 1 & 3)
@@ -3776,8 +3792,8 @@ class Agent:
                     # Use the most recent ring file
                     latest = ring_files[-1]
                     out = subprocess.run(
-                        ["tcpdump", "-nn", "-r", latest, "-c", "500", "-q"],
-                        capture_output=True, text=True, timeout=10)
+                        ["tcpdump", "-nn", "-r", latest, "-c", "200", "-q"],
+                        capture_output=True, text=True, timeout=3)
                     for _tline in out.stdout.splitlines():
                         if "UDP" in _tline or "udp" in _tline:
                             _ring_udp += 1
