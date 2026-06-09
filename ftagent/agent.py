@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.21"
+VERSION = "1.9.22"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -4335,6 +4335,17 @@ class Agent:
             data = self.api.get_config()
             if data is None:
                 return
+            # Handle workspace suspension (trial expired / billing inactive)
+            if data.get("suspended"):
+                if not getattr(self, '_suspended_logged', False):
+                    logger.warning("Workspace suspended (billing inactive). "
+                                   "Detection paused. Visit your dashboard to subscribe.")
+                    self._suspended_logged = True
+                # Disable service ports if active
+                if self.sp_detector.enabled:
+                    self.sp_detector.configure({"enabled": False})
+                return
+            self._suspended_logged = False
             if "pps_threshold" in data and data["pps_threshold"]:
                 self.server_threshold = float(data["pps_threshold"])
                 logger.info("Server threshold: %.0f", self.server_threshold)
