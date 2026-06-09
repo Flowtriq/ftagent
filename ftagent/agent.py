@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.19"
+VERSION = "1.9.20"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -2789,7 +2789,7 @@ class ServicePortDetector:
         self.ports: list = []           # [{"protocol":"tcp","port_value":"80,443"}]
         self.sensitivity = "standard"
         self.pps_threshold = 100
-        self.response_mode = "full"     # onnode, pipeline, full
+        self.response_mode = "full"     # monitor, onnode, pipeline, full
         self.block_cooldown = 300       # seconds
         self.block_scope = "non_service"
         self._rules_installed = False
@@ -2810,6 +2810,37 @@ class ServicePortDetector:
         self._attack_sources: list = []
         self._config_version = ""
         self.ip_safelist: set = set()
+        self._auto_safelist: set = set()  # auto-detected: localhost, own IPs
+        self.min_block_pps = 10  # minimum PPS from a source before blocking
+
+    def detect_local_ips(self) -> None:
+        """Detect local IPs and add to auto-safelist. Called once on startup."""
+        import subprocess
+        safe = {"127.0.0.1", "127.0.0.53"}  # always protect localhost
+        try:
+            r = subprocess.run(
+                ["ip", "-4", "addr", "show"],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    line = line.strip()
+                    if line.startswith("inet "):
+                        # "inet 192.168.1.5/24 brd ..."
+                        addr_cidr = line.split()[1]
+                        ip = addr_cidr.split("/")[0]
+                        safe.add(ip)
+                        # Also add /24 subnet neighbors
+                        parts = ip.split(".")
+                        if len(parts) == 4:
+                            prefix = ".".join(parts[:3]) + "."
+                            for i in range(256):
+                                safe.add(prefix + str(i))
+        except Exception as e:
+            logger.debug("Auto-safelist IP detection: %s", e)
+        self._auto_safelist = safe
+        if safe:
+            logger.info("Auto-safelist: %d local IPs/subnet IPs protected",
+                        len(safe))
 
     def configure(self, sp_cfg: dict) -> None:
         """Apply config from server. Rebuilds accounting rules if ports changed."""
@@ -3082,10 +3113,10 @@ class ServicePortDetector:
         Uses conntrack or ss to find active connections to non-service ports."""
         import subprocess
 
-        # Build a set of service ports for filtering
+        # Build a set of service ports for filtering + combined safelist
         with self._lock:
             ports_snapshot = list(self.ports)
-            safelist_snapshot = set(self.ip_safelist)
+            safelist_snapshot = self.ip_safelist | self._auto_safelist
 
         service_ports = set()
         for entry in ports_snapshot:
@@ -3200,9 +3231,15 @@ class ServicePortDetector:
                 ip = src.get("ip", "")
                 if not ip or ip in self._block_rules:
                     continue
-                # Never block safelisted IPs
-                if ip in self.ip_safelist:
+                # Never block safelisted or local IPs
+                if ip in self.ip_safelist or ip in self._auto_safelist:
                     logger.info("Service port block skipped (safelisted): %s", ip)
+                    continue
+                # Require minimum PPS before blocking (don't block 1-2 PPS noise)
+                src_pps = src.get("pps", 0)
+                if src_pps < self.min_block_pps:
+                    logger.debug("Service port block skipped (pps=%d < min %d): %s",
+                                 src_pps, self.min_block_pps, ip)
                     continue
 
                 if self.block_scope == "non_service":
@@ -3377,6 +3414,7 @@ class Agent:
 
         # Service Port Detection
         self.sp_detector = ServicePortDetector()
+        self.sp_detector.detect_local_ips()
         self._sp_last_metrics_push: float = 0.0
         self._sp_metrics_interval = 5  # push split metrics every 5s
 
@@ -4735,6 +4773,14 @@ class Agent:
             if ';' in line or '`' in line:
                 errors.append(f"Blocked command with shell injection chars: {line}")
                 logger.warning("Blocked shell injection in command: %s", line)
+                continue
+            # Block destructive iptables commands that could lock out the server
+            _destructive = ("-F INPUT", "-X INPUT", "-P INPUT DROP",
+                            "-P INPUT REJECT", "--flush INPUT",
+                            "--delete-chain INPUT")
+            if any(d in line for d in _destructive):
+                errors.append(f"Blocked destructive firewall command: {line}")
+                logger.warning("Blocked destructive command: %s", line)
                 continue
             try:
                 import subprocess
