@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.24"
+VERSION = "1.9.25"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1662,12 +1662,19 @@ class PcapCapture:
                 stderr=subprocess.DEVNULL,
             )
             _restarts = 0
+            _last_start = time.monotonic()
             while not shutdown.is_set():
                 shutdown.wait(1)
                 if self._tcpdump_proc.poll() is not None:
-                    logger.warning("tcpdump exited (code %d)",
-                                   self._tcpdump_proc.returncode)
-                    _restarts += 1
+                    _ran_for = time.monotonic() - _last_start
+                    _exit_code = self._tcpdump_proc.returncode
+                    # Normal rotation: tcpdump -G exits cleanly after each interval
+                    if _exit_code == 0 and _ran_for >= 20:
+                        _restarts = 0  # reset — this was a healthy rotation, not a crash
+                    else:
+                        logger.warning("tcpdump exited (code %d, ran %.0fs)",
+                                       _exit_code, _ran_for)
+                        _restarts += 1
                     if _restarts > 5:
                         self._tcpdump_unavailable(
                             f"tcpdump crashed {_restarts} times consecutively.  "
@@ -1682,6 +1689,7 @@ class PcapCapture:
                         self._tcpdump_proc = subprocess.Popen(
                             tcpdump_cmd, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
+                        _last_start = time.monotonic()
 
             self._tcpdump_proc.terminate()
             try:
