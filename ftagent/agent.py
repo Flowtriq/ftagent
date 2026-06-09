@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.20"
+VERSION = "1.9.21"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -4774,7 +4774,7 @@ class Agent:
                 errors.append(f"Blocked command with shell injection chars: {line}")
                 logger.warning("Blocked shell injection in command: %s", line)
                 continue
-            # Block destructive iptables commands that could lock out the server
+            # Block destructive commands that could lock out the server
             _destructive = ("-F INPUT", "-X INPUT", "-P INPUT DROP",
                             "-P INPUT REJECT", "--flush INPUT",
                             "--delete-chain INPUT")
@@ -4782,6 +4782,38 @@ class Agent:
                 errors.append(f"Blocked destructive firewall command: {line}")
                 logger.warning("Blocked destructive command: %s", line)
                 continue
+            # Sysctl whitelist: only allow known-safe kernel parameters
+            if line.startswith("sysctl "):
+                _safe_sysctl = (
+                    "net.ipv4.tcp_syncookies", "net.ipv4.tcp_max_syn_backlog",
+                    "net.ipv4.tcp_synack_retries", "net.ipv4.tcp_syn_retries",
+                    "net.ipv4.icmp_echo_ignore_broadcasts",
+                    "net.ipv4.icmp_ignore_bogus_error_responses",
+                    "net.ipv4.conf.all.log_martians",
+                    "net.ipv4.tcp_fin_timeout", "net.ipv4.tcp_keepalive_time",
+                    "net.core.somaxconn", "net.core.netdev_max_backlog",
+                )
+                if not any(s in line for s in _safe_sysctl):
+                    errors.append(f"Blocked unsafe sysctl: {line}")
+                    logger.warning("Blocked non-whitelisted sysctl: %s", line)
+                    continue
+            # Block null routes to private/reserved IPs
+            if "blackhole" in line and line.startswith("ip route "):
+                import ipaddress as _ipa
+                _parts = line.split()
+                for _p in _parts:
+                    try:
+                        _addr = _ipa.ip_address(_p.split("/")[0])
+                        if _addr.is_private or _addr.is_loopback or _addr.is_reserved:
+                            errors.append(f"Blocked blackhole route to private/reserved IP: {line}")
+                            logger.warning("Blocked blackhole to private IP: %s", line)
+                            break
+                    except ValueError:
+                        continue
+                else:
+                    pass  # no private IP found, allow
+                if any("Blocked blackhole" in e for e in errors[-1:]):
+                    continue
             try:
                 import subprocess
                 result = subprocess.run(
@@ -4905,11 +4937,11 @@ class Agent:
 
             match_expr = " ".join(match_parts)
 
-            if rate_pps:
+            if rate_pps and int(rate_pps) > 0:
                 # Rate-limit mode: allow up to rate_pps, drop excess
                 cmds.append(
                     f"nft add rule inet {nft_table} {nft_chain} "
-                    f"{match_expr} limit rate over {int(rate_pps)}/second "
+                    f"{match_expr} limit rate over {max(1, int(rate_pps))}/second "
                     f"drop comment \"{nft_comment}\""
                 )
             else:
