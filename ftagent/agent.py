@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.16"
+VERSION = "1.9.17"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -899,6 +899,28 @@ class TrafficAnalyser:
         self.inner_dst_ips: dict = {}  # inner_dst_ip -> packet count
         self.per_vm_detail: dict = {}  # inner_dst_ip -> {pps, bps, tcp, udp, icmp, src_ips}
 
+    def _evict_low_count_ips(self) -> None:
+        """Evict bottom 20% of source IPs by count to make room for new ones.
+        Keeps high-count IPs (the real attackers) and removes low-count noise."""
+        if not self.src_ips:
+            return
+        # Find the 20th percentile count threshold
+        counts = sorted(self.src_ips.values())
+        cutoff_idx = len(counts) // 5  # bottom 20%
+        cutoff_count = counts[cutoff_idx] if cutoff_idx < len(counts) else 1
+
+        to_remove = [ip for ip, cnt in self.src_ips.items() if cnt <= cutoff_count]
+        # Don't evict more than 20% to avoid over-pruning
+        to_remove = to_remove[:len(self.src_ips) // 5]
+
+        for ip in to_remove:
+            del self.src_ips[ip]
+            self.src_ip_detail.pop(ip, None)
+
+        if to_remove:
+            logger.debug("Evicted %d low-count source IPs (threshold=%d, remaining=%d)",
+                         len(to_remove), cutoff_count, len(self.src_ips))
+
     def process_packet(self, pkt, ioc_matcher=None, gre_decap=None,
                        hypervisor_mode: bool = False) -> None:
         """
@@ -936,9 +958,8 @@ class TrafficAnalyser:
             elif len(self.src_ips) < self.MAX_SRC_IPS:
                 self.src_ips[src] = 1
             else:
-                if not self._src_ip_overflow:
-                    self._src_ip_overflow = True
-                    logger.warning("Source IP tracking cap reached (%d IPs) — additional IPs not individually tracked", self.MAX_SRC_IPS)
+                # Evict bottom 20% by count to make room for new IPs
+                self._evict_low_count_ips()
 
             # Bounded packet length / TTL samples (use inner packet length)
             if len(self.pkt_lengths) < self.MAX_PKT_SAMPLES:
@@ -1315,15 +1336,17 @@ class GREDecapsulator:
         for _ in range(self.max_depth):
             if len(data) < 24:  # min: 20 IP + 4 GRE
                 break
+            # Validate IP version nibble (must be 4 for IPv4)
+            if (data[0] >> 4) != 4:
+                break
             # Parse IP header length and protocol
             ihl = (data[0] & 0x0F) * 4
+            if ihl < 20 or ihl > 60:  # valid IHL range: 20-60 bytes
+                break
             if len(data) < ihl + 4:
                 break
             proto = data[9]
             if proto != self.GRE_PROTO:
-                break
-            # Parse GRE header flags to find header length
-            if len(data) < ihl + 4:
                 break
             gre_flags = struct.unpack('!H', data[ihl:ihl + 2])[0]
             gre_hdr_len = 4
@@ -1336,7 +1359,11 @@ class GREDecapsulator:
             inner_start = ihl + gre_hdr_len
             if inner_start >= len(data):
                 break
-            data = data[inner_start:]
+            inner_data = data[inner_start:]
+            # Validate inner packet is IP before continuing recursion
+            if len(inner_data) < 20 or (inner_data[0] >> 4) != 4:
+                break
+            data = inner_data
 
         was_gre = data is not original
         if was_gre:
@@ -1442,6 +1469,7 @@ class PcapCapture:
         self._hypervisor_mode = hypervisor_mode
         self.ring_buffer: collections.deque = collections.deque(maxlen=1000)
         self.capture_packets: list = []
+        self._capture_lock = threading.Lock()
         self.capturing = False
         self.max_capture = 10000
         self._thread = None
@@ -1681,7 +1709,8 @@ class PcapCapture:
     def _ring_cb(self, pkt) -> None:
         self.ring_buffer.append(pkt)
         if self.capturing and len(self.capture_packets) < self.max_capture:
-            self.capture_packets.append(pkt)  # always store original (unstripped) for forensics
+            with self._capture_lock:
+                self.capture_packets.append(pkt)  # always store original (unstripped) for forensics
             self._pkt_counter += 1
             if self._pkt_counter % self._analyse_every == 0:
                 self.analyser.process_packet(
@@ -1743,7 +1772,8 @@ class PcapCapture:
             self._tcpdump_capture_dir = None
             self._capture_proc = None
 
-        self.capture_packets = list(self.ring_buffer)
+        with self._capture_lock:
+            self.capture_packets = list(self.ring_buffer)
         self.capturing = True
         self._incident_uuid = incident_uuid
         self._api_client = api_client
@@ -1771,7 +1801,8 @@ class PcapCapture:
             self._chunk_stop.wait(10)  # check every 10 seconds
             if self._chunk_stop.is_set():
                 break
-            pkt_count = len(self.capture_packets)
+            with self._capture_lock:
+                pkt_count = len(self.capture_packets)
             threshold = (self._chunk_index + 1) * self._chunk_size
             if pkt_count >= threshold:
                 self._flush_chunk()
@@ -1780,7 +1811,8 @@ class PcapCapture:
         """Write current packets to a chunk file and upload it."""
         start_idx = self._chunk_index * self._chunk_size
         end_idx = start_idx + self._chunk_size
-        chunk_pkts = self.capture_packets[start_idx:end_idx]
+        with self._capture_lock:
+            chunk_pkts = self.capture_packets[start_idx:end_idx]
         if not chunk_pkts:
             return None
         Path(self.pcap_dir).mkdir(parents=True, exist_ok=True)
@@ -1955,19 +1987,21 @@ class PcapCapture:
             except OSError:
                 pass
         self._uploaded_chunks = []
-        if not self.capture_packets:
+        with self._capture_lock:
+            packets_copy = list(self.capture_packets)
+            self.capture_packets = []
+        if not packets_copy:
             return None
         Path(self.pcap_dir).mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         filepath = os.path.join(self.pcap_dir, f"{incident_uuid}_{ts}.pcap")
         try:
             writer = PcapWriter(filepath, append=False, sync=True)
-            for pkt in self.capture_packets:
+            for pkt in packets_copy:
                 writer.write(pkt)
             writer.close()
             logger.info("PCAP written: %s (%d packets)",
-                        filepath, len(self.capture_packets))
-            self.capture_packets = []
+                        filepath, len(packets_copy))
             return filepath
         except Exception as exc:
             logger.error("PCAP write failed: %s", exc)
@@ -5236,7 +5270,7 @@ class MirrorAgent(Agent):
 
         del self.active_attacks[ip]
 
-    _MAX_IP_PCAP_PROCS = 50  # prevent subprocess explosion during wide DDoS
+    _MAX_IP_PCAP_PROCS = 10  # prevent subprocess explosion during wide DDoS
 
     def _start_ip_pcap(self, ip: str, incident_uuid: str) -> None:
         """Start a BPF-filtered tcpdump capture for a specific attacked IP."""
