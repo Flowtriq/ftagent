@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.23"
+VERSION = "1.9.24"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -4346,6 +4346,37 @@ class Agent:
                     self.sp_detector.configure({"enabled": False})
                 return
             self._suspended_logged = False
+            # Server-triggered forced update
+            force_ver = data.get("force_update")
+            if force_ver and isinstance(force_ver, str):
+                def _ver(v):
+                    try: return tuple(int(x) for x in v.split("."))
+                    except: return (0,)
+                if _ver(force_ver) > _ver(VERSION):
+                    logger.warning("Server requests forced update to v%s (current v%s), upgrading...",
+                                   force_ver, VERSION)
+                    import subprocess as _sub
+                    try:
+                        r = _sub.run([sys.executable, "-m", "pip", "install",
+                                      "--no-cache-dir", "--upgrade", f"ftagent=={force_ver}"],
+                                     capture_output=True, text=True, timeout=120)
+                        if r.returncode != 0 and "externally-managed" in r.stderr:
+                            r = _sub.run([sys.executable, "-m", "pip", "install",
+                                          "--no-cache-dir", "--upgrade", "--break-system-packages",
+                                          f"ftagent=={force_ver}"],
+                                         capture_output=True, text=True, timeout=120)
+                        if r.returncode == 0:
+                            logger.warning("Updated to v%s. Restarting...", force_ver)
+                            try:
+                                _sub.run(["systemctl", "restart", "ftagent"],
+                                         capture_output=True, timeout=30)
+                            except Exception:
+                                logger.info("Update installed. Restart ftagent manually.")
+                        else:
+                            logger.warning("Forced update failed: %s", r.stderr[:300])
+                    except Exception as e:
+                        logger.warning("Forced update error: %s", e)
+
             if "pps_threshold" in data and data["pps_threshold"]:
                 self.server_threshold = float(data["pps_threshold"])
                 logger.info("Server threshold: %.0f", self.server_threshold)
