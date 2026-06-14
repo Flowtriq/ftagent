@@ -2,7 +2,7 @@
 
 **Flowtriq DDoS Detection Agent** Real-time traffic monitoring, attack detection, PCAP capture, and auto-mitigation for Linux servers.
 
-A valid [Flowtriq](https://flowtriq.com) account and API key are required. Start a free 7-day trial at **[flowtriq.com](https://flowtriq.com)**.
+A valid [Flowtriq](https://flowtriq.com) account and API key are required. Start a free 14-day trial at **[flowtriq.com](https://flowtriq.com)**.
 
 ---
 
