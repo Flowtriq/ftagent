@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.25"
+VERSION = "1.9.26"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -648,9 +648,18 @@ class PPSMonitor:
 
         # /proc/net/tcp is expensive (kernel serializes full socket table).
         # Read every 15s instead of every tick — not needed for detection.
+        # Auto-scale interval: if server has many connections, read less often
+        # to avoid CPU spikes (100K+ conns can take 50-100ms to enumerate).
         if now - self._last_conn_read >= self._conn_count_interval:
             self.conn_count = self._read_conn_count()
             self._last_conn_read = now
+            # Back off to 60s if server has many connections
+            if self.conn_count > 50000:
+                self._conn_count_interval = 60
+            elif self.conn_count > 10000:
+                self._conn_count_interval = 30
+            else:
+                self._conn_count_interval = 15
 
         self.prev_rx_packets = rx_packets
         self.prev_rx_bytes = rx_bytes
@@ -701,11 +710,15 @@ class PPSMonitor:
 
     @staticmethod
     def _read_conn_count() -> int:
+        # Reading /proc/net/tcp line-by-line is expensive on busy servers
+        # (kernel serializes the full socket table). Use a bulk read + count
+        # newlines instead, which is ~3x faster on servers with 100K+ conns.
         count = 0
         for path in ("/proc/net/tcp", "/proc/net/tcp6"):
             try:
-                with open(path) as f:
-                    count += sum(1 for _ in f) - 1
+                with open(path, "rb") as f:
+                    buf = f.read()
+                    count += buf.count(b"\n") - 1  # subtract header line
             except OSError:
                 pass
         return max(count, 0)
@@ -720,6 +733,10 @@ class BaselineManager:
     # Use a low default floor (150 PPS) only before baseline is established.
     # Once baseline is ready, threshold is purely data-driven (p99 * 3).
     _DEFAULT_FLOOR = 5000
+    # Minimum threshold after baseline is ready. Even if p99 * 3 is lower,
+    # never trigger below this. A 500 PPS spike on a 100 PPS server is normal
+    # traffic variation, not a DDoS attack.
+    _MIN_READY_THRESHOLD = 5000
 
     def __init__(self, window: int = 300):
         self.WINDOW = window
@@ -751,10 +768,12 @@ class BaselineManager:
             sorted_s = sorted(self.samples)
             self.p95_pps = sorted_s[int(n * 0.95)]
             self.p99_pps = sorted_s[int(n * 0.99)]
-            # Before baseline is ready, use a low floor so low-traffic nodes
-            # can still detect attacks. Once ready, go purely data-driven.
+            # Before baseline is ready, use a default floor so low-traffic nodes
+            # can still detect attacks. Once ready, use data-driven threshold
+            # but never go below _MIN_READY_THRESHOLD — a tiny spike on a
+            # quiet server is not a DDoS attack.
             if self.baseline_ready:
-                self.threshold = self.p99_pps * 3
+                self.threshold = max(self.p99_pps * 3, self._MIN_READY_THRESHOLD)
             else:
                 self.threshold = max(self.p99_pps * 3, self._DEFAULT_FLOOR)
 
@@ -1467,7 +1486,12 @@ class PcapCapture:
         self.ioc_matcher = ioc_matcher
         self._gre_decap = gre_decap
         self._hypervisor_mode = hypervisor_mode
-        self.ring_buffer: collections.deque = collections.deque(maxlen=1000)
+        # In Scapy mode, each packet object can be 1-50KB in memory.
+        # Keep ring buffer small (200) to limit memory to ~5-10MB.
+        # tcpdump mode writes to disk files, so this buffer is only used
+        # as a fallback for pre-attack packet capture in Scapy mode.
+        _ring_size = 200 if self.pcap_mode == "scapy" else 1000
+        self.ring_buffer: collections.deque = collections.deque(maxlen=_ring_size)
         self.capture_packets: list = []
         self._capture_lock = threading.Lock()
         self.capturing = False
@@ -3443,6 +3467,12 @@ class Agent:
         self._last_metrics_push: float = 0.0
         self._start_mono: float = time.monotonic()
 
+        # Startup grace period: suppress attack detection for the first 90 seconds
+        # so the baseline has time to warm up. Without this, normal traffic spikes
+        # during startup (cache warming, log rotation, backup flush) can trigger
+        # false positives that erode user trust in the first few minutes.
+        self._STARTUP_GRACE_SECONDS = 90
+
         # Command deduplication: track executed command IDs
         self._executed_command_ids: set = set()
 
@@ -3732,6 +3762,16 @@ class Agent:
             _trigger = pps > self.threshold
             if not self.baseline.baseline_ready and pps >= _absolute_floor:
                 _trigger = True
+
+            # Startup grace period: don't trigger during the first 90 seconds
+            # so the baseline can warm up. This prevents false positives from
+            # normal startup spikes (cache warming, log rotation, etc.).
+            # Exception: truly massive floods (>5x absolute floor) still trigger
+            # immediately because those are unambiguously attacks.
+            if _trigger and not self.baseline.baseline_ready:
+                uptime = time.monotonic() - self._start_mono
+                if uptime < self._STARTUP_GRACE_SECONDS and pps < _absolute_floor * 5:
+                    _trigger = False
 
             if _trigger:
                 # Flush buffered metrics immediately so the dashboard sees the spike
