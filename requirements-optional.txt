@@ -4,3 +4,4 @@
 scapy>=2.4.5       # Packet capture + PCAP support (required for traffic analysis)
 psutil>=5.9.0      # System metrics collection
 colorama>=0.4.6    # Colored terminal output (Windows compatibility)
+rich>=13.0.0       # Terminal UI dashboard (--tui flag)

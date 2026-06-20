@@ -41,7 +41,9 @@ full = [
     "scapy>=2.4.5",
     "psutil>=5.9.0",
     "colorama>=0.4.6",
+    "rich>=13.0.0",
 ]
+tui = ["rich>=13.0.0"]
 lite = ["requests>=2.28.0"]
 
 [project.scripts]

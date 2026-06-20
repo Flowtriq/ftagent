@@ -5592,6 +5592,8 @@ def main() -> None:
                         help="Check for and install agent updates")
     parser.add_argument("--no-update-check", action="store_true",
                         help="Skip automatic update check on startup")
+    parser.add_argument("--tui", action="store_true",
+                        help="Enable terminal UI dashboard (requires 'rich' package)")
     args = parser.parse_args()
 
     if args.update:
@@ -5634,7 +5636,12 @@ def main() -> None:
         agent = MirrorAgent(cfg)
     else:
         agent = Agent(cfg)
-    agent.run()
+
+    if args.tui:
+        from ftagent.tui import run_tui
+        run_tui(agent)
+    else:
+        agent.run()
 
 
 if __name__ == "__main__":
