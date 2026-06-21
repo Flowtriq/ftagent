@@ -437,12 +437,16 @@ class MirrorCaptureEngine:
                  mode: str = "af_packet",
                  subnets: Optional[list[str]] = None,
                  gre_strip: bool = False,
-                 fanout_workers: int = 0):
+                 fanout_workers: int = 0,
+                 socket_buf_mb: int = 8):
         self.interface = interface
         self.counter = counter
         self.mode = mode
         self.gre_strip = gre_strip
-        self._fanout_workers = fanout_workers or max(os.cpu_count() or 1, 1)
+        # Cap fanout workers at 8 to limit socket buffer memory
+        # (each worker allocates socket_buf_mb of kernel receive buffer)
+        self._fanout_workers = min(fanout_workers or max(os.cpu_count() or 1, 1), 8)
+        self._socket_buf_bytes = socket_buf_mb * 1024 * 1024
         self._threads: list[threading.Thread] = []
         self._running = False
         self._sock: Optional[socket.socket] = None
@@ -501,7 +505,7 @@ class MirrorCaptureEngine:
                     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                          socket.htons(ETH_P_ALL))
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
-                                    8 * 1024 * 1024)
+                                    self._socket_buf_bytes)
                     sock.bind((self.interface, ETH_P_ALL))
                     sock.setsockopt(SOL_PACKET, PACKET_FANOUT, fanout_arg)
                     sock.settimeout(1.0)
@@ -522,7 +526,7 @@ class MirrorCaptureEngine:
                 sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                      socket.htons(ETH_P_ALL))
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
-                                8 * 1024 * 1024)
+                                self._socket_buf_bytes)
                 sock.bind((self.interface, ETH_P_ALL))
                 sock.settimeout(1.0)
                 self._sock = sock
