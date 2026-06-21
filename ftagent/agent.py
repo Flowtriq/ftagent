@@ -620,7 +620,9 @@ class APIClient:
             resp = self.session.post(
                 f"{self.base}/agent/heartbeat",
                 json={"version": VERSION, "baseline_ready": False,
-                      "baseline_avg_pps": 0, "baseline_p99_pps": 0},
+                      "baseline_avg_pps": 0, "baseline_p99_pps": 0,
+                      "baseline_hourly_ready": False,
+                      "baseline_current_hour_p99": 0},
                 timeout=10,
             )
             resp.raise_for_status()
@@ -819,6 +821,10 @@ class BaselineManager:
     # never trigger below this. A 500 PPS spike on a 100 PPS server is normal
     # traffic variation, not a DDoS attack.
     _MIN_READY_THRESHOLD = 5000
+    # Hourly baseline: samples needed per hour bucket before it's trusted.
+    _HOURLY_MIN_SAMPLES = 60
+    # Per-hour deque size: 360 samples = ~6 hours of data for each hour slot.
+    _HOURLY_WINDOW = 360
 
     def __init__(self, window: int = 300):
         self.WINDOW = window
@@ -830,6 +836,12 @@ class BaselineManager:
         self.baseline_ready = False
         self._since_recalc = 0
         self._running_sum = 0.0
+        # Time-of-day baselines: per-hour deques for adaptive thresholds
+        self._hourly_baselines: dict[int, collections.deque] = {
+            h: collections.deque(maxlen=self._HOURLY_WINDOW) for h in range(24)
+        }
+        self._hourly_p99: dict[int, float] = {}
+        self._hourly_ready: bool = False  # True once current hour has enough data
 
     def add(self, pps: float) -> None:
         # Track evicted sample for running sum
@@ -837,6 +849,11 @@ class BaselineManager:
             self._running_sum -= self.samples[0]
         self.samples.append(pps)
         self._running_sum += pps
+
+        # Feed into the hourly bucket for time-of-day awareness
+        current_hour = datetime.now().hour
+        self._hourly_baselines[current_hour].append(pps)
+
         n = len(self.samples)
         if n < 2:
             return
@@ -850,17 +867,45 @@ class BaselineManager:
             sorted_s = sorted(self.samples)
             self.p95_pps = sorted_s[int(n * 0.95)]
             self.p99_pps = sorted_s[int(n * 0.99)]
+
+            # Compute hourly p99 for the current hour if enough samples
+            hourly_samples = self._hourly_baselines[current_hour]
+            hourly_n = len(hourly_samples)
+            hour_has_data = hourly_n >= self._HOURLY_MIN_SAMPLES
+            self._hourly_ready = hour_has_data
+
+            if hour_has_data:
+                sorted_h = sorted(hourly_samples)
+                hourly_p99 = sorted_h[int(hourly_n * 0.99)]
+                self._hourly_p99[current_hour] = hourly_p99
+                # Hourly p99 drives the threshold, but never below half of
+                # the flat p99 to avoid dangerously low thresholds.
+                effective_p99 = max(hourly_p99, self.p99_pps * 0.5)
+            else:
+                effective_p99 = self.p99_pps
+
             # Before baseline is ready, use a default floor so low-traffic nodes
             # can still detect attacks. Once ready, use data-driven threshold
-            # but never go below _MIN_READY_THRESHOLD — a tiny spike on a
+            # but never go below _MIN_READY_THRESHOLD -- a tiny spike on a
             # quiet server is not a DDoS attack.
             if self.baseline_ready:
-                self.threshold = max(self.p99_pps * 3, self._MIN_READY_THRESHOLD)
+                self.threshold = max(effective_p99 * 3, self._MIN_READY_THRESHOLD)
             else:
-                self.threshold = max(self.p99_pps * 3, self._DEFAULT_FLOOR)
+                self.threshold = max(effective_p99 * 3, self._DEFAULT_FLOOR)
 
         if n >= self.WINDOW:
             self.baseline_ready = True
+
+    @property
+    def hourly_ready(self) -> bool:
+        """Whether the current hour's bucket has enough samples."""
+        return self._hourly_ready
+
+    @property
+    def current_hour_p99(self) -> float:
+        """P99 for the current hour, or 0.0 if not enough data yet."""
+        current_hour = datetime.now().hour
+        return self._hourly_p99.get(current_hour, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -4703,6 +4748,8 @@ class Agent:
                     "baseline_ready": self.baseline.baseline_ready,
                     "baseline_avg_pps": round(self.baseline.avg_pps, 1),
                     "baseline_p99_pps": round(self.baseline.p99_pps, 1),
+                    "baseline_hourly_ready": self.baseline.hourly_ready,
+                    "baseline_current_hour_p99": round(self.baseline.current_hour_p99, 1),
                     "circuit_breaker": self.api.circuit_breaker_state,
                     "retry_queue_size": len(self.api.retry_queue),
                     # GRE dedup status (Feature 1)
@@ -6144,6 +6191,8 @@ class MirrorAgent(Agent):
                     "baseline_ready": self.baseline.baseline_ready,
                     "baseline_avg_pps": round(self.baseline.avg_pps, 1),
                     "baseline_p99_pps": round(self.baseline.p99_pps, 1),
+                    "baseline_hourly_ready": self.baseline.hourly_ready,
+                    "baseline_current_hour_p99": round(self.baseline.current_hour_p99, 1),
                     "circuit_breaker": self.api.circuit_breaker_state,
                     "retry_queue_size": len(self.api.retry_queue),
                     "gre_dedup_enabled": self.gre_decap.enabled,
