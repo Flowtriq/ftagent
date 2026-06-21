@@ -4,6 +4,8 @@
 
 A valid [Flowtriq](https://flowtriq.com) account and API key are required. Start a free 14-day trial at **[flowtriq.com](https://flowtriq.com)**.
 
+![ftagent demo](ftagent-demo.gif)
+
 ---
 
 ## Requirements
