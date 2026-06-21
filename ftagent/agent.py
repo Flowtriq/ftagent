@@ -1107,7 +1107,24 @@ class TrafficAnalyser:
         return self.ttl_entropy() < 1.5 and len(self.src_ips) > 100
 
     def botnet_detected(self) -> bool:
-        return len(self.src_ips) > 300
+        # Heuristic: many source IPs
+        if len(self.src_ips) > 300:
+            return True
+        # IOC-based: any botnet family signature matched
+        botnet_keywords = ("mirai", "gafgyt", "bashlite", "mozi", "xorddos",
+                           "muhstik", "tsunami", "kaiten", "hajime", "meris",
+                           "mantis", "fodcha", "botnet")
+        for hit in self.ioc_hits:
+            if any(kw in hit.lower() for kw in botnet_keywords):
+                return True
+        return False
+
+    def blocklist_ratio(self) -> float:
+        """Fraction of source IPs that match the threat intel blocklist."""
+        if not self.src_ips or not hasattr(self, '_blocklist') or not self._blocklist:
+            return 0.0
+        matched = sum(1 for ip in self.src_ips if ip in self._blocklist)
+        return matched / len(self.src_ips) if self.src_ips else 0.0
 
     def top_src_ips(self, n: int = 20) -> list:
         total = self.total_packets or 1
@@ -2847,6 +2864,76 @@ def classify_tcp_subtype(tcp_flags: dict) -> str:
     return "tcp_generic"
 
 
+def enrich_from_ioc(ioc_hits: list, family: str, subtype: str) -> tuple:
+    """Enrich family/subtype/tool from IOC pattern matches.
+    Returns (family, subtype, attack_tool, confidence_boost)."""
+    if not ioc_hits:
+        return family, subtype, None, 0
+
+    # Count occurrences of each IOC pattern
+    hit_counts = {}
+    for hit in ioc_hits:
+        hit_counts[hit] = hit_counts.get(hit, 0) + 1
+
+    # Get the most frequent IOC hit
+    top_hit = max(hit_counts, key=hit_counts.get)
+    top_count = hit_counts[top_hit]
+
+    # Parse "Name:family" format
+    parts = top_hit.split(":", 1)
+    ioc_name = parts[0].strip().lower()
+    ioc_family = parts[1].strip() if len(parts) > 1 else ""
+
+    attack_tool = None
+    confidence_boost = min(top_count, 30)  # Up to +30 confidence from IOC matches
+
+    # Map IOC names to tools and subtypes
+    tool_map = {
+        "mirai": ("mirai_botnet", "Mirai"),
+        "gafgyt": ("gafgyt_botnet", "Gafgyt"),
+        "bashlite": ("gafgyt_botnet", "Bashlite"),
+        "mozi": ("mozi_botnet", "Mozi"),
+        "xorddos": ("xorddos_botnet", "XorDDoS"),
+        "muhstik": ("muhstik_botnet", "Muhstik"),
+        "tsunami": ("tsunami_botnet", "Tsunami/Kaiten"),
+        "kaiten": ("tsunami_botnet", "Kaiten"),
+        "hajime": ("hajime_botnet", "Hajime"),
+        "meris": ("meris_botnet", "Meris"),
+        "mantis": ("mantis_botnet", "Mantis"),
+        "fodcha": ("fodcha_botnet", "Fodcha"),
+        "loic": ("loic", "LOIC"),
+        "hoic": ("hoic", "HOIC"),
+        "mhddos": ("mhddos", "MHDDoS"),
+        "slowloris": ("slowloris", "Slowloris"),
+        "goldeneye": ("goldeneye", "GoldenEye"),
+        "hulk": ("hulk", "HULK"),
+        "xerxes": ("xerxes", "Xerxes"),
+        "hping": ("hping", "hping"),
+        "rudy": ("rudy", "R.U.D.Y."),
+        "ntp monlist": ("ntp_amplification", None),
+        "ssdp": ("ssdp_amplification", None),
+        "memcached": ("memcached_amplification", None),
+        "cldap": ("cldap_amplification", None),
+        "chargen": ("chargen_amplification", None),
+        "dns amplification": ("dns_amplification", None),
+        "stresser": ("booter_service", None),
+        "booter": ("booter_service", None),
+    }
+
+    for keyword, (mapped_subtype, tool) in tool_map.items():
+        if keyword in ioc_name:
+            if not subtype or subtype in ("volumetric", "syn_flood", "ping_flood", "tcp_generic"):
+                subtype = mapped_subtype
+            attack_tool = tool
+            break
+
+    # If IOC specified a family and ours is generic, prefer the IOC's
+    if ioc_family and ioc_family != "unknown" and family in ("unknown", ""):
+        family = ioc_family
+
+    return family, subtype, attack_tool, confidence_boost
+
+
 # ---------------------------------------------------------------------------
 # Health Check Server
 # ---------------------------------------------------------------------------
@@ -3860,7 +3947,11 @@ class Agent:
             #    This catches attacks on brand-new nodes before enough
             #    samples exist for a meaningful baseline.
             _absolute_floor = self.server_threshold or 10000
-            _trigger = pps > self.threshold
+            # Lower threshold when 30%+ of source IPs are known-bad (threat intel)
+            _effective_threshold = self.threshold
+            if self.analyser.blocklist_ratio() > 0.3:
+                _effective_threshold = self.threshold * 0.7
+            _trigger = pps > _effective_threshold
             if not self.baseline.baseline_ready and pps >= _absolute_floor:
                 _trigger = True
 
@@ -4017,6 +4108,9 @@ class Agent:
                                  dns_detected=bool(self.analyser.dns_queries),
                                  top_ports=self.analyser.top_dst_ports(),
                                  tcp_flags=dict(self.analyser.tcp_flags))
+        # Enrich classification with IOC threat intel
+        family, _init_subtype, _init_tool, _ = enrich_from_ioc(
+            self.analyser.ioc_hits, family, "")
         started_at = datetime.now(timezone.utc).isoformat()
 
         # Per-VM: identify which inner IP is being attacked (Feature 2)
@@ -4041,11 +4135,14 @@ class Agent:
             "peak_bps": round(self.peak_bps, 1),
             "started_at": started_at,
             "attack_family": family,
+            "attack_subtype": _init_subtype or None,
             "baseline_pps": round(self.baseline.avg_pps, 1),
             "duration": 0,
             # GRE / hypervisor metadata (Features 1 & 2)
             "gre_dedup_active": self.gre_decap.enabled,
         }
+        if _init_tool:
+            inc_data["attack_tool"] = _init_tool
         if target_vm_ip:
             inc_data["inner_ip"] = target_vm_ip
             label = self.vm_labels.get(target_vm_ip, "")
@@ -4238,6 +4335,9 @@ class Agent:
                                  top_ports=self.analyser.top_dst_ports(),
                                  tcp_flags=dict(self.analyser.tcp_flags),
                                  other_pct=proto.get("other", 0.0))
+        # Enrich classification with IOC threat intel
+        family, _upd_subtype, _upd_tool, _ = enrich_from_ioc(
+            self.analyser.ioc_hits, family, "")
 
         # Merge source IP data: use whichever source (scapy or flow) has more visibility
         _scapy_src_count = len(self.analyser.src_ips)
@@ -4258,6 +4358,7 @@ class Agent:
             "peak_pps": round(self.peak_pps, 1),
             "peak_bps": round(self.peak_bps, 1),
             "attack_family": family,
+            "attack_subtype": _upd_subtype or None,
             "protocol_breakdown": proto,
             "source_ip_count": _src_count,
             "total_packets": self.analyser.total_packets,
@@ -4267,6 +4368,8 @@ class Agent:
             "spoofing_detected": self.analyser.spoofing_detected(),
             "botnet_detected": self.analyser.botnet_detected(),
         }
+        if _upd_tool:
+            update_payload["attack_tool"] = _upd_tool
         # Per-VM breakdown update (Feature 2)
         if self.hypervisor_mode and self.analyser.inner_dst_ips:
             top_vm = self.analyser.top_attacked_vm()
@@ -4302,6 +4405,9 @@ class Agent:
                 subtype = tcp_sub
                 if family == "unknown":
                     family = "tcp_flood"
+        # Enrich classification with IOC threat intel
+        family, subtype, _end_tool, _ = enrich_from_ioc(
+            self.analyser.ioc_hits, family, subtype)
 
         logger.warning("ATTACK ENDED — duration=%.0fs peak_pps=%.0f family=%s subtype=%s",
                        duration, self.peak_pps, family, subtype or "none")
@@ -4324,7 +4430,7 @@ class Agent:
             _top_ports_final = [{"port": p, "count": pkts}
                                 for p, pkts in self.flow.aggregator.top_dst_ports(20)]
 
-        self.api.resolve_incident(self.incident_uuid, {
+        _resolve_data = {
             "duration_seconds": round(duration, 1),
             "peak_pps": round(self.peak_pps, 1),
             "peak_bps": round(self.peak_bps, 1),
@@ -4345,7 +4451,10 @@ class Agent:
             "top_src_ips": _top_ips,
             "top_dst_ports": _top_ports_final,
             "avg_pkt_length": self.analyser.avg_pkt_length(),
-        })
+        }
+        if _end_tool:
+            _resolve_data["attack_tool"] = _end_tool
+        self.api.resolve_incident(self.incident_uuid, _resolve_data)
 
         if self.pcap.enabled:
             pcap_path = self.pcap.stop_capture(self.incident_uuid)
