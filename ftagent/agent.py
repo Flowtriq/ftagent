@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.27"
+VERSION = "1.9.28"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1878,11 +1878,20 @@ class PcapCapture:
                             "It may be incompatible with this system or missing permissions."
                         )
                         return
-                    shutdown.wait(5)
+                    # Fully reap the old process before spawning a new one
+                    try:
+                        self._tcpdump_proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        self._tcpdump_proc.kill()
+                        self._tcpdump_proc.wait(timeout=3)
+                    # Exponential backoff: 5s, 10s, 20s, 40s, ...
+                    _backoff = min(5 * (2 ** (_restarts - 1)), 60)
+                    shutdown.wait(_backoff)
                     if not shutdown.is_set():
                         # Clean orphaned files before restart
                         self._cleanup_ring_dir(keep_latest=3)
-                        logger.info("Restarting tcpdump (attempt %d)...", _restarts)
+                        logger.info("Restarting tcpdump (attempt %d, backoff %ds)...",
+                                    _restarts, _backoff)
                         self._tcpdump_proc = subprocess.Popen(
                             tcpdump_cmd, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
@@ -2013,7 +2022,7 @@ class PcapCapture:
                 self._flush_chunk()
 
     def _check_disk_space(self, min_mb: int = 500) -> bool:
-        """Check if enough disk space is available for PCAP writes."""
+        """Check free disk space AND enforce max_disk_mb cap before writes."""
         try:
             import shutil
             usage = shutil.disk_usage(self.pcap_dir)
@@ -2022,7 +2031,28 @@ class PcapCapture:
                 logger.warning("PCAP write skipped: only %d MB free (minimum %d MB)", free_mb, min_mb)
                 return False
         except Exception:
-            pass  # If we can't check, proceed cautiously
+            pass  # If we can't check free space, proceed cautiously
+
+        # Enforce max_disk_mb cap synchronously before every write
+        try:
+            pcap_root = Path(self.pcap_dir)
+            if pcap_root.is_dir():
+                pcap_files = [f for f in pcap_root.glob("*.pcap") if f.is_file()]
+                total_bytes = sum(f.stat().st_size for f in pcap_files)
+                max_bytes = self.max_disk_mb * 1024 * 1024
+                if total_bytes >= max_bytes:
+                    logger.warning(
+                        "PCAP write skipped: %.1f MB on disk >= %d MB cap, "
+                        "triggering cleanup", total_bytes / 1048576, self.max_disk_mb)
+                    self.cleanup_pcaps()
+                    # Re-check after cleanup
+                    total_bytes = sum(
+                        f.stat().st_size for f in pcap_root.glob("*.pcap")
+                        if f.is_file())
+                    if total_bytes >= max_bytes:
+                        return False
+        except Exception:
+            pass
         return True
 
     def _flush_chunk(self) -> Optional[str]:
@@ -2151,6 +2181,12 @@ class PcapCapture:
                 self._capture_proc.wait(timeout=5)
             except Exception:
                 self._capture_proc.kill()
+
+            # Check disk space before merge write
+            if not self._check_disk_space():
+                import shutil
+                shutil.rmtree(self._tcpdump_capture_dir, ignore_errors=True)
+                return None
 
             # Merge ring snapshots + attack capture into one file
             import glob
@@ -2544,8 +2580,8 @@ class L7Monitor:
         cutoff = now - self._window
         self._requests = [r for r in self._requests if r[0] >= cutoff]
         # Hard safety cap in case clock skew breaks window filtering
-        if len(self._requests) > 100_000:
-            self._requests = self._requests[-50_000:]
+        if len(self._requests) > 20_000:
+            self._requests = self._requests[-10_000:]
 
         if not self._requests:
             return None
@@ -3440,20 +3476,72 @@ class ServicePortDetector:
             self._run_ipt(["-F", self.CHAIN_BLOCK])
             self._run_ipt(["-X", self.CHAIN_BLOCK])
             return
-        rules_ok = True
-        for proto, ports in port_matches:
-            # Service traffic counter (RETURN so it doesn't double-count)
-            if not self._run_ipt([
-                "-A", self.CHAIN_ACCOUNT,
-                "-p", proto, "-m", "multiport", "--dports", ports,
-                "-m", "comment", "--comment", "ft_sp_service",
-                "-j", "RETURN",
-            ]):
-                logger.error("Service ports: failed to install accounting rule for %s %s", proto, ports)
-                rules_ok = False
 
-        if not rules_ok:
-            logger.error("Service ports: accounting rule install failed, rolling back")
+        # Batch all accounting rules into a single iptables-restore call
+        # instead of spawning one subprocess per rule
+        restore_lines = ["*filter"]
+        for proto, ports in port_matches:
+            restore_lines.append(
+                f"-A {self.CHAIN_ACCOUNT} -p {proto} -m multiport"
+                f" --dports {ports} -m comment --comment ft_sp_service"
+                f" -j RETURN"
+            )
+        # Non-service traffic counter: everything that didn't match above
+        restore_lines.append(
+            f"-A {self.CHAIN_ACCOUNT} -m comment"
+            f" --comment ft_sp_non_service -j RETURN"
+        )
+        restore_lines.append("COMMIT\n")
+
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["iptables-restore", "--noflush"],
+                input="\n".join(restore_lines),
+                capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                logger.error("Service ports: iptables-restore failed: %s",
+                             r.stderr.strip())
+                # Fallback: try individual rule installation
+                rules_ok = True
+                for proto, ports in port_matches:
+                    if not self._run_ipt([
+                        "-A", self.CHAIN_ACCOUNT,
+                        "-p", proto, "-m", "multiport", "--dports", ports,
+                        "-m", "comment", "--comment", "ft_sp_service",
+                        "-j", "RETURN",
+                    ]):
+                        rules_ok = False
+                if not rules_ok:
+                    logger.error("Service ports: rule install failed, rolling back")
+                    self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_BLOCK])
+                    self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_ACCOUNT])
+                    self._run_ipt(["-F", self.CHAIN_ACCOUNT])
+                    self._run_ipt(["-X", self.CHAIN_ACCOUNT])
+                    self._run_ipt(["-F", self.CHAIN_BLOCK])
+                    self._run_ipt(["-X", self.CHAIN_BLOCK])
+                    return
+                self._run_ipt([
+                    "-A", self.CHAIN_ACCOUNT,
+                    "-m", "comment", "--comment", "ft_sp_non_service",
+                    "-j", "RETURN",
+                ])
+        except FileNotFoundError:
+            logger.warning("iptables-restore not found, falling back to per-rule install")
+            for proto, ports in port_matches:
+                self._run_ipt([
+                    "-A", self.CHAIN_ACCOUNT,
+                    "-p", proto, "-m", "multiport", "--dports", ports,
+                    "-m", "comment", "--comment", "ft_sp_service",
+                    "-j", "RETURN",
+                ])
+            self._run_ipt([
+                "-A", self.CHAIN_ACCOUNT,
+                "-m", "comment", "--comment", "ft_sp_non_service",
+                "-j", "RETURN",
+            ])
+        except subprocess.TimeoutExpired:
+            logger.error("Service ports: iptables-restore timed out, rolling back")
             self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_BLOCK])
             self._run_ipt(["-D", "INPUT", "-j", self.CHAIN_ACCOUNT])
             self._run_ipt(["-F", self.CHAIN_ACCOUNT])
@@ -3461,14 +3549,6 @@ class ServicePortDetector:
             self._run_ipt(["-F", self.CHAIN_BLOCK])
             self._run_ipt(["-X", self.CHAIN_BLOCK])
             return
-
-        # Non-service traffic counter: everything that didn't match above
-        # (also RETURN - these are just counters, no drops)
-        self._run_ipt([
-            "-A", self.CHAIN_ACCOUNT,
-            "-m", "comment", "--comment", "ft_sp_non_service",
-            "-j", "RETURN",
-        ])
 
         self._rules_installed = True
         self._reset_counters()
@@ -4057,9 +4137,9 @@ class Agent:
                         daemon=True, name="pcap-ring")
                     self._sniffer_thread.start()
 
-            # Periodic pcap cleanup every 5 minutes
+            # Periodic pcap cleanup every 60 seconds
             if (self.pcap.enabled
-                    and loop_start - self.pcap._last_cleanup >= 300):
+                    and loop_start - self.pcap._last_cleanup >= 60):
                 self.pcap._last_cleanup = loop_start
                 self.pcap.cleanup_pcaps()
 
