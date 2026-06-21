@@ -2490,7 +2490,7 @@ class L7Monitor:
         except (OSError, IOError):
             pass
 
-        now = time.time()
+        now = time.monotonic()
         for line in new_lines:
             parsed = self._parse_line(line)
             if parsed:
@@ -2745,7 +2745,7 @@ class L7Monitor:
         # Need at least 2 signals AND multiple source IPs (single IP = scanner, not flood)
         if signals >= 2 and unique_ips >= 3 and not self._attack_active:
             self._attack_active = True
-            self._attack_start = time.time()
+            self._attack_start = time.monotonic()
             self._attack_peak_rps = rps
             self._below_count = 0
             self._reset_attack_accumulators()
@@ -2828,7 +2828,7 @@ class L7Monitor:
         rps = stats["rps"]
         total = stats.get("total_requests", 0)
         error_rate = stats.get("error_rate", 0)
-        elapsed = time.time() - self._attack_start
+        elapsed = time.monotonic() - self._attack_start
 
         # Minimum 15s before allowing resolve to prevent rapid open/close flapping
         if elapsed < 15:
@@ -3174,8 +3174,6 @@ class HealthCheckHandler:
                     "current_pps": round(agent_ref.monitor.pps, 1),
                     "current_bps": round(agent_ref.monitor.bps, 1),
                     "baseline_ready": agent_ref.baseline.baseline_ready,
-                    "baseline_avg_pps": round(agent_ref.baseline.avg_pps, 1),
-                    "baseline_threshold": round(agent_ref.threshold, 1),
                     "attack_active": agent_ref.attacking,
                     "incident_uuid": agent_ref.incident_uuid or None,
                 }).encode()
@@ -5355,16 +5353,20 @@ class Agent:
                 logger.warning("Blocked shell injection in command: %s", line)
                 continue
             # Block destructive commands that could lock out the server
-            _destructive = ("-F INPUT", "-X INPUT", "-P INPUT DROP",
-                            "-P INPUT REJECT", "--flush INPUT",
-                            "--delete-chain INPUT")
-            if any(d in line for d in _destructive):
+            _tokens = line.split()
+            _destructive_tokens = {"-F", "-X", "--flush", "--delete-chain"}
+            _destructive_policy = [("-P", "INPUT", "DROP"), ("-P", "INPUT", "REJECT")]
+            if any(t in _destructive_tokens for t in _tokens):
+                errors.append(f"Blocked destructive firewall command: {line}")
+                logger.warning("Blocked destructive command: %s", line)
+                continue
+            if any(all(p in _tokens for p in combo) for combo in _destructive_policy):
                 errors.append(f"Blocked destructive firewall command: {line}")
                 logger.warning("Blocked destructive command: %s", line)
                 continue
             # Sysctl whitelist: only allow known-safe kernel parameters
             if line.startswith("sysctl "):
-                _safe_sysctl = (
+                _safe_sysctl = {
                     "net.ipv4.tcp_syncookies", "net.ipv4.tcp_max_syn_backlog",
                     "net.ipv4.tcp_synack_retries", "net.ipv4.tcp_syn_retries",
                     "net.ipv4.icmp_echo_ignore_broadcasts",
@@ -5372,8 +5374,16 @@ class Agent:
                     "net.ipv4.conf.all.log_martians",
                     "net.ipv4.tcp_fin_timeout", "net.ipv4.tcp_keepalive_time",
                     "net.core.somaxconn", "net.core.netdev_max_backlog",
-                )
-                if not any(s in line for s in _safe_sysctl):
+                }
+                # Extract exact sysctl key: "sysctl -w key=value" or "sysctl key=value"
+                _sysctl_parts = line.split()
+                _sysctl_key = None
+                for _sp in _sysctl_parts[1:]:
+                    if _sp.startswith("-"):
+                        continue
+                    _sysctl_key = _sp.split("=")[0]
+                    break
+                if _sysctl_key not in _safe_sysctl:
                     errors.append(f"Blocked unsafe sysctl: {line}")
                     logger.warning("Blocked non-whitelisted sysctl: %s", line)
                     continue

@@ -390,10 +390,22 @@ def _parse_ipv6(data: bytes, offset: int, counter: PerIPCounter,
         except ValueError:
             return
 
-    # Extract L4 info (skip extension headers — use next_header directly)
+    # Traverse IPv6 extension headers to find the actual transport header
+    _IPV6_EXT_HEADERS = {0, 43, 44, 60}  # Hop-by-Hop, Routing, Fragment, Dest Opts
+    l4_offset = offset + 40
+    _ext_loops = 0
+    while next_header in _IPV6_EXT_HEADERS and _ext_loops < 10:
+        if l4_offset + 2 > len(data):
+            break
+        _ext_next = data[l4_offset]
+        _ext_len = data[l4_offset + 1]  # length in 8-byte units, not counting first 8
+        l4_offset += (_ext_len + 1) * 8
+        next_header = _ext_next
+        _ext_loops += 1
+
+    # Extract L4 info
     dst_port = 0
     tcp_flags = 0
-    l4_offset = offset + 40
 
     if next_header == PROTO_TCP and l4_offset + 14 <= len(data):
         dst_port = struct.unpack_from("!H", data, l4_offset + 2)[0]
@@ -448,9 +460,10 @@ class MirrorCaptureEngine:
             if not self._subnets:
                 self._subnets = None
 
-        # Stats
+        # Stats (counter lock protects increments across fanout workers)
         self._packets_captured = 0
         self._packets_errors = 0
+        self._counter_lock = threading.Lock()
         self._capture_start: float = 0.0
 
     def start(self, shutdown: threading.Event) -> None:
@@ -548,14 +561,17 @@ class MirrorCaptureEngine:
             except OSError:
                 if shutdown.is_set():
                     break
-                self._packets_errors += 1
+                with self._counter_lock:
+                    self._packets_errors += 1
                 continue
 
-            self._packets_captured += 1
+            with self._counter_lock:
+                self._packets_captured += 1
             try:
                 _parse_ethernet(data, counter, subnets, gre_strip)
             except Exception:
-                self._packets_errors += 1
+                with self._counter_lock:
+                    self._packets_errors += 1
 
         try:
             sock.close()
@@ -636,11 +652,13 @@ class MirrorCaptureEngine:
                 if len(pkt_data) < incl_len:
                     break
 
-                self._packets_captured += 1
+                with self._counter_lock:
+                    self._packets_captured += 1
                 try:
                     _parse_ethernet(pkt_data, counter, subnets, gre_strip)
                 except Exception:
-                    self._packets_errors += 1
+                    with self._counter_lock:
+                        self._packets_errors += 1
 
         except FileNotFoundError:
             logger.error("tcpdump not found. Install tcpdump for mirror capture.")
