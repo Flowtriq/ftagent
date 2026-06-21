@@ -913,6 +913,7 @@ class TrafficAnalyser:
         self.ttl_values: list = []
         self.dns_queries: dict = {}
         self.total_packets = 0
+        self.fragment_count = 0        # IP fragmented packets (MF flag or frag offset > 0)
         self.ioc_hits: list = []
         self._src_ip_overflow = False   # flag: True once we hit cap
         # Per-VM tracking (Feature 2): inner dst IP after GRE decapsulation
@@ -971,6 +972,10 @@ class TrafficAnalyser:
         if stats_pkt.haslayer(IP):
             ip = stats_pkt[IP]
             src = ip.src
+
+            # Track IP fragments (MF flag set or fragment offset > 0)
+            if ip.flags.MF or ip.frag > 0:
+                self.fragment_count += 1
 
             # Bounded src_ips: only track new IPs if under cap
             if src in self.src_ips:
@@ -1194,14 +1199,22 @@ class TrafficAnalyser:
             icmp_total += d["icmp"]
             other_total += d.get("other", 0)
         grand = tcp_total + udp_total + icmp_total + other_total
+        frag_pct = round(self.fragment_count / max(self.total_packets, 1) * 100, 1)
         if grand == 0:
-            return {"tcp": 0, "udp": 0, "icmp": 0, "other": 0}
+            return {"tcp": 0, "udp": 0, "icmp": 0, "other": 0, "fragments": frag_pct}
         return {
             "tcp": round(tcp_total / grand * 100, 1),
             "udp": round(udp_total / grand * 100, 1),
             "icmp": round(icmp_total / grand * 100, 1),
             "other": round(other_total / grand * 100, 1),
+            "fragments": frag_pct,
         }
+
+    def fragment_pct(self) -> float:
+        """Percentage of total packets that are IP fragments."""
+        if self.total_packets == 0:
+            return 0.0
+        return round(self.fragment_count / self.total_packets * 100, 1)
 
     def syn_ratio(self) -> float:
         """SYN ratio from captured TCP flags."""
@@ -2116,7 +2129,7 @@ WEB_SERVER_LOG_PATHS = {
 }
 
 LOG_PATTERN_COMBINED = re.compile(
-    r'^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"(\S+)\s+(\S+)\s+\S+"\s+(\d{3})\s+(\S+)'
+    r'^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"(\S+)\s+(\S+)\s+(HTTP/\S+)"\s+(\d{3})\s+(\S+)'
     r'(?:\s+"[^"]*"\s+"([^"]*)")?'
 )
 
@@ -2166,6 +2179,28 @@ L7_BOT_UA_PATTERNS = re.compile(
     r"zgrab|httpx|nuclei|dirsearch|gobuster|ffuf|wfuzz|"
     r"bot|spider|crawl|scan|attack|exploit|hack)", re.I)
 
+def _normalize_http_version(raw: str) -> str:
+    """Normalize HTTP protocol string to version shorthand.
+    'HTTP/1.1' -> '1.1', 'HTTP/2.0' -> '2', 'HTTP/3.0' -> '3', 'h2' -> '2', etc."""
+    if not raw:
+        return ""
+    r = raw.strip().upper()
+    if r.startswith("HTTP/"):
+        ver = r[5:]
+        # "2.0" -> "2", "3.0" -> "3", "1.1" stays "1.1", "1.0" stays "1.0"
+        if ver in ("2.0", "2"):
+            return "2"
+        if ver in ("3.0", "3"):
+            return "3"
+        return ver
+    r_low = raw.strip().lower()
+    if r_low in ("h2", "h2c"):
+        return "2"
+    if r_low in ("h3",):
+        return "3"
+    return ""
+
+
 # ── L7 subtype classification helpers ──
 def _classify_l7_subtype(stats: dict) -> str:
     """Classify L7 attack subtype from traffic characteristics."""
@@ -2178,6 +2213,36 @@ def _classify_l7_subtype(stats: dict) -> str:
 
     if not total:
         return "l7_flood"
+
+    # ── HTTP/2-specific attack pattern detection ──
+    h2_pct = stats.get("h2_pct", 0.0)
+    h3_pct = stats.get("h3_pct", 0.0)
+    status_499 = stats.get("status_499", 0)
+    rps_per_ip = stats.get("rps_per_ip", 0.0)
+
+    if h2_pct > 30:
+        # HTTP/2 Rapid Reset (CVE-2023-44487): extremely high RPS with many
+        # 499/client-closed responses from relatively few source IPs.
+        # Attackers open streams then immediately RST them.
+        status_499_pct = (status_499 / max(total, 1)) * 100
+        if rps > 200 and status_499_pct > 20 and rps_per_ip > 50:
+            return "h2_rapid_reset"
+
+        # HTTP/2 SETTINGS flood: few IPs generating extreme per-IP RPS
+        # via connection-level abuse (multiplexed streams)
+        if rps_per_ip > 200 and unique_ips < 20 and rps > 500:
+            return "h2_settings_flood"
+
+        # HTTP/2 CONTINUATION flood (CVE-2024-27983): few IPs, many
+        # 400-series errors from malformed continuation frames
+        status_4xx = stats.get("status_4xx", 0)
+        status_4xx_pct = (status_4xx / max(total, 1)) * 100
+        if rps_per_ip > 100 and unique_ips < 30 and status_4xx_pct > 40:
+            return "h2_continuation_flood"
+
+    # ── HTTP/3 (QUIC) flood detection ──
+    if h3_pct > 30 and rps > 300 and unique_ips > 5:
+        return "quic_flood"
 
     # Single source abuse
     if unique_ips <= 2 and total > 50:
@@ -2300,6 +2365,7 @@ class L7Monitor:
         self._attack_path_totals: dict = {}
         self._attack_ip_totals: dict = {}
         self._attack_total_requests: int = 0
+        self._attack_version_totals: dict = {}  # HTTP version -> request count
 
     def open(self) -> bool:
         try:
@@ -2382,8 +2448,12 @@ class L7Monitor:
                             resp_time = resp_time * 1000
                     except (ValueError, TypeError):
                         resp_time = None
+                # HTTP protocol version (e.g. "HTTP/2.0", "HTTP/1.1", "HTTP/3.0")
+                raw_proto = (d.get("server_protocol") or d.get("protocol")
+                             or d.get("httpVersion") or d.get("http_version") or "")
+                http_version = _normalize_http_version(raw_proto)
                 if ip and status:
-                    return (ip, method, path, status, size, ua, resp_time)
+                    return (ip, method, path, status, size, ua, resp_time, http_version)
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
             return None
@@ -2393,12 +2463,14 @@ class L7Monitor:
         if m:
             ip = m.group(1)
             method, path = m.group(3), m.group(4)
-            status = int(m.group(5))
-            size_str = m.group(6)
-            ua = m.group(7) or ""
+            raw_proto = m.group(5)  # e.g. "HTTP/1.1", "HTTP/2.0", "HTTP/3.0"
+            status = int(m.group(6))
+            size_str = m.group(7)
+            ua = m.group(8) or ""
             size = int(size_str) if size_str != "-" else 0
             path = path.split("?")[0] if "?" in path else path
-            return (ip, method, path, status, size, ua, None)
+            http_version = _normalize_http_version(raw_proto)
+            return (ip, method, path, status, size, ua, None, http_version)
         return None
 
     def _compute_stats(self, now: float) -> dict:
@@ -2413,15 +2485,27 @@ class L7Monitor:
         threat_hits: dict = {}
         resp_times: list = []
         bot_request_count = 0
+        version_counts: dict = {}  # HTTP version -> count ("1.1", "2", "3")
+        # HTTP/2 rapid reset heuristic: count 499/client-closed status codes
+        status_499_count = 0
 
         for req in self._requests:
             ts, ip, method, path, status, size, ua = req[0], req[1], req[2], req[3], req[4], req[5], req[6]
             resp_time = req[7] if len(req) > 7 else None
+            http_version = req[8] if len(req) > 8 else ""
 
             ip_counts[ip] = ip_counts.get(ip, 0) + 1
             path_counts[path] = path_counts.get(path, 0) + 1
             code_group = f"{status // 100}xx"
             status_counts[code_group] = status_counts.get(code_group, 0) + 1
+
+            # Track HTTP protocol version distribution
+            if http_version:
+                version_counts[http_version] = version_counts.get(http_version, 0) + 1
+
+            # Track 499 (nginx client closed request) for rapid reset detection
+            if status == 499:
+                status_499_count += 1
 
             # User-Agent tracking
             if ua:
@@ -2451,6 +2535,16 @@ class L7Monitor:
         top_uas = sorted(ua_counts.items(), key=lambda x: x[1], reverse=True)[:20]
         avg_resp_ms = round(sum(resp_times) / len(resp_times), 1) if resp_times else None
 
+        # Protocol version distribution as percentages
+        version_total = sum(version_counts.values())
+        protocol_versions = {}
+        if version_total > 0:
+            for ver, cnt in version_counts.items():
+                protocol_versions[ver] = round(cnt / version_total * 100, 1)
+
+        # RPS per unique IP (for concurrency-based H2 attack detection)
+        rps_per_ip = rps / max(len(ip_counts), 1)
+
         return {
             "rps": round(rps, 1),
             "error_rate": round(error_rate, 1),
@@ -2466,6 +2560,11 @@ class L7Monitor:
             "avg_response_ms": avg_resp_ms,
             "status_5xx": status_counts.get("5xx", 0),
             "status_4xx": status_counts.get("4xx", 0),
+            "status_499": status_499_count,
+            "protocol_versions": protocol_versions,
+            "rps_per_ip": round(rps_per_ip, 1),
+            "h2_pct": protocol_versions.get("2", 0.0),
+            "h3_pct": protocol_versions.get("3", 0.0),
         }
 
     def check_attack(self, stats: dict) -> Optional[dict]:
@@ -2592,6 +2691,7 @@ class L7Monitor:
         self._attack_path_totals = {}
         self._attack_ip_totals = {}
         self._attack_total_requests = 0
+        self._attack_version_totals = {}
 
     def _capped_merge(self, target: dict, source: dict) -> None:
         """Merge counts into target dict, ignoring new keys once cap is hit."""
@@ -2610,12 +2710,25 @@ class L7Monitor:
         self._capped_merge(self._attack_status_totals, stats.get("status_codes", {}))
         self._capped_merge(self._attack_path_totals, stats.get("top_paths", {}))
         self._capped_merge(self._attack_ip_totals, stats.get("top_ips", {}))
+        # Accumulate protocol version counts (convert percentages back to counts)
+        pv = stats.get("protocol_versions", {})
+        total = stats.get("total_requests", 0)
+        if pv and total > 0:
+            for ver, pct in pv.items():
+                cnt = round(pct / 100 * total)
+                self._attack_version_totals[ver] = self._attack_version_totals.get(ver, 0) + cnt
 
     def get_attack_summary(self) -> dict:
         """Return accumulated attack-wide data for incident enrichment."""
         top_uas = sorted(self._attack_ua_counts.items(), key=lambda x: x[1], reverse=True)[:20]
         top_paths = sorted(self._attack_path_totals.items(), key=lambda x: x[1], reverse=True)[:20]
         top_ips = sorted(self._attack_ip_totals.items(), key=lambda x: x[1], reverse=True)[:50]
+        # Protocol version distribution as percentages
+        ver_total = sum(self._attack_version_totals.values())
+        protocol_versions = {}
+        if ver_total > 0:
+            for ver, cnt in self._attack_version_totals.items():
+                protocol_versions[ver] = round(cnt / ver_total * 100, 1)
         return {
             "top_user_agents": dict(top_uas),
             "threat_patterns": self._attack_threat_hits,
@@ -2623,6 +2736,7 @@ class L7Monitor:
             "top_paths": dict(top_paths),
             "top_ips": dict(top_ips),
             "total_requests": self._attack_total_requests,
+            "protocol_versions": protocol_versions,
         }
 
     def _check_attack_end(self, stats: dict) -> Optional[dict]:
@@ -2680,7 +2794,11 @@ class L7Monitor:
 def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
                     syn_ratio: float = 0.0, dns_detected: bool = False,
                     top_ports: list = None, tcp_flags: dict = None,
-                    other_pct: float = 0.0) -> str:
+                    other_pct: float = 0.0,
+                    fragment_pct: float = 0.0) -> str:
+    # Fragment flood: overwhelmingly fragmented traffic is its own family
+    if fragment_pct > 50:
+        return "fragment_flood"
     if dns_detected:
         return "dns_flood"
     if udp_pct > 45:
@@ -2717,7 +2835,7 @@ def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
 
 def classify_subtype(family: str, top_ports: list = None,
                      tcp_flags: dict = None, avg_pkt_len: int = 0,
-                     src_ports: list = None) -> str:
+                     src_ports: list = None, fragment_pct: float = 0.0) -> str:
     """Derive attack subtype from port/flag/size evidence."""
     ports = top_ports or []
     top_port = 0
@@ -2754,6 +2872,12 @@ def classify_subtype(family: str, top_ports: list = None,
 
     # ── UDP subtypes ──
     if family == "udp_flood":
+        # Fragment flood: high percentage of IP fragments indicates fragmentation attack
+        if fragment_pct > 30:
+            return "udp_fragment_flood"
+        # QUIC flood: UDP port 443 is used by HTTP/3 over QUIC
+        if top_port == 443:
+            return "quic_flood"
         _amp_ports = {53: "dns_amplification", 123: "ntp_amplification",
                       1900: "ssdp_amplification", 11211: "memcached_amplification",
                       389: "cldap_amplification", 19: "chargen_amplification",
@@ -2824,6 +2948,10 @@ def classify_subtype(family: str, top_ports: list = None,
         if tcp_flags:
             return classify_tcp_subtype(tcp_flags) or "gre_flood"
         return "gre_flood"
+
+    # ── Fragment flood ──
+    if family == "fragment_flood":
+        return "ip_fragment_flood"
 
     return ""
 
@@ -4107,7 +4235,8 @@ class Agent:
                                  syn_ratio=_syn_est,
                                  dns_detected=bool(self.analyser.dns_queries),
                                  top_ports=self.analyser.top_dst_ports(),
-                                 tcp_flags=dict(self.analyser.tcp_flags))
+                                 tcp_flags=dict(self.analyser.tcp_flags),
+                                 fragment_pct=self.analyser.fragment_pct())
         # Enrich classification with IOC threat intel
         family, _init_subtype, _init_tool, _ = enrich_from_ioc(
             self.analyser.ioc_hits, family, "")
@@ -4254,7 +4383,8 @@ class Agent:
                                  dns_detected=bool(self.analyser.dns_queries),
                                  top_ports=self.analyser.top_dst_ports(),
                                  tcp_flags=dict(self.analyser.tcp_flags),
-                                 other_pct=proto.get("other", 0.0))
+                                 other_pct=proto.get("other", 0.0),
+                                 fragment_pct=self.analyser.fragment_pct())
 
         started_at = datetime.now(timezone.utc).isoformat()
 
@@ -4329,12 +4459,14 @@ class Agent:
             self.velocity_curve[-1] = {"t": round(elapsed, 1), "pps": round(self.monitor.pps, 1)}
 
         proto = self._proto_breakdown()
+        _frag_pct = self.analyser.fragment_pct()
         family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"],
                                  syn_ratio=self.analyser.syn_ratio(),
                                  dns_detected=bool(self.analyser.dns_queries),
                                  top_ports=self.analyser.top_dst_ports(),
                                  tcp_flags=dict(self.analyser.tcp_flags),
-                                 other_pct=proto.get("other", 0.0))
+                                 other_pct=proto.get("other", 0.0),
+                                 fragment_pct=_frag_pct)
         # Enrich classification with IOC threat intel
         family, _upd_subtype, _upd_tool, _ = enrich_from_ioc(
             self.analyser.ioc_hits, family, "")
@@ -4367,6 +4499,8 @@ class Agent:
             "ioc_hits": list(set(self.analyser.ioc_hits)),
             "spoofing_detected": self.analyser.spoofing_detected(),
             "botnet_detected": self.analyser.botnet_detected(),
+            "fragment_count": self.analyser.fragment_count,
+            "fragment_pct": _frag_pct,
         }
         if _upd_tool:
             update_payload["attack_tool"] = _upd_tool
@@ -4388,6 +4522,7 @@ class Agent:
         _src_ports = self.analyser.top_src_ports()
         _flags = dict(self.analyser.tcp_flags)
         _avg_pkt = self.analyser.avg_pkt_length()
+        _frag_pct = self.analyser.fragment_pct()
         family = classify_attack(
             proto["tcp"], proto["udp"], proto["icmp"],
             syn_ratio=self.analyser.syn_ratio(),
@@ -4395,9 +4530,11 @@ class Agent:
             top_ports=_top_ports,
             tcp_flags=_flags,
             other_pct=proto.get("other", 0.0),
+            fragment_pct=_frag_pct,
         )
         # Derive subtype from port/flag/size evidence
-        subtype = classify_subtype(family, _top_ports, _flags, _avg_pkt, src_ports=_src_ports)
+        subtype = classify_subtype(family, _top_ports, _flags, _avg_pkt,
+                                   src_ports=_src_ports, fragment_pct=_frag_pct)
         # For TCP-dominant traffic that isn't SYN flood, check for other TCP subtypes
         if family in ("unknown", "tcp_flood") and proto["tcp"] > 40:
             tcp_sub = classify_tcp_subtype(_flags)
@@ -4451,6 +4588,8 @@ class Agent:
             "top_src_ips": _top_ips,
             "top_dst_ports": _top_ports_final,
             "avg_pkt_length": self.analyser.avg_pkt_length(),
+            "fragment_count": self.analyser.fragment_count,
+            "fragment_pct": _frag_pct,
         }
         if _end_tool:
             _resolve_data["attack_tool"] = _end_tool
@@ -4945,6 +5084,7 @@ class Agent:
             "l7_status_codes": stats.get("status_codes", {}),
             "l7_top_user_agents": stats.get("top_user_agents", {}),
             "l7_threat_patterns": stats.get("threat_patterns", {}),
+            "l7_protocol_versions": stats.get("protocol_versions", {}),
         })
 
     def _l7_update_attack(self, info: dict) -> None:
@@ -4989,6 +5129,7 @@ class Agent:
             "l7_status_codes": accum.get("status_codes", stats.get("status_codes", {})),
             "l7_top_user_agents": accum.get("top_user_agents", stats.get("top_user_agents", {})),
             "l7_threat_patterns": accum.get("threat_patterns", stats.get("threat_patterns", {})),
+            "l7_protocol_versions": accum.get("protocol_versions", stats.get("protocol_versions", {})),
         })
 
     def _l7_end_attack(self, info: dict) -> None:
@@ -5046,6 +5187,7 @@ class Agent:
             "l7_top_user_agents": summary.get("top_user_agents", stats.get("top_user_agents", {})),
             "l7_targeted_paths": summary.get("top_paths", stats.get("top_paths", {})),
             "l7_threat_patterns": summary.get("threat_patterns", stats.get("threat_patterns", {})),
+            "l7_protocol_versions": summary.get("protocol_versions", stats.get("protocol_versions", {})),
         })
         self.l7_incident_uuid = ""
         self.l7_peak_rps = 0
@@ -5564,10 +5706,12 @@ class MirrorAgent(Agent):
         _snap_flag_total = sum(_snap_flags.values()) if _snap_flags else 0
         _snap_syn_ratio = (_snap_flags.get("SYN", 0) / _snap_flag_total) if _snap_flag_total > 0 else 0.0
         _snap_top_ports = [{"port": p, "count": c} for p, c in snap.top_dst_ports] if snap.top_dst_ports else []
+        _snap_frag_pct = getattr(snap, 'fragment_pct', 0.0)
         family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct,
                                  syn_ratio=_snap_syn_ratio,
                                  top_ports=_snap_top_ports,
-                                 tcp_flags=_snap_flags)
+                                 tcp_flags=_snap_flags,
+                                 fragment_pct=_snap_frag_pct)
 
         started_at = datetime.now(timezone.utc).isoformat()
 
@@ -5581,6 +5725,7 @@ class MirrorAgent(Agent):
             "inner_ip": ip,
             "mirror_mode": True,
             "source_ip_count": snap.src_ip_count,
+            "fragment_pct": _snap_frag_pct,
         }
         if label:
             inc_data["inner_ip_label"] = label
@@ -5644,10 +5789,12 @@ class MirrorAgent(Agent):
         _snap_flag_total = sum(_snap_flags.values()) if _snap_flags else 0
         _snap_syn_ratio = (_snap_flags.get("SYN", 0) / _snap_flag_total) if _snap_flag_total > 0 else 0.0
         _snap_top_ports = [{"port": p, "count": c} for p, c in snap.top_dst_ports] if snap.top_dst_ports else []
+        _snap_frag_pct = getattr(snap, 'fragment_pct', 0.0)
         family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct,
                                  syn_ratio=_snap_syn_ratio,
                                  top_ports=_snap_top_ports,
-                                 tcp_flags=_snap_flags)
+                                 tcp_flags=_snap_flags,
+                                 fragment_pct=_snap_frag_pct)
 
         update_payload = {
             "peak_pps": round(state["peak_pps"], 1),
@@ -5657,6 +5804,7 @@ class MirrorAgent(Agent):
                 "tcp": snap.tcp_pct,
                 "udp": snap.udp_pct,
                 "icmp": snap.icmp_pct,
+                "fragments": _snap_frag_pct,
             },
             "source_ip_count": snap.src_ip_count,
             "top_src_ips": [
@@ -5668,6 +5816,7 @@ class MirrorAgent(Agent):
             "inner_ip": ip,
             "mirror_mode": True,
             "tcp_flag_breakdown": snap.tcp_flags,
+            "fragment_pct": _snap_frag_pct,
         }
         label = self.mirror_ip_labels.get(ip, "")
         if label:
@@ -5688,11 +5837,13 @@ class MirrorAgent(Agent):
         last_snap = self._last_snapshot.get(ip)
         tcp_flags = last_snap.tcp_flags if last_snap else {}
         avg_pkt = last_snap.avg_pkt_size if last_snap else 0
+        _snap_frag_pct = getattr(last_snap, 'fragment_pct', 0.0) if last_snap else 0.0
         top_ports = []
         if last_snap and last_snap.top_dst_ports:
             top_ports = [{"port": p, "count": c} for p, c in last_snap.top_dst_ports]
 
-        subtype = classify_subtype(family, top_ports, tcp_flags, avg_pkt)
+        subtype = classify_subtype(family, top_ports, tcp_flags, avg_pkt,
+                                   fragment_pct=_snap_frag_pct)
 
         label = self.mirror_ip_labels.get(ip, "")
         label_str = f" ({label})" if label else ""
@@ -5715,6 +5866,7 @@ class MirrorAgent(Agent):
                     "tcp": last_snap.tcp_pct,
                     "udp": last_snap.udp_pct,
                     "icmp": last_snap.icmp_pct,
+                    "fragments": _snap_frag_pct,
                 }
                 resolve_data["source_ip_count"] = last_snap.src_ip_count
                 resolve_data["top_src_ips"] = [
@@ -5723,6 +5875,7 @@ class MirrorAgent(Agent):
                 resolve_data["top_dst_ports"] = top_ports
                 resolve_data["tcp_flag_breakdown"] = tcp_flags
                 resolve_data["avg_pkt_length"] = avg_pkt
+                resolve_data["fragment_pct"] = _snap_frag_pct
 
             self.api.resolve_incident(state["incident_uuid"], resolve_data)
 
