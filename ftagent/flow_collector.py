@@ -366,6 +366,8 @@ class TemplateCache:
     Templates are keyed by (source_ip, observation_domain, template_id).
     """
 
+    MAX_ENTRIES = 50_000
+
     def __init__(self):
         self._lock = threading.Lock()
         # key: (source_ip, domain_id, template_id) → list of (field_id, field_length)
@@ -378,12 +380,20 @@ class TemplateCache:
         with self._lock:
             self._templates[key] = fields
             self._last_seen[key] = time.monotonic()
+            # LRU eviction if cache exceeds max size
+            if len(self._templates) > self.MAX_ENTRIES:
+                oldest = min(self._last_seen, key=self._last_seen.get)
+                self._templates.pop(oldest, None)
+                self._last_seen.pop(oldest, None)
 
     def get(self, source_ip: str, domain_id: int,
             template_id: int) -> Optional[list[tuple[int, int]]]:
         key = (source_ip, domain_id, template_id)
         with self._lock:
-            return self._templates.get(key)
+            tpl = self._templates.get(key)
+            if tpl is not None:
+                self._last_seen[key] = time.monotonic()
+            return tpl
 
     def prune(self, max_age: float = 3600) -> None:
         """Remove templates not seen in max_age seconds."""
