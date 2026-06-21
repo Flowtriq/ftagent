@@ -179,32 +179,113 @@ def check_for_updates(force: bool = False, interactive: bool = True) -> None:
         pass  # Never let update check break the agent
 
 
+def _verify_installed_version(expected_version: str) -> bool:
+    """Verify the installed ftagent version matches what we expected from PyPI."""
+    try:
+        import importlib.metadata
+        # Force re-read by clearing any cached data
+        installed = importlib.metadata.version("ftagent")
+        if installed == expected_version:
+            return True
+        logger.warning(
+            "Update verification: expected version %s but got %s",
+            expected_version, installed)
+        return False
+    except Exception as exc:
+        logger.warning("Update verification: cannot read installed version: %s", exc)
+        return False
+
+
+def _verify_module_imports() -> bool:
+    """Sanity-check that the new ftagent module loads without errors."""
+    import subprocess as _sp
+    result = _sp.run(
+        [sys.executable, "-c", "import ftagent.agent; print('ok')"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return result.returncode == 0 and "ok" in result.stdout
+
+
+def _pip_install_version(version: str, break_system: bool = False) -> bool:
+    """Install a specific ftagent version. Returns True on success."""
+    import subprocess as _sp
+    pip_cmd = [sys.executable, "-m", "pip", "install", f"ftagent=={version}"]
+    if break_system:
+        pip_cmd.insert(-1, "--break-system-packages")
+    result = _sp.run(pip_cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0 and "externally-managed-environment" in result.stderr and not break_system:
+        return _pip_install_version(version, break_system=True)
+    return result.returncode == 0
+
+
+def _get_pypi_latest_version() -> str | None:
+    """Query PyPI for the latest ftagent version string."""
+    import urllib.request
+    import json as _json
+    try:
+        req = urllib.request.Request(
+            "https://pypi.org/pypi/ftagent/json",
+            headers={"User-Agent": f"ftagent/{VERSION}"})
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = _json.loads(resp.read())
+        return data.get("info", {}).get("version", "") or None
+    except Exception:
+        return None
+
+
 def _do_pip_upgrade() -> None:
-    """Run pip upgrade, handling --break-system-packages for PEP 668."""
+    """Run pip upgrade with post-install integrity verification."""
     import subprocess as _sp
 
+    previous_version = VERSION
+    # Determine what PyPI says is latest before we install
+    pypi_latest = _get_pypi_latest_version()
+
     pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "ftagent"]
+    break_system = False
 
     print("  Updating ftagent...")
-    result = _sp.run(pip_cmd, capture_output=True, text=True)
-
-    if result.returncode == 0:
-        print("  Updated successfully. Restart the agent to use the new version.")
-        print("  Run: systemctl restart ftagent")
-        return
+    result = _sp.run(pip_cmd, capture_output=True, text=True, timeout=120)
 
     # PEP 668: externally managed Python (Debian 12+, Ubuntu 23.04+)
-    if "externally-managed-environment" in result.stderr:
+    if result.returncode != 0 and "externally-managed-environment" in result.stderr:
         print("  System Python detected. Retrying with --break-system-packages...")
         pip_cmd.insert(-1, "--break-system-packages")
-        result = _sp.run(pip_cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print("  Updated successfully. Restart the agent to use the new version.")
-            print("  Run: systemctl restart ftagent")
-            return
+        break_system = True
+        result = _sp.run(pip_cmd, capture_output=True, text=True, timeout=120)
 
-    print(f"  Update failed: {result.stderr.strip()}")
-    print("  Try manually: pip install --upgrade ftagent")
+    if result.returncode != 0:
+        print(f"  Update failed: {result.stderr.strip()}")
+        print("  Try manually: pip install --upgrade ftagent")
+        return
+
+    # Post-install verification
+    verified = True
+
+    # 1. Verify installed version matches PyPI's advertised latest
+    if pypi_latest:
+        if not _verify_installed_version(pypi_latest):
+            print(f"  WARNING: Version mismatch after install (expected {pypi_latest})")
+            verified = False
+    else:
+        print("  WARNING: Could not query PyPI to verify target version")
+
+    # 2. Verify the module imports cleanly
+    if not _verify_module_imports():
+        print("  WARNING: New version fails to import")
+        verified = False
+
+    if not verified:
+        print(f"  Rolling back to v{previous_version}...")
+        if _pip_install_version(previous_version, break_system=break_system):
+            print(f"  Rolled back to v{previous_version}. Update aborted.")
+        else:
+            print(f"  Rollback failed. Manual intervention required.")
+            print(f"  Try: pip install ftagent=={previous_version}")
+        return
+
+    print("  Updated successfully. Restart the agent to use the new version.")
+    print("  Run: systemctl restart ftagent")
 
 
 # ---------------------------------------------------------------------------
@@ -4687,34 +4768,69 @@ class Agent:
                     logger.info(
                         "Auto-update: newer version %s available (current %s), "
                         "upgrading...", latest, VERSION)
+                    previous_version = VERSION
                     import subprocess
                     pip_cmd = [sys.executable, "-m", "pip", "install",
                                "--upgrade", "ftagent"]
+                    break_system = False
                     result = subprocess.run(
                         pip_cmd, capture_output=True, text=True, timeout=120,
                     )
                     # Handle PEP 668 (externally managed Python on Debian 12+, Ubuntu 23.04+)
                     if result.returncode != 0 and "externally-managed-environment" in result.stderr:
                         pip_cmd.insert(-1, "--break-system-packages")
+                        break_system = True
                         result = subprocess.run(
                             pip_cmd, capture_output=True, text=True, timeout=120,
                         )
-                    if result.returncode == 0:
-                        logger.info(
-                            "Auto-update: ftagent upgraded to %s. "
-                            "Restarting service...", latest)
-                        # Auto-restart via systemd if running as service
-                        try:
-                            subprocess.run(
-                                ["systemctl", "restart", "ftagent"],
-                                capture_output=True, timeout=30,
-                            )
-                        except Exception:
-                            logger.info("Auto-update: restart ftagent manually to use v%s", latest)
-                    else:
+                    if result.returncode != 0:
                         logger.warning(
                             "Auto-update: pip upgrade failed: %s",
                             result.stderr.strip()[:500])
+                        continue
+
+                    # Post-install integrity verification
+                    verified = True
+
+                    # Verify installed version matches PyPI's advertised latest
+                    if not _verify_installed_version(latest):
+                        logger.warning(
+                            "Auto-update: version mismatch after install "
+                            "(expected %s)", latest)
+                        verified = False
+
+                    # Verify the module imports cleanly before restarting
+                    if not _verify_module_imports():
+                        logger.warning(
+                            "Auto-update: new version fails import check")
+                        verified = False
+
+                    if not verified:
+                        logger.warning(
+                            "Auto-update: verification failed, rolling back "
+                            "to v%s", previous_version)
+                        if _pip_install_version(previous_version, break_system):
+                            logger.info(
+                                "Auto-update: rolled back to v%s",
+                                previous_version)
+                        else:
+                            logger.error(
+                                "Auto-update: rollback to v%s failed, "
+                                "manual intervention required",
+                                previous_version)
+                        continue
+
+                    logger.info(
+                        "Auto-update: ftagent upgraded to %s (verified). "
+                        "Restarting service...", latest)
+                    # Auto-restart via systemd if running as service
+                    try:
+                        subprocess.run(
+                            ["systemctl", "restart", "ftagent"],
+                            capture_output=True, timeout=30,
+                        )
+                    except Exception:
+                        logger.info("Auto-update: restart ftagent manually to use v%s", latest)
             except Exception as exc:
                 logger.debug("Auto-update check failed: %s", exc)
 

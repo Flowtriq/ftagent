@@ -29,9 +29,10 @@ logger = logging.getLogger("ftagent.flow")
 # Constants
 # ════════════════════════════════════════════════��══════════════════════
 
-PROTO_TCP  = 6
-PROTO_UDP  = 17
-PROTO_ICMP = 1
+PROTO_TCP    = 6
+PROTO_UDP    = 17
+PROTO_ICMP   = 1
+PROTO_ICMPV6 = 58
 
 DEFAULT_PORTS = {
     "sflow":      6343,
@@ -233,10 +234,12 @@ def _parse_sflow_raw_header(data: bytes, offset: int, length: int,
         ethertype = struct.unpack_from("!H", hdr, 16)[0]
         ip_offset = 18
 
-    if ethertype != 0x0800:  # Only IPv4 for now
+    if ethertype == 0x0800:
+        return _parse_ip_header(hdr, ip_offset, frame_length, sampling_rate)
+    elif ethertype == 0x86DD:
+        return _parse_ipv6_header(hdr, ip_offset, frame_length, sampling_rate)
+    else:
         return None
-
-    return _parse_ip_header(hdr, ip_offset, frame_length, sampling_rate)
 
 
 def _parse_ip_header(hdr: bytes, ip_offset: int, frame_length: int,
@@ -268,7 +271,45 @@ def _parse_ip_header(hdr: bytes, ip_offset: int, frame_length: int,
     )
 
 
-# ─── NetFlow v5 ───────────��────────────────────────────────────────
+def _parse_ipv6_header(hdr: bytes, ip_offset: int, frame_length: int,
+                       sampling_rate: int) -> Optional[FlowRecord]:
+    """Parse IPv6 + transport header from raw bytes.
+
+    IPv6 fixed header is 40 bytes:
+      Bytes  0-3:  version(4b) + traffic class(8b) + flow label(20b)
+      Bytes  4-5:  payload length
+      Byte   6:    next header (protocol: 6=TCP, 17=UDP, 58=ICMPv6)
+      Byte   7:    hop limit
+      Bytes  8-23: source address (128 bits)
+      Bytes 24-39: destination address (128 bits)
+
+    We use the first next-header value directly (no extension header traversal).
+    """
+    if len(hdr) < ip_offset + 40:
+        return None
+
+    next_header = hdr[ip_offset + 6]
+    src_ip = socket.inet_ntop(socket.AF_INET6, hdr[ip_offset + 8:ip_offset + 24])
+    dst_ip = socket.inet_ntop(socket.AF_INET6, hdr[ip_offset + 24:ip_offset + 40])
+
+    src_port = dst_port = tcp_flags = 0
+    transport_offset = ip_offset + 40
+
+    if next_header == PROTO_TCP and len(hdr) >= transport_offset + 14:
+        src_port, dst_port = struct.unpack_from("!HH", hdr, transport_offset)
+        tcp_flags = hdr[transport_offset + 13]
+    elif next_header == PROTO_UDP and len(hdr) >= transport_offset + 4:
+        src_port, dst_port = struct.unpack_from("!HH", hdr, transport_offset)
+
+    return FlowRecord(
+        src_ip=src_ip, dst_ip=dst_ip, src_port=src_port, dst_port=dst_port,
+        protocol=next_header, packets=sampling_rate,
+        octets=frame_length * sampling_rate,
+        tcp_flags=tcp_flags, sample_rate=sampling_rate,
+    )
+
+
+# ─── NetFlow v5 ───────────────────────────────────────────────────
 
 _NFV5_HEADER = struct.Struct("!HHIIIIBBh")  # 24 bytes
 _NFV5_RECORD = struct.Struct("!4s4s4sHHIIIIHHxBBBHHBB2x")  # 48 bytes
@@ -643,7 +684,7 @@ class FlowAggregator:
                         self._tcp_flags["URG"] += rec.packets
                 elif rec.protocol == PROTO_UDP:
                     self._udp_packets += rec.packets
-                elif rec.protocol == PROTO_ICMP:
+                elif rec.protocol in (PROTO_ICMP, PROTO_ICMPV6):
                     self._icmp_packets += rec.packets
 
                 if rec.src_ip:
@@ -677,7 +718,7 @@ class FlowAggregator:
                         if rec.tcp_flags & 0x20: dst["tcp_flags"]["URG"] += rec.packets
                     elif rec.protocol == PROTO_UDP:
                         dst["udp"] += rec.packets
-                    elif rec.protocol == PROTO_ICMP:
+                    elif rec.protocol in (PROTO_ICMP, PROTO_ICMPV6):
                         dst["icmp"] += rec.packets
                     if rec.src_ip and (len(dst["src_ips"]) < 5000 or rec.src_ip in dst["src_ips"]):
                         dst["src_ips"][rec.src_ip] = dst["src_ips"].get(rec.src_ip, 0) + rec.packets
