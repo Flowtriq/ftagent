@@ -13,6 +13,7 @@ import math
 import os
 import re
 import signal
+import shlex
 import struct
 import sys
 import threading
@@ -1667,8 +1668,8 @@ class PcapCapture:
         Full-fidelity capture of every packet at any PPS."""
         import subprocess
         ring_dir = os.path.join(self.pcap_dir, "_ring")
-        os.makedirs(ring_dir, mode=0o777, exist_ok=True)
-        os.chmod(ring_dir, 0o777)  # writable by any user (tcpdump may drop privs)
+        os.makedirs(ring_dir, mode=0o700, exist_ok=True)
+        os.chmod(ring_dir, 0o700)
         self._ring_dir = ring_dir
 
         # Clean up any orphaned ring files from previous runs on startup
@@ -2393,7 +2394,10 @@ class L7Monitor:
                 self.file = None
                 self.open()
         except OSError:
-            pass
+            # Log file was deleted, not just rotated
+            if self.file:
+                self.file.close()
+            self.file = None
 
         new_lines = []
         try:
@@ -5213,7 +5217,7 @@ class Agent:
             "iptables ", "ip6tables ", "ipset ", "sysctl ",
             "nft ", "ufw ", "firewall-cmd ", "tc ", "ip route ",
             "fail2ban-client ", "nginx ", "apache2ctl ",
-            "echo ", "sed ", "rm -f /etc/nginx/conf.d/ft_",
+            "rm -f /etc/nginx/conf.d/ft_",
             "rm -f /etc/apache2/conf-enabled/ft_",
             "for cc in ",
         )
@@ -5229,9 +5233,8 @@ class Agent:
                 errors.append(f"Blocked unsafe command: {line}")
                 logger.warning("Blocked unsafe command: %s", line)
                 continue
-            # Block semicolons and backticks - the most dangerous injection vectors
-            # (&&, |, $, > are allowed as they're used in legitimate templates)
-            if ';' in line or '`' in line:
+            # Block shell metacharacters that enable injection
+            if ';' in line or '`' in line or '$' in line or '|' in line or '>' in line or '<' in line:
                 errors.append(f"Blocked command with shell injection chars: {line}")
                 logger.warning("Blocked shell injection in command: %s", line)
                 continue
@@ -5278,7 +5281,7 @@ class Agent:
             try:
                 import subprocess
                 result = subprocess.run(
-                    line, shell=True, capture_output=True, text=True,
+                    shlex.split(line), capture_output=True, text=True,
                     timeout=30,
                 )
                 if result.returncode == 0:

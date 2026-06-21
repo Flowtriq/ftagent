@@ -299,7 +299,7 @@ class TestPerIPBaselineManager(unittest.TestCase):
         self.assertAlmostEqual(bl_b["avg_pps"], 100, delta=10)
 
     def test_check_with_baseline(self):
-        """After baseline is established, check should use p99 x 3."""
+        """After baseline is established, check should use max(p99 x 3, 5000)."""
         mgr = PerIPBaselineManager(window=10)
         # Build a baseline at 100 PPS
         for _ in range(15):
@@ -307,10 +307,10 @@ class TestPerIPBaselineManager(unittest.TestCase):
 
         bl = mgr.get_baseline("10.0.0.1")
         self.assertTrue(bl["ready"])
-        # 100 * 3 = 300 threshold, so 500 should trigger
-        self.assertTrue(mgr.check("10.0.0.1", 500))
-        # 200 should not trigger
-        self.assertFalse(mgr.check("10.0.0.1", 200))
+        # threshold = max(100 * 3, 5000) = 5000, so 10000 should trigger
+        self.assertTrue(mgr.check("10.0.0.1", 10000))
+        # 3000 should not trigger (below 5000 floor)
+        self.assertFalse(mgr.check("10.0.0.1", 3000))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -320,17 +320,17 @@ class TestPerIPBaselineManager(unittest.TestCase):
 class TestDetectionLogic(unittest.TestCase):
 
     def test_per_ip_not_aggregate(self):
-        """50 IPs each at 500 PPS = 25K aggregate, but no single IP should trigger."""
+        """50 IPs each at 2000 PPS = 100K aggregate, but no single IP should trigger."""
         mgr = PerIPBaselineManager(window=10)
-        # Build baselines at 500 PPS
+        # Build baselines at 2000 PPS
         for _ in range(15):
             for i in range(50):
-                mgr.add(f"10.0.0.{i}", 500)
-        # Check: no IP should trigger at 500 PPS
+                mgr.add(f"10.0.0.{i}", 2000)
+        # Check: no IP should trigger at 2000 PPS
         for i in range(50):
-            self.assertFalse(mgr.check(f"10.0.0.{i}", 500))
-        # But one IP at 5000 PPS should trigger
-        self.assertTrue(mgr.check("10.0.0.0", 5000))
+            self.assertFalse(mgr.check(f"10.0.0.{i}", 2000))
+        # But one IP at 20000 PPS should trigger (above max(6000, 5000) = 6000)
+        self.assertTrue(mgr.check("10.0.0.0", 20000))
 
     def test_concurrent_incidents(self):
         """Two IPs under attack should get separate detection states."""
@@ -338,9 +338,9 @@ class TestDetectionLogic(unittest.TestCase):
         for _ in range(15):
             mgr.add("10.0.0.1", 100)
             mgr.add("10.0.0.2", 200)
-        # Both should trigger independently
-        self.assertTrue(mgr.check("10.0.0.1", 1000))
-        self.assertTrue(mgr.check("10.0.0.2", 2000))
+        # Both should trigger independently (threshold floor = 5000)
+        self.assertTrue(mgr.check("10.0.0.1", 10000))
+        self.assertTrue(mgr.check("10.0.0.2", 15000))
 
     def test_resolution_independence(self):
         """IP-A resolving should not affect IP-B's state."""
@@ -351,9 +351,9 @@ class TestDetectionLogic(unittest.TestCase):
             mgr.add("10.0.0.1", 100)
             mgr.add("10.0.0.2", 100)
 
-        # Both under attack
-        self.assertTrue(mgr.check("10.0.0.1", 1000))
-        self.assertTrue(mgr.check("10.0.0.2", 1000))
+        # Both under attack (must exceed 5000 floor)
+        self.assertTrue(mgr.check("10.0.0.1", 10000))
+        self.assertTrue(mgr.check("10.0.0.2", 10000))
 
         # IP-A drops back to normal
         for _ in range(5):
@@ -362,7 +362,7 @@ class TestDetectionLogic(unittest.TestCase):
         # IP-A should no longer trigger
         self.assertFalse(mgr.check("10.0.0.1", 100))
         # IP-B should still trigger
-        self.assertTrue(mgr.check("10.0.0.2", 1000))
+        self.assertTrue(mgr.check("10.0.0.2", 10000))
 
 
 # ═══════════════════════════════════════════════════════════════════════
