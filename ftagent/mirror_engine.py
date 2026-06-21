@@ -65,7 +65,7 @@ class IPStats:
     """Mutable accumulator for one destination IP in the current window."""
     __slots__ = ("packets", "octets", "tcp_packets", "udp_packets",
                  "icmp_packets", "src_ips", "dst_ports", "tcp_flags",
-                 "pkt_sizes")
+                 "pkt_sizes", "fragment_count")
 
     def __init__(self):
         self.packets: int = 0
@@ -73,6 +73,7 @@ class IPStats:
         self.tcp_packets: int = 0
         self.udp_packets: int = 0
         self.icmp_packets: int = 0
+        self.fragment_count: int = 0            # IP fragmented packets
         self.src_ips: dict[str, int] = {}       # src_ip -> packet count
         self.dst_ports: dict[int, int] = {}     # dst_port -> packet count
         self.tcp_flags: dict[str, int] = {
@@ -85,7 +86,8 @@ class IPSnapshot:
     """Immutable snapshot for one destination IP, produced by PerIPCounter.snapshot_and_reset()."""
     __slots__ = ("dst_ip", "pps", "bps", "tcp_pct", "udp_pct", "icmp_pct",
                  "src_ip_count", "top_src_ips", "top_dst_ports",
-                 "tcp_flags", "avg_pkt_size", "packets", "octets")
+                 "tcp_flags", "avg_pkt_size", "packets", "octets",
+                 "fragment_pct")
 
     def __init__(self, dst_ip: str, stats: IPStats):
         self.dst_ip = dst_ip
@@ -93,6 +95,8 @@ class IPSnapshot:
         self.octets = stats.octets
         self.pps = float(stats.packets)
         self.bps = float(stats.octets * 8)
+        self.fragment_pct = round(
+            stats.fragment_count / max(stats.packets, 1) * 100, 1)
 
         total_proto = stats.tcp_packets + stats.udp_packets + stats.icmp_packets
         if total_proto > 0:
@@ -140,7 +144,8 @@ class PerIPCounter:
 
     def record_packet(self, dst_ip: str, src_ip: str, protocol: int,
                       pkt_len: int, dst_port: int = 0,
-                      tcp_flags: int = 0) -> None:
+                      tcp_flags: int = 0,
+                      is_fragment: bool = False) -> None:
         """Record a single parsed packet. Called from capture worker threads."""
         with self._lock:
             self._total_packets += 1
@@ -157,6 +162,8 @@ class PerIPCounter:
 
             stats.packets += 1
             stats.octets += pkt_len
+            if is_fragment:
+                stats.fragment_count += 1
 
             if protocol == PROTO_TCP:
                 stats.tcp_packets += 1
@@ -272,6 +279,11 @@ def _parse_ipv4(data: bytes, offset: int, counter: PerIPCounter,
         return
 
     total_len = struct.unpack_from("!H", data, offset + 2)[0]
+    # IP flags and fragment offset (bytes 6-7): flags in top 3 bits, frag offset in lower 13
+    flags_frag = struct.unpack_from("!H", data, offset + 6)[0]
+    _mf_flag = bool(flags_frag & 0x2000)     # More Fragments flag
+    _frag_offset = flags_frag & 0x1FFF       # Fragment offset (in 8-byte units)
+    _is_fragment = _mf_flag or _frag_offset > 0
     protocol = data[offset + 9]
     src_ip = socket.inet_ntoa(data[offset + 12:offset + 16])
     dst_ip = socket.inet_ntoa(data[offset + 16:offset + 20])
@@ -324,6 +336,7 @@ def _parse_ipv4(data: bytes, offset: int, counter: PerIPCounter,
     counter.record_packet(
         dst_ip=dst_ip, src_ip=src_ip, protocol=protocol,
         pkt_len=total_len, dst_port=dst_port, tcp_flags=tcp_flags,
+        is_fragment=_is_fragment,
     )
 
 
@@ -377,10 +390,22 @@ def _parse_ipv6(data: bytes, offset: int, counter: PerIPCounter,
         except ValueError:
             return
 
-    # Extract L4 info (skip extension headers — use next_header directly)
+    # Traverse IPv6 extension headers to find the actual transport header
+    _IPV6_EXT_HEADERS = {0, 43, 44, 60}  # Hop-by-Hop, Routing, Fragment, Dest Opts
+    l4_offset = offset + 40
+    _ext_loops = 0
+    while next_header in _IPV6_EXT_HEADERS and _ext_loops < 10:
+        if l4_offset + 2 > len(data):
+            break
+        _ext_next = data[l4_offset]
+        _ext_len = data[l4_offset + 1]  # length in 8-byte units, not counting first 8
+        l4_offset += (_ext_len + 1) * 8
+        next_header = _ext_next
+        _ext_loops += 1
+
+    # Extract L4 info
     dst_port = 0
     tcp_flags = 0
-    l4_offset = offset + 40
 
     if next_header == PROTO_TCP and l4_offset + 14 <= len(data):
         dst_port = struct.unpack_from("!H", data, l4_offset + 2)[0]
@@ -435,9 +460,10 @@ class MirrorCaptureEngine:
             if not self._subnets:
                 self._subnets = None
 
-        # Stats
+        # Stats (counter lock protects increments across fanout workers)
         self._packets_captured = 0
         self._packets_errors = 0
+        self._counter_lock = threading.Lock()
         self._capture_start: float = 0.0
 
     def start(self, shutdown: threading.Event) -> None:
@@ -535,14 +561,17 @@ class MirrorCaptureEngine:
             except OSError:
                 if shutdown.is_set():
                     break
-                self._packets_errors += 1
+                with self._counter_lock:
+                    self._packets_errors += 1
                 continue
 
-            self._packets_captured += 1
+            with self._counter_lock:
+                self._packets_captured += 1
             try:
                 _parse_ethernet(data, counter, subnets, gre_strip)
             except Exception:
-                self._packets_errors += 1
+                with self._counter_lock:
+                    self._packets_errors += 1
 
         try:
             sock.close()
@@ -623,11 +652,13 @@ class MirrorCaptureEngine:
                 if len(pkt_data) < incl_len:
                     break
 
-                self._packets_captured += 1
+                with self._counter_lock:
+                    self._packets_captured += 1
                 try:
                     _parse_ethernet(pkt_data, counter, subnets, gre_strip)
                 except Exception:
-                    self._packets_errors += 1
+                    with self._counter_lock:
+                        self._packets_errors += 1
 
         except FileNotFoundError:
             logger.error("tcpdump not found. Install tcpdump for mirror capture.")

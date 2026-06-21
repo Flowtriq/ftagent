@@ -13,6 +13,7 @@ import math
 import os
 import re
 import signal
+import shlex
 import struct
 import sys
 import threading
@@ -21,7 +22,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.17"
+VERSION = "1.9.27"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -178,32 +179,113 @@ def check_for_updates(force: bool = False, interactive: bool = True) -> None:
         pass  # Never let update check break the agent
 
 
+def _verify_installed_version(expected_version: str) -> bool:
+    """Verify the installed ftagent version matches what we expected from PyPI."""
+    try:
+        import importlib.metadata
+        # Force re-read by clearing any cached data
+        installed = importlib.metadata.version("ftagent")
+        if installed == expected_version:
+            return True
+        logger.warning(
+            "Update verification: expected version %s but got %s",
+            expected_version, installed)
+        return False
+    except Exception as exc:
+        logger.warning("Update verification: cannot read installed version: %s", exc)
+        return False
+
+
+def _verify_module_imports() -> bool:
+    """Sanity-check that the new ftagent module loads without errors."""
+    import subprocess as _sp
+    result = _sp.run(
+        [sys.executable, "-c", "import ftagent.agent; print('ok')"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return result.returncode == 0 and "ok" in result.stdout
+
+
+def _pip_install_version(version: str, break_system: bool = False) -> bool:
+    """Install a specific ftagent version. Returns True on success."""
+    import subprocess as _sp
+    pip_cmd = [sys.executable, "-m", "pip", "install", f"ftagent=={version}"]
+    if break_system:
+        pip_cmd.insert(-1, "--break-system-packages")
+    result = _sp.run(pip_cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0 and "externally-managed-environment" in result.stderr and not break_system:
+        return _pip_install_version(version, break_system=True)
+    return result.returncode == 0
+
+
+def _get_pypi_latest_version() -> str | None:
+    """Query PyPI for the latest ftagent version string."""
+    import urllib.request
+    import json as _json
+    try:
+        req = urllib.request.Request(
+            "https://pypi.org/pypi/ftagent/json",
+            headers={"User-Agent": f"ftagent/{VERSION}"})
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = _json.loads(resp.read())
+        return data.get("info", {}).get("version", "") or None
+    except Exception:
+        return None
+
+
 def _do_pip_upgrade() -> None:
-    """Run pip upgrade, handling --break-system-packages for PEP 668."""
+    """Run pip upgrade with post-install integrity verification."""
     import subprocess as _sp
 
+    previous_version = VERSION
+    # Determine what PyPI says is latest before we install
+    pypi_latest = _get_pypi_latest_version()
+
     pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "ftagent"]
+    break_system = False
 
     print("  Updating ftagent...")
-    result = _sp.run(pip_cmd, capture_output=True, text=True)
-
-    if result.returncode == 0:
-        print("  Updated successfully. Restart the agent to use the new version.")
-        print("  Run: systemctl restart ftagent")
-        return
+    result = _sp.run(pip_cmd, capture_output=True, text=True, timeout=120)
 
     # PEP 668: externally managed Python (Debian 12+, Ubuntu 23.04+)
-    if "externally-managed-environment" in result.stderr:
+    if result.returncode != 0 and "externally-managed-environment" in result.stderr:
         print("  System Python detected. Retrying with --break-system-packages...")
         pip_cmd.insert(-1, "--break-system-packages")
-        result = _sp.run(pip_cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print("  Updated successfully. Restart the agent to use the new version.")
-            print("  Run: systemctl restart ftagent")
-            return
+        break_system = True
+        result = _sp.run(pip_cmd, capture_output=True, text=True, timeout=120)
 
-    print(f"  Update failed: {result.stderr.strip()}")
-    print("  Try manually: pip install --upgrade ftagent")
+    if result.returncode != 0:
+        print(f"  Update failed: {result.stderr.strip()}")
+        print("  Try manually: pip install --upgrade ftagent")
+        return
+
+    # Post-install verification
+    verified = True
+
+    # 1. Verify installed version matches PyPI's advertised latest
+    if pypi_latest:
+        if not _verify_installed_version(pypi_latest):
+            print(f"  WARNING: Version mismatch after install (expected {pypi_latest})")
+            verified = False
+    else:
+        print("  WARNING: Could not query PyPI to verify target version")
+
+    # 2. Verify the module imports cleanly
+    if not _verify_module_imports():
+        print("  WARNING: New version fails to import")
+        verified = False
+
+    if not verified:
+        print(f"  Rolling back to v{previous_version}...")
+        if _pip_install_version(previous_version, break_system=break_system):
+            print(f"  Rolled back to v{previous_version}. Update aborted.")
+        else:
+            print(f"  Rollback failed. Manual intervention required.")
+            print(f"  Try: pip install ftagent=={previous_version}")
+        return
+
+    print("  Updated successfully. Restart the agent to use the new version.")
+    print("  Run: systemctl restart ftagent")
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +620,9 @@ class APIClient:
             resp = self.session.post(
                 f"{self.base}/agent/heartbeat",
                 json={"version": VERSION, "baseline_ready": False,
-                      "baseline_avg_pps": 0, "baseline_p99_pps": 0},
+                      "baseline_avg_pps": 0, "baseline_p99_pps": 0,
+                      "baseline_hourly_ready": False,
+                      "baseline_current_hour_p99": 0},
                 timeout=10,
             )
             resp.raise_for_status()
@@ -648,9 +732,18 @@ class PPSMonitor:
 
         # /proc/net/tcp is expensive (kernel serializes full socket table).
         # Read every 15s instead of every tick — not needed for detection.
+        # Auto-scale interval: if server has many connections, read less often
+        # to avoid CPU spikes (100K+ conns can take 50-100ms to enumerate).
         if now - self._last_conn_read >= self._conn_count_interval:
             self.conn_count = self._read_conn_count()
             self._last_conn_read = now
+            # Back off to 60s if server has many connections
+            if self.conn_count > 50000:
+                self._conn_count_interval = 60
+            elif self.conn_count > 10000:
+                self._conn_count_interval = 30
+            else:
+                self._conn_count_interval = 15
 
         self.prev_rx_packets = rx_packets
         self.prev_rx_bytes = rx_bytes
@@ -701,11 +794,15 @@ class PPSMonitor:
 
     @staticmethod
     def _read_conn_count() -> int:
+        # Reading /proc/net/tcp line-by-line is expensive on busy servers
+        # (kernel serializes the full socket table). Use a bulk read + count
+        # newlines instead, which is ~3x faster on servers with 100K+ conns.
         count = 0
         for path in ("/proc/net/tcp", "/proc/net/tcp6"):
             try:
-                with open(path) as f:
-                    count += sum(1 for _ in f) - 1
+                with open(path, "rb") as f:
+                    buf = f.read()
+                    count += buf.count(b"\n") - 1  # subtract header line
             except OSError:
                 pass
         return max(count, 0)
@@ -719,7 +816,15 @@ class BaselineManager:
     _RECALC_EVERY = 10  # recalculate percentiles every N samples
     # Use a low default floor (150 PPS) only before baseline is established.
     # Once baseline is ready, threshold is purely data-driven (p99 * 3).
-    _DEFAULT_FLOOR = 150
+    _DEFAULT_FLOOR = 5000
+    # Minimum threshold after baseline is ready. Even if p99 * 3 is lower,
+    # never trigger below this. A 500 PPS spike on a 100 PPS server is normal
+    # traffic variation, not a DDoS attack.
+    _MIN_READY_THRESHOLD = 5000
+    # Hourly baseline: samples needed per hour bucket before it's trusted.
+    _HOURLY_MIN_SAMPLES = 60
+    # Per-hour deque size: 360 samples = ~6 hours of data for each hour slot.
+    _HOURLY_WINDOW = 360
 
     def __init__(self, window: int = 300):
         self.WINDOW = window
@@ -731,6 +836,12 @@ class BaselineManager:
         self.baseline_ready = False
         self._since_recalc = 0
         self._running_sum = 0.0
+        # Time-of-day baselines: per-hour deques for adaptive thresholds
+        self._hourly_baselines: dict[int, collections.deque] = {
+            h: collections.deque(maxlen=self._HOURLY_WINDOW) for h in range(24)
+        }
+        self._hourly_p99: dict[int, float] = {}
+        self._hourly_ready: bool = False  # True once current hour has enough data
 
     def add(self, pps: float) -> None:
         # Track evicted sample for running sum
@@ -738,6 +849,11 @@ class BaselineManager:
             self._running_sum -= self.samples[0]
         self.samples.append(pps)
         self._running_sum += pps
+
+        # Feed into the hourly bucket for time-of-day awareness
+        current_hour = datetime.now().hour
+        self._hourly_baselines[current_hour].append(pps)
+
         n = len(self.samples)
         if n < 2:
             return
@@ -751,15 +867,45 @@ class BaselineManager:
             sorted_s = sorted(self.samples)
             self.p95_pps = sorted_s[int(n * 0.95)]
             self.p99_pps = sorted_s[int(n * 0.99)]
-            # Before baseline is ready, use a low floor so low-traffic nodes
-            # can still detect attacks. Once ready, go purely data-driven.
-            if self.baseline_ready:
-                self.threshold = self.p99_pps * 3
+
+            # Compute hourly p99 for the current hour if enough samples
+            hourly_samples = self._hourly_baselines[current_hour]
+            hourly_n = len(hourly_samples)
+            hour_has_data = hourly_n >= self._HOURLY_MIN_SAMPLES
+            self._hourly_ready = hour_has_data
+
+            if hour_has_data:
+                sorted_h = sorted(hourly_samples)
+                hourly_p99 = sorted_h[int(hourly_n * 0.99)]
+                self._hourly_p99[current_hour] = hourly_p99
+                # Hourly p99 drives the threshold, but never below half of
+                # the flat p99 to avoid dangerously low thresholds.
+                effective_p99 = max(hourly_p99, self.p99_pps * 0.5)
             else:
-                self.threshold = max(self.p99_pps * 3, self._DEFAULT_FLOOR)
+                effective_p99 = self.p99_pps
+
+            # Before baseline is ready, use a default floor so low-traffic nodes
+            # can still detect attacks. Once ready, use data-driven threshold
+            # but never go below _MIN_READY_THRESHOLD -- a tiny spike on a
+            # quiet server is not a DDoS attack.
+            if self.baseline_ready:
+                self.threshold = max(effective_p99 * 3, self._MIN_READY_THRESHOLD)
+            else:
+                self.threshold = max(effective_p99 * 3, self._DEFAULT_FLOOR)
 
         if n >= self.WINDOW:
             self.baseline_ready = True
+
+    @property
+    def hourly_ready(self) -> bool:
+        """Whether the current hour's bucket has enough samples."""
+        return self._hourly_ready
+
+    @property
+    def current_hour_p99(self) -> float:
+        """P99 for the current hour, or 0.0 if not enough data yet."""
+        current_hour = datetime.now().hour
+        return self._hourly_p99.get(current_hour, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -887,12 +1033,14 @@ class TrafficAnalyser:
         self.tcp_flags = {"SYN": 0, "ACK": 0, "RST": 0, "FIN": 0,
                           "PSH": 0, "URG": 0}
         self.src_ips: dict = {}        # ip -> count
-        self.src_ip_detail: dict = {}  # ip -> {tcp, udp, icmp, syn, ack, bytes, ttls}
+        self.src_ip_detail: dict = {}  # ip -> {tcp, udp, icmp, other, syn, ack, bytes, ttls}
         self.dst_ports: dict = {}
+        self.src_ports: dict = {}      # source port -> count (for amplification detection)
         self.pkt_lengths: list = []
         self.ttl_values: list = []
         self.dns_queries: dict = {}
         self.total_packets = 0
+        self.fragment_count = 0        # IP fragmented packets (MF flag or frag offset > 0)
         self.ioc_hits: list = []
         self._src_ip_overflow = False   # flag: True once we hit cap
         # Per-VM tracking (Feature 2): inner dst IP after GRE decapsulation
@@ -952,6 +1100,10 @@ class TrafficAnalyser:
             ip = stats_pkt[IP]
             src = ip.src
 
+            # Track IP fragments (MF flag set or fragment offset > 0)
+            if ip.flags.MF or ip.frag > 0:
+                self.fragment_count += 1
+
             # Bounded src_ips: only track new IPs if under cap
             if src in self.src_ips:
                 self.src_ips[src] += 1
@@ -971,7 +1123,7 @@ class TrafficAnalyser:
             if src in self.src_ip_detail:
                 d = self.src_ip_detail[src]
             elif len(self.src_ip_detail) < self.MAX_SRC_IPS:
-                d = {"tcp": 0, "udp": 0, "icmp": 0, "syn": 0, "ack": 0, "bytes": 0, "ttls": set()}
+                d = {"tcp": 0, "udp": 0, "icmp": 0, "other": 0, "syn": 0, "ack": 0, "bytes": 0, "ttls": set()}
                 self.src_ip_detail[src] = d
             else:
                 d = None
@@ -984,6 +1136,7 @@ class TrafficAnalyser:
             if stats_pkt.haslayer(TCP):
                 tcp = stats_pkt[TCP]
                 self.dst_ports[tcp.dport] = self.dst_ports.get(tcp.dport, 0) + 1
+                self.src_ports[tcp.sport] = self.src_ports.get(tcp.sport, 0) + 1
                 if d is not None:
                     d["tcp"] += 1
                 flags = tcp.flags
@@ -1005,12 +1158,19 @@ class TrafficAnalyser:
             elif stats_pkt.haslayer(UDP):
                 self.dst_ports[stats_pkt[UDP].dport] = (
                     self.dst_ports.get(stats_pkt[UDP].dport, 0) + 1)
+                self.src_ports[stats_pkt[UDP].sport] = (
+                    self.src_ports.get(stats_pkt[UDP].sport, 0) + 1)
                 if d is not None:
                     d["udp"] += 1
 
             elif stats_pkt.haslayer(ICMP):
                 if d is not None:
                     d["icmp"] += 1
+
+            else:
+                # GRE/ESP/IPIP/other protocols
+                if d is not None:
+                    d["other"] += 1
 
             if stats_pkt.haslayer(DNS) and stats_pkt[DNS].qr == 0:
                 try:
@@ -1079,7 +1239,24 @@ class TrafficAnalyser:
         return self.ttl_entropy() < 1.5 and len(self.src_ips) > 100
 
     def botnet_detected(self) -> bool:
-        return len(self.src_ips) > 300
+        # Heuristic: many source IPs
+        if len(self.src_ips) > 300:
+            return True
+        # IOC-based: any botnet family signature matched
+        botnet_keywords = ("mirai", "gafgyt", "bashlite", "mozi", "xorddos",
+                           "muhstik", "tsunami", "kaiten", "hajime", "meris",
+                           "mantis", "fodcha", "botnet")
+        for hit in self.ioc_hits:
+            if any(kw in hit.lower() for kw in botnet_keywords):
+                return True
+        return False
+
+    def blocklist_ratio(self) -> float:
+        """Fraction of source IPs that match the threat intel blocklist."""
+        if not self.src_ips or not hasattr(self, '_blocklist') or not self._blocklist:
+            return 0.0
+        matched = sum(1 for ip in self.src_ips if ip in self._blocklist)
+        return matched / len(self.src_ips) if self.src_ips else 0.0
 
     def top_src_ips(self, n: int = 20) -> list:
         total = self.total_packets or 1
@@ -1134,22 +1311,37 @@ class TrafficAnalyser:
                 for p, c in sorted(self.dst_ports.items(),
                                    key=lambda x: x[1], reverse=True)[:n]]
 
+    def top_src_ports(self, n: int = 20) -> list:
+        return [{"port": p, "count": c}
+                for p, c in sorted(self.src_ports.items(),
+                                   key=lambda x: x[1], reverse=True)[:n]]
+
     def protocol_breakdown(self) -> dict:
         """Compute protocol percentages from actual packet inspection (scapy).
         This is authoritative — unlike /proc/net/snmp which misses dropped packets."""
-        tcp_total = udp_total = icmp_total = 0
+        tcp_total = udp_total = icmp_total = other_total = 0
         for d in self.src_ip_detail.values():
             tcp_total += d["tcp"]
             udp_total += d["udp"]
             icmp_total += d["icmp"]
-        grand = tcp_total + udp_total + icmp_total
+            other_total += d.get("other", 0)
+        grand = tcp_total + udp_total + icmp_total + other_total
+        frag_pct = round(self.fragment_count / max(self.total_packets, 1) * 100, 1)
         if grand == 0:
-            return {"tcp": 0, "udp": 0, "icmp": 0}
+            return {"tcp": 0, "udp": 0, "icmp": 0, "other": 0, "fragments": frag_pct}
         return {
             "tcp": round(tcp_total / grand * 100, 1),
             "udp": round(udp_total / grand * 100, 1),
             "icmp": round(icmp_total / grand * 100, 1),
+            "other": round(other_total / grand * 100, 1),
+            "fragments": frag_pct,
         }
+
+    def fragment_pct(self) -> float:
+        """Percentage of total packets that are IP fragments."""
+        if self.total_packets == 0:
+            return 0.0
+        return round(self.fragment_count / self.total_packets * 100, 1)
 
     def syn_ratio(self) -> float:
         """SYN ratio from captured TCP flags."""
@@ -1467,7 +1659,12 @@ class PcapCapture:
         self.ioc_matcher = ioc_matcher
         self._gre_decap = gre_decap
         self._hypervisor_mode = hypervisor_mode
-        self.ring_buffer: collections.deque = collections.deque(maxlen=1000)
+        # In Scapy mode, each packet object can be 1-50KB in memory.
+        # Keep ring buffer small (200) to limit memory to ~5-10MB.
+        # tcpdump mode writes to disk files, so this buffer is only used
+        # as a fallback for pre-attack packet capture in Scapy mode.
+        _ring_size = 200 if self.pcap_mode == "scapy" else 1000
+        self.ring_buffer: collections.deque = collections.deque(maxlen=_ring_size)
         self.capture_packets: list = []
         self._capture_lock = threading.Lock()
         self.capturing = False
@@ -1597,8 +1794,8 @@ class PcapCapture:
         Full-fidelity capture of every packet at any PPS."""
         import subprocess
         ring_dir = os.path.join(self.pcap_dir, "_ring")
-        os.makedirs(ring_dir, mode=0o777, exist_ok=True)
-        os.chmod(ring_dir, 0o777)  # writable by any user (tcpdump may drop privs)
+        os.makedirs(ring_dir, mode=0o700, exist_ok=True)
+        os.chmod(ring_dir, 0o700)
         self._ring_dir = ring_dir
 
         # Clean up any orphaned ring files from previous runs on startup
@@ -1662,12 +1859,19 @@ class PcapCapture:
                 stderr=subprocess.DEVNULL,
             )
             _restarts = 0
+            _last_start = time.monotonic()
             while not shutdown.is_set():
                 shutdown.wait(1)
                 if self._tcpdump_proc.poll() is not None:
-                    logger.warning("tcpdump exited (code %d)",
-                                   self._tcpdump_proc.returncode)
-                    _restarts += 1
+                    _ran_for = time.monotonic() - _last_start
+                    _exit_code = self._tcpdump_proc.returncode
+                    # Normal rotation: tcpdump -G exits cleanly after each interval
+                    if _exit_code == 0 and _ran_for >= 20:
+                        _restarts = 0  # reset — this was a healthy rotation, not a crash
+                    else:
+                        logger.warning("tcpdump exited (code %d, ran %.0fs)",
+                                       _exit_code, _ran_for)
+                        _restarts += 1
                     if _restarts > 5:
                         self._tcpdump_unavailable(
                             f"tcpdump crashed {_restarts} times consecutively.  "
@@ -1682,6 +1886,7 @@ class PcapCapture:
                         self._tcpdump_proc = subprocess.Popen(
                             tcpdump_cmd, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
+                        _last_start = time.monotonic()
 
             self._tcpdump_proc.terminate()
             try:
@@ -1807,6 +2012,19 @@ class PcapCapture:
             if pkt_count >= threshold:
                 self._flush_chunk()
 
+    def _check_disk_space(self, min_mb: int = 500) -> bool:
+        """Check if enough disk space is available for PCAP writes."""
+        try:
+            import shutil
+            usage = shutil.disk_usage(self.pcap_dir)
+            free_mb = usage.free // (1024 * 1024)
+            if free_mb < min_mb:
+                logger.warning("PCAP write skipped: only %d MB free (minimum %d MB)", free_mb, min_mb)
+                return False
+        except Exception:
+            pass  # If we can't check, proceed cautiously
+        return True
+
     def _flush_chunk(self) -> Optional[str]:
         """Write current packets to a chunk file and upload it."""
         start_idx = self._chunk_index * self._chunk_size
@@ -1814,6 +2032,8 @@ class PcapCapture:
         with self._capture_lock:
             chunk_pkts = self.capture_packets[start_idx:end_idx]
         if not chunk_pkts:
+            return None
+        if not self._check_disk_space():
             return None
         Path(self.pcap_dir).mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1992,6 +2212,8 @@ class PcapCapture:
             self.capture_packets = []
         if not packets_copy:
             return None
+        if not self._check_disk_space():
+            return None
         Path(self.pcap_dir).mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         filepath = os.path.join(self.pcap_dir, f"{incident_uuid}_{ts}.pcap")
@@ -2034,7 +2256,7 @@ WEB_SERVER_LOG_PATHS = {
 }
 
 LOG_PATTERN_COMBINED = re.compile(
-    r'^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"(\S+)\s+(\S+)\s+\S+"\s+(\d{3})\s+(\S+)'
+    r'^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"(\S+)\s+(\S+)\s+(HTTP/\S+)"\s+(\d{3})\s+(\S+)'
     r'(?:\s+"[^"]*"\s+"([^"]*)")?'
 )
 
@@ -2084,6 +2306,28 @@ L7_BOT_UA_PATTERNS = re.compile(
     r"zgrab|httpx|nuclei|dirsearch|gobuster|ffuf|wfuzz|"
     r"bot|spider|crawl|scan|attack|exploit|hack)", re.I)
 
+def _normalize_http_version(raw: str) -> str:
+    """Normalize HTTP protocol string to version shorthand.
+    'HTTP/1.1' -> '1.1', 'HTTP/2.0' -> '2', 'HTTP/3.0' -> '3', 'h2' -> '2', etc."""
+    if not raw:
+        return ""
+    r = raw.strip().upper()
+    if r.startswith("HTTP/"):
+        ver = r[5:]
+        # "2.0" -> "2", "3.0" -> "3", "1.1" stays "1.1", "1.0" stays "1.0"
+        if ver in ("2.0", "2"):
+            return "2"
+        if ver in ("3.0", "3"):
+            return "3"
+        return ver
+    r_low = raw.strip().lower()
+    if r_low in ("h2", "h2c"):
+        return "2"
+    if r_low in ("h3",):
+        return "3"
+    return ""
+
+
 # ── L7 subtype classification helpers ──
 def _classify_l7_subtype(stats: dict) -> str:
     """Classify L7 attack subtype from traffic characteristics."""
@@ -2096,6 +2340,36 @@ def _classify_l7_subtype(stats: dict) -> str:
 
     if not total:
         return "l7_flood"
+
+    # ── HTTP/2-specific attack pattern detection ──
+    h2_pct = stats.get("h2_pct", 0.0)
+    h3_pct = stats.get("h3_pct", 0.0)
+    status_499 = stats.get("status_499", 0)
+    rps_per_ip = stats.get("rps_per_ip", 0.0)
+
+    if h2_pct > 30:
+        # HTTP/2 Rapid Reset (CVE-2023-44487): extremely high RPS with many
+        # 499/client-closed responses from relatively few source IPs.
+        # Attackers open streams then immediately RST them.
+        status_499_pct = (status_499 / max(total, 1)) * 100
+        if rps > 200 and status_499_pct > 20 and rps_per_ip > 50:
+            return "h2_rapid_reset"
+
+        # HTTP/2 SETTINGS flood: few IPs generating extreme per-IP RPS
+        # via connection-level abuse (multiplexed streams)
+        if rps_per_ip > 200 and unique_ips < 20 and rps > 500:
+            return "h2_settings_flood"
+
+        # HTTP/2 CONTINUATION flood (CVE-2024-27983): few IPs, many
+        # 400-series errors from malformed continuation frames
+        status_4xx = stats.get("status_4xx", 0)
+        status_4xx_pct = (status_4xx / max(total, 1)) * 100
+        if rps_per_ip > 100 and unique_ips < 30 and status_4xx_pct > 40:
+            return "h2_continuation_flood"
+
+    # ── HTTP/3 (QUIC) flood detection ──
+    if h3_pct > 30 and rps > 300 and unique_ips > 5:
+        return "quic_flood"
 
     # Single source abuse
     if unique_ips <= 2 and total > 50:
@@ -2218,6 +2492,7 @@ class L7Monitor:
         self._attack_path_totals: dict = {}
         self._attack_ip_totals: dict = {}
         self._attack_total_requests: int = 0
+        self._attack_version_totals: dict = {}  # HTTP version -> request count
 
     def open(self) -> bool:
         try:
@@ -2238,10 +2513,17 @@ class L7Monitor:
             current_inode = os.stat(self.log_path).st_ino
             if current_inode != self.inode:
                 logger.info("L7: log rotated, reopening %s", self.log_path)
-                self.file.close()
+                try:
+                    self.file.close()
+                except Exception:
+                    pass
+                self.file = None
                 self.open()
         except OSError:
-            pass
+            # Log file was deleted, not just rotated
+            if self.file:
+                self.file.close()
+            self.file = None
 
         new_lines = []
         try:
@@ -2253,7 +2535,7 @@ class L7Monitor:
         except (OSError, IOError):
             pass
 
-        now = time.time()
+        now = time.monotonic()
         for line in new_lines:
             parsed = self._parse_line(line)
             if parsed:
@@ -2296,8 +2578,12 @@ class L7Monitor:
                             resp_time = resp_time * 1000
                     except (ValueError, TypeError):
                         resp_time = None
+                # HTTP protocol version (e.g. "HTTP/2.0", "HTTP/1.1", "HTTP/3.0")
+                raw_proto = (d.get("server_protocol") or d.get("protocol")
+                             or d.get("httpVersion") or d.get("http_version") or "")
+                http_version = _normalize_http_version(raw_proto)
                 if ip and status:
-                    return (ip, method, path, status, size, ua, resp_time)
+                    return (ip, method, path, status, size, ua, resp_time, http_version)
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
             return None
@@ -2307,12 +2593,14 @@ class L7Monitor:
         if m:
             ip = m.group(1)
             method, path = m.group(3), m.group(4)
-            status = int(m.group(5))
-            size_str = m.group(6)
-            ua = m.group(7) or ""
+            raw_proto = m.group(5)  # e.g. "HTTP/1.1", "HTTP/2.0", "HTTP/3.0"
+            status = int(m.group(6))
+            size_str = m.group(7)
+            ua = m.group(8) or ""
             size = int(size_str) if size_str != "-" else 0
             path = path.split("?")[0] if "?" in path else path
-            return (ip, method, path, status, size, ua, None)
+            http_version = _normalize_http_version(raw_proto)
+            return (ip, method, path, status, size, ua, None, http_version)
         return None
 
     def _compute_stats(self, now: float) -> dict:
@@ -2327,15 +2615,27 @@ class L7Monitor:
         threat_hits: dict = {}
         resp_times: list = []
         bot_request_count = 0
+        version_counts: dict = {}  # HTTP version -> count ("1.1", "2", "3")
+        # HTTP/2 rapid reset heuristic: count 499/client-closed status codes
+        status_499_count = 0
 
         for req in self._requests:
             ts, ip, method, path, status, size, ua = req[0], req[1], req[2], req[3], req[4], req[5], req[6]
             resp_time = req[7] if len(req) > 7 else None
+            http_version = req[8] if len(req) > 8 else ""
 
             ip_counts[ip] = ip_counts.get(ip, 0) + 1
             path_counts[path] = path_counts.get(path, 0) + 1
             code_group = f"{status // 100}xx"
             status_counts[code_group] = status_counts.get(code_group, 0) + 1
+
+            # Track HTTP protocol version distribution
+            if http_version:
+                version_counts[http_version] = version_counts.get(http_version, 0) + 1
+
+            # Track 499 (nginx client closed request) for rapid reset detection
+            if status == 499:
+                status_499_count += 1
 
             # User-Agent tracking
             if ua:
@@ -2365,6 +2665,16 @@ class L7Monitor:
         top_uas = sorted(ua_counts.items(), key=lambda x: x[1], reverse=True)[:20]
         avg_resp_ms = round(sum(resp_times) / len(resp_times), 1) if resp_times else None
 
+        # Protocol version distribution as percentages
+        version_total = sum(version_counts.values())
+        protocol_versions = {}
+        if version_total > 0:
+            for ver, cnt in version_counts.items():
+                protocol_versions[ver] = round(cnt / version_total * 100, 1)
+
+        # RPS per unique IP (for concurrency-based H2 attack detection)
+        rps_per_ip = rps / max(len(ip_counts), 1)
+
         return {
             "rps": round(rps, 1),
             "error_rate": round(error_rate, 1),
@@ -2380,6 +2690,11 @@ class L7Monitor:
             "avg_response_ms": avg_resp_ms,
             "status_5xx": status_counts.get("5xx", 0),
             "status_4xx": status_counts.get("4xx", 0),
+            "status_499": status_499_count,
+            "protocol_versions": protocol_versions,
+            "rps_per_ip": round(rps_per_ip, 1),
+            "h2_pct": protocol_versions.get("2", 0.0),
+            "h3_pct": protocol_versions.get("3", 0.0),
         }
 
     def check_attack(self, stats: dict) -> Optional[dict]:
@@ -2475,7 +2790,7 @@ class L7Monitor:
         # Need at least 2 signals AND multiple source IPs (single IP = scanner, not flood)
         if signals >= 2 and unique_ips >= 3 and not self._attack_active:
             self._attack_active = True
-            self._attack_start = time.time()
+            self._attack_start = time.monotonic()
             self._attack_peak_rps = rps
             self._below_count = 0
             self._reset_attack_accumulators()
@@ -2506,6 +2821,7 @@ class L7Monitor:
         self._attack_path_totals = {}
         self._attack_ip_totals = {}
         self._attack_total_requests = 0
+        self._attack_version_totals = {}
 
     def _capped_merge(self, target: dict, source: dict) -> None:
         """Merge counts into target dict, ignoring new keys once cap is hit."""
@@ -2524,12 +2840,25 @@ class L7Monitor:
         self._capped_merge(self._attack_status_totals, stats.get("status_codes", {}))
         self._capped_merge(self._attack_path_totals, stats.get("top_paths", {}))
         self._capped_merge(self._attack_ip_totals, stats.get("top_ips", {}))
+        # Accumulate protocol version counts (convert percentages back to counts)
+        pv = stats.get("protocol_versions", {})
+        total = stats.get("total_requests", 0)
+        if pv and total > 0:
+            for ver, pct in pv.items():
+                cnt = round(pct / 100 * total)
+                self._attack_version_totals[ver] = self._attack_version_totals.get(ver, 0) + cnt
 
     def get_attack_summary(self) -> dict:
         """Return accumulated attack-wide data for incident enrichment."""
         top_uas = sorted(self._attack_ua_counts.items(), key=lambda x: x[1], reverse=True)[:20]
         top_paths = sorted(self._attack_path_totals.items(), key=lambda x: x[1], reverse=True)[:20]
         top_ips = sorted(self._attack_ip_totals.items(), key=lambda x: x[1], reverse=True)[:50]
+        # Protocol version distribution as percentages
+        ver_total = sum(self._attack_version_totals.values())
+        protocol_versions = {}
+        if ver_total > 0:
+            for ver, cnt in self._attack_version_totals.items():
+                protocol_versions[ver] = round(cnt / ver_total * 100, 1)
         return {
             "top_user_agents": dict(top_uas),
             "threat_patterns": self._attack_threat_hits,
@@ -2537,13 +2866,14 @@ class L7Monitor:
             "top_paths": dict(top_paths),
             "top_ips": dict(top_ips),
             "total_requests": self._attack_total_requests,
+            "protocol_versions": protocol_versions,
         }
 
     def _check_attack_end(self, stats: dict) -> Optional[dict]:
         rps = stats["rps"]
         total = stats.get("total_requests", 0)
         error_rate = stats.get("error_rate", 0)
-        elapsed = time.time() - self._attack_start
+        elapsed = time.monotonic() - self._attack_start
 
         # Minimum 15s before allowing resolve to prevent rapid open/close flapping
         if elapsed < 15:
@@ -2593,7 +2923,12 @@ class L7Monitor:
 
 def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
                     syn_ratio: float = 0.0, dns_detected: bool = False,
-                    top_ports: list = None, tcp_flags: dict = None) -> str:
+                    top_ports: list = None, tcp_flags: dict = None,
+                    other_pct: float = 0.0,
+                    fragment_pct: float = 0.0) -> str:
+    # Fragment flood: overwhelmingly fragmented traffic is its own family
+    if fragment_pct > 50:
+        return "fragment_flood"
     if dns_detected:
         return "dns_flood"
     if udp_pct > 45:
@@ -2605,46 +2940,85 @@ def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
     elevated = sum(1 for v in (tcp_pct, udp_pct, icmp_pct) if v > 15)
     if elevated >= 2:
         return "multi_vector"
+    # GRE/ESP/IPIP/other protocol floods
+    if other_pct > 30:
+        return "protocol_flood"
     # Last resort: pick dominant protocol.
     if udp_pct >= tcp_pct and udp_pct >= icmp_pct and udp_pct > 5:
         return "udp_flood"
     if tcp_pct >= udp_pct and tcp_pct >= icmp_pct and tcp_pct > 5:
         if syn_ratio >= 0.3:
             return "syn_flood"
-        return "unknown"
+        return "tcp_flood"
     if icmp_pct > 5:
         return "icmp_flood"
+    # Try harder: classify by whichever protocol is non-zero
+    if tcp_pct > 0 or udp_pct > 0 or icmp_pct > 0 or other_pct > 0:
+        dominant = max(
+            ("tcp_flood", tcp_pct), ("udp_flood", udp_pct),
+            ("icmp_flood", icmp_pct), ("protocol_flood", other_pct),
+            key=lambda x: x[1],
+        )
+        return dominant[0]
     return "unknown"
 
 
 def classify_subtype(family: str, top_ports: list = None,
-                     tcp_flags: dict = None, avg_pkt_len: int = 0) -> str:
+                     tcp_flags: dict = None, avg_pkt_len: int = 0,
+                     src_ports: list = None, fragment_pct: float = 0.0) -> str:
     """Derive attack subtype from port/flag/size evidence."""
-    if not family or family == "unknown":
-        return ""
-
     ports = top_ports or []
     top_port = 0
     if ports:
         entry = ports[0]
         top_port = entry.get("port", 0) if isinstance(entry, dict) else int(entry)
 
+    # Source ports for amplification detection (reflectors respond FROM known ports)
+    _src_ports = src_ports or []
+    top_src_port = 0
+    if _src_ports:
+        entry = _src_ports[0]
+        top_src_port = entry.get("port", 0) if isinstance(entry, dict) else int(entry)
+
+    # ── Unknown/empty family: still try to classify from available evidence ──
+    if not family or family == "unknown":
+        if tcp_flags:
+            tcp_sub = classify_tcp_subtype(tcp_flags)
+            if tcp_sub:
+                return tcp_sub
+        if top_port or top_src_port:
+            # Check for amplification by source port
+            _amp_ports = {53: "dns_amplification", 123: "ntp_amplification",
+                          1900: "ssdp_amplification", 11211: "memcached_amplification",
+                          389: "cldap_amplification", 19: "chargen_amplification",
+                          161: "snmp_amplification", 3702: "wsd_amplification",
+                          5353: "mdns_amplification", 1194: "openvpn_amplification",
+                          3283: "apple_remote_amplification", 3389: "rdp_amplification"}
+            if top_src_port in _amp_ports:
+                return _amp_ports[top_src_port]
+            if top_port in _amp_ports:
+                return _amp_ports[top_port]
+        return ""
+
     # ── UDP subtypes ──
     if family == "udp_flood":
-        if top_port == 53:
-            return "dns_amplification"
-        if top_port == 123:
-            return "ntp_amplification"
-        if top_port == 1900:
-            return "ssdp_amplification"
-        if top_port == 11211:
-            return "memcached_amplification"
-        if top_port == 389:
-            return "cldap_amplification"
-        if top_port == 19:
-            return "chargen_amplification"
-        if top_port == 161:
-            return "snmp_amplification"
+        # Fragment flood: high percentage of IP fragments indicates fragmentation attack
+        if fragment_pct > 30:
+            return "udp_fragment_flood"
+        # QUIC flood: UDP port 443 is used by HTTP/3 over QUIC
+        if top_port == 443:
+            return "quic_flood"
+        _amp_ports = {53: "dns_amplification", 123: "ntp_amplification",
+                      1900: "ssdp_amplification", 11211: "memcached_amplification",
+                      389: "cldap_amplification", 19: "chargen_amplification",
+                      161: "snmp_amplification", 3702: "wsd_amplification",
+                      5353: "mdns_amplification", 1194: "openvpn_amplification",
+                      3283: "apple_remote_amplification", 3389: "rdp_amplification"}
+        # Check source ports first (amplification comes FROM reflector ports)
+        if top_src_port in _amp_ports:
+            return _amp_ports[top_src_port]
+        if top_port in _amp_ports:
+            return _amp_ports[top_port]
         if avg_pkt_len > 0 and avg_pkt_len < 100:
             return "small_packet_flood"
         if avg_pkt_len > 1200:
@@ -2653,11 +3027,42 @@ def classify_subtype(family: str, top_ports: list = None,
 
     # ── TCP subtypes (beyond SYN flood) ──
     if family == "syn_flood":
+        # Distinguish SYN vs SYN-ACK flood using flags
+        if tcp_flags:
+            total = sum(tcp_flags.values())
+            if total > 0:
+                syn_r = tcp_flags.get("SYN", 0) / total
+                ack_r = tcp_flags.get("ACK", 0) / total
+                if syn_r > 0.3 and ack_r > 0.3:
+                    return "syn_ack_flood"
         return "syn_flood"
+
+    # ── TCP flood (non-SYN dominant TCP) ──
+    if family == "tcp_flood":
+        if tcp_flags:
+            return classify_tcp_subtype(tcp_flags) or "tcp_generic"
+        return "tcp_generic"
+
+    # ── Multi-vector: identify dominant component ──
+    if family == "multi_vector":
+        if tcp_flags:
+            tcp_sub = classify_tcp_subtype(tcp_flags)
+            if tcp_sub:
+                return "multi_" + tcp_sub
+        # Check for amplification component via source ports
+        _amp_ports = {53: "dns_amplification", 123: "ntp_amplification",
+                      1900: "ssdp_amplification"}
+        if top_src_port in _amp_ports:
+            return "multi_" + _amp_ports[top_src_port]
+        if top_port in _amp_ports:
+            return "multi_" + _amp_ports[top_port]
+        return "multi_mixed"
 
     # ── DNS subtypes ──
     if family == "dns_flood":
         if top_port == 53 and avg_pkt_len > 512:
+            return "dns_amplification"
+        if top_src_port == 53 and avg_pkt_len > 512:
             return "dns_amplification"
         return "dns_query_flood"
 
@@ -2666,6 +3071,17 @@ def classify_subtype(family: str, top_ports: list = None,
         if avg_pkt_len > 1000:
             return "ping_of_death"
         return "ping_flood"
+
+    # ── Protocol flood (GRE/ESP/IPIP) ──
+    if family == "protocol_flood":
+        # Without deep protocol inspection, classify by common protocol floods
+        if tcp_flags:
+            return classify_tcp_subtype(tcp_flags) or "gre_flood"
+        return "gre_flood"
+
+    # ── Fragment flood ──
+    if family == "fragment_flood":
+        return "ip_fragment_flood"
 
     return ""
 
@@ -2683,8 +3099,18 @@ def classify_tcp_subtype(tcp_flags: dict) -> str:
     rst_r = tcp_flags.get("RST", 0) / total
     fin_r = tcp_flags.get("FIN", 0) / total
     psh_r = tcp_flags.get("PSH", 0) / total
+    urg_r = tcp_flags.get("URG", 0) / total
 
-    if rst_r > 0.5:
+    # XMAS flood: FIN+PSH+URG all elevated
+    if fin_r > 0.15 and psh_r > 0.15 and urg_r > 0.15:
+        return "xmas_flood"
+    # NULL flood: all flag ratios near zero but packets exist
+    if total > 0 and syn_r < 0.05 and ack_r < 0.05 and rst_r < 0.05 and fin_r < 0.05 and psh_r < 0.05:
+        return "null_flood"
+    # SYN-ACK flood: both SYN and ACK high
+    if syn_r > 0.3 and ack_r > 0.3:
+        return "syn_ack_flood"
+    if rst_r > 0.4:
         return "rst_flood"
     if fin_r > 0.4:
         return "fin_flood"
@@ -2692,7 +3118,78 @@ def classify_tcp_subtype(tcp_flags: dict) -> str:
         return "ack_flood"
     if psh_r > 0.4 and ack_r > 0.3:
         return "psh_ack_flood"
-    return ""
+    # Fallback: if flags have data, return tcp_generic
+    return "tcp_generic"
+
+
+def enrich_from_ioc(ioc_hits: list, family: str, subtype: str) -> tuple:
+    """Enrich family/subtype/tool from IOC pattern matches.
+    Returns (family, subtype, attack_tool, confidence_boost)."""
+    if not ioc_hits:
+        return family, subtype, None, 0
+
+    # Count occurrences of each IOC pattern
+    hit_counts = {}
+    for hit in ioc_hits:
+        hit_counts[hit] = hit_counts.get(hit, 0) + 1
+
+    # Get the most frequent IOC hit
+    top_hit = max(hit_counts, key=hit_counts.get)
+    top_count = hit_counts[top_hit]
+
+    # Parse "Name:family" format
+    parts = top_hit.split(":", 1)
+    ioc_name = parts[0].strip().lower()
+    ioc_family = parts[1].strip() if len(parts) > 1 else ""
+
+    attack_tool = None
+    confidence_boost = min(top_count, 30)  # Up to +30 confidence from IOC matches
+
+    # Map IOC names to tools and subtypes
+    tool_map = {
+        "mirai": ("mirai_botnet", "Mirai"),
+        "gafgyt": ("gafgyt_botnet", "Gafgyt"),
+        "bashlite": ("gafgyt_botnet", "Bashlite"),
+        "mozi": ("mozi_botnet", "Mozi"),
+        "xorddos": ("xorddos_botnet", "XorDDoS"),
+        "muhstik": ("muhstik_botnet", "Muhstik"),
+        "tsunami": ("tsunami_botnet", "Tsunami/Kaiten"),
+        "kaiten": ("tsunami_botnet", "Kaiten"),
+        "hajime": ("hajime_botnet", "Hajime"),
+        "meris": ("meris_botnet", "Meris"),
+        "mantis": ("mantis_botnet", "Mantis"),
+        "fodcha": ("fodcha_botnet", "Fodcha"),
+        "loic": ("loic", "LOIC"),
+        "hoic": ("hoic", "HOIC"),
+        "mhddos": ("mhddos", "MHDDoS"),
+        "slowloris": ("slowloris", "Slowloris"),
+        "goldeneye": ("goldeneye", "GoldenEye"),
+        "hulk": ("hulk", "HULK"),
+        "xerxes": ("xerxes", "Xerxes"),
+        "hping": ("hping", "hping"),
+        "rudy": ("rudy", "R.U.D.Y."),
+        "ntp monlist": ("ntp_amplification", None),
+        "ssdp": ("ssdp_amplification", None),
+        "memcached": ("memcached_amplification", None),
+        "cldap": ("cldap_amplification", None),
+        "chargen": ("chargen_amplification", None),
+        "dns amplification": ("dns_amplification", None),
+        "stresser": ("booter_service", None),
+        "booter": ("booter_service", None),
+    }
+
+    for keyword, (mapped_subtype, tool) in tool_map.items():
+        if keyword in ioc_name:
+            if not subtype or subtype in ("volumetric", "syn_flood", "ping_flood", "tcp_generic"):
+                subtype = mapped_subtype
+            attack_tool = tool
+            break
+
+    # If IOC specified a family and ours is generic, prefer the IOC's
+    if ioc_family and ioc_family != "unknown" and family in ("unknown", ""):
+        family = ioc_family
+
+    return family, subtype, attack_tool, confidence_boost
 
 
 # ---------------------------------------------------------------------------
@@ -2722,8 +3219,6 @@ class HealthCheckHandler:
                     "current_pps": round(agent_ref.monitor.pps, 1),
                     "current_bps": round(agent_ref.monitor.bps, 1),
                     "baseline_ready": agent_ref.baseline.baseline_ready,
-                    "baseline_avg_pps": round(agent_ref.baseline.avg_pps, 1),
-                    "baseline_threshold": round(agent_ref.threshold, 1),
                     "attack_active": agent_ref.attacking,
                     "incident_uuid": agent_ref.incident_uuid or None,
                 }).encode()
@@ -2768,7 +3263,7 @@ class ServicePortDetector:
         self.ports: list = []           # [{"protocol":"tcp","port_value":"80,443"}]
         self.sensitivity = "standard"
         self.pps_threshold = 100
-        self.response_mode = "full"     # onnode, pipeline, full
+        self.response_mode = "full"     # monitor, onnode, pipeline, full
         self.block_cooldown = 300       # seconds
         self.block_scope = "non_service"
         self._rules_installed = False
@@ -2785,9 +3280,41 @@ class ServicePortDetector:
         self.blocked_pps = 0
         self._prev_blocked_pkts = 0
         self._attacking = False
+        self._sp_below_count = 0  # hysteresis: require N ticks below threshold
         self._attack_sources: list = []
         self._config_version = ""
         self.ip_safelist: set = set()
+        self._auto_safelist: set = set()  # auto-detected: localhost, own IPs
+        self.min_block_pps = 10  # minimum PPS from a source before blocking
+
+    def detect_local_ips(self) -> None:
+        """Detect local IPs and add to auto-safelist. Called once on startup."""
+        import subprocess
+        safe = {"127.0.0.1", "127.0.0.53"}  # always protect localhost
+        try:
+            r = subprocess.run(
+                ["ip", "-4", "addr", "show"],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    line = line.strip()
+                    if line.startswith("inet "):
+                        # "inet 192.168.1.5/24 brd ..."
+                        addr_cidr = line.split()[1]
+                        ip = addr_cidr.split("/")[0]
+                        safe.add(ip)
+                        # Also add /24 subnet neighbors
+                        parts = ip.split(".")
+                        if len(parts) == 4:
+                            prefix = ".".join(parts[:3]) + "."
+                            for i in range(256):
+                                safe.add(prefix + str(i))
+        except Exception as e:
+            logger.debug("Auto-safelist IP detection: %s", e)
+        self._auto_safelist = safe
+        if safe:
+            logger.info("Auto-safelist: %d local IPs/subnet IPs protected",
+                        len(safe))
 
     def configure(self, sp_cfg: dict) -> None:
         """Apply config from server. Rebuilds accounting rules if ports changed."""
@@ -3060,10 +3587,10 @@ class ServicePortDetector:
         Uses conntrack or ss to find active connections to non-service ports."""
         import subprocess
 
-        # Build a set of service ports for filtering
+        # Build a set of service ports for filtering + combined safelist
         with self._lock:
             ports_snapshot = list(self.ports)
-            safelist_snapshot = set(self.ip_safelist)
+            safelist_snapshot = self.ip_safelist | self._auto_safelist
 
         service_ports = set()
         for entry in ports_snapshot:
@@ -3178,9 +3705,15 @@ class ServicePortDetector:
                 ip = src.get("ip", "")
                 if not ip or ip in self._block_rules:
                     continue
-                # Never block safelisted IPs
-                if ip in self.ip_safelist:
+                # Never block safelisted or local IPs
+                if ip in self.ip_safelist or ip in self._auto_safelist:
                     logger.info("Service port block skipped (safelisted): %s", ip)
+                    continue
+                # Require minimum PPS before blocking (don't block 1-2 PPS noise)
+                src_pps = src.get("pps", 0)
+                if src_pps < self.min_block_pps:
+                    logger.debug("Service port block skipped (pps=%d < min %d): %s",
+                                 src_pps, self.min_block_pps, ip)
                     continue
 
                 if self.block_scope == "non_service":
@@ -3355,6 +3888,7 @@ class Agent:
 
         # Service Port Detection
         self.sp_detector = ServicePortDetector()
+        self.sp_detector.detect_local_ips()
         self._sp_last_metrics_push: float = 0.0
         self._sp_metrics_interval = 5  # push split metrics every 5s
 
@@ -3374,6 +3908,12 @@ class Agent:
         self._metrics_buffer: list = []
         self._last_metrics_push: float = 0.0
         self._start_mono: float = time.monotonic()
+
+        # Startup grace period: suppress attack detection for the first 90 seconds
+        # so the baseline has time to warm up. Without this, normal traffic spikes
+        # during startup (cache warming, log rotation, backup flush) can trigger
+        # false positives that erode user trust in the first few minutes.
+        self._STARTUP_GRACE_SECONDS = 90
 
         # Command deduplication: track executed command IDs
         self._executed_command_ids: set = set()
@@ -3398,11 +3938,13 @@ class Agent:
                 "tcp": self.flow.aggregator.tcp_pct,
                 "udp": self.flow.aggregator.udp_pct,
                 "icmp": self.flow.aggregator.icmp_pct,
+                "other": 0,
             }
         return {
             "tcp": self.monitor.tcp_pct,
             "udp": self.monitor.udp_pct,
             "icmp": self.monitor.icmp_pct,
+            "other": 0,
         }
 
     def run(self) -> None:
@@ -3463,6 +4005,22 @@ class Agent:
                 capture_output=True, timeout=5)
         except Exception:
             pass
+
+        # Register atexit handler as backup cleanup for iptables/nft rules.
+        # Runs on normal exit and unhandled exceptions (not SIGKILL/OOM).
+        import atexit
+        def _atexit_cleanup():
+            try:
+                self.sp_detector.cleanup_stale()
+            except Exception:
+                pass
+            try:
+                subprocess.run(
+                    ["nft", "delete", "table", "inet", "flowtriq_xdp"],
+                    capture_output=True, timeout=5)
+            except Exception:
+                pass
+        atexit.register(_atexit_cleanup)
 
         self._fetch_config()
 
@@ -3626,10 +4184,16 @@ class Agent:
                     self._report_sp_blocks(blocked_sources)
 
             elif self.sp_detector._attacking and not self.sp_detector.check_threshold():
-                # Non-service traffic dropped below threshold
-                self.sp_detector._attacking = False
-                logger.info("Service port non-service traffic returned to normal (PPS=%d)",
-                            self.sp_detector.non_service_pps)
+                # Require 5 consecutive ticks below threshold (hysteresis)
+                self.sp_detector._sp_below_count += 1
+                if self.sp_detector._sp_below_count >= 5:
+                    self.sp_detector._attacking = False
+                    self.sp_detector._sp_below_count = 0
+                    logger.info("Service port non-service traffic returned to normal (PPS=%d)",
+                                self.sp_detector.non_service_pps)
+            elif self.sp_detector._attacking:
+                # Still above threshold, reset below counter
+                self.sp_detector._sp_below_count = 0
 
         if not self.attacking:
             # Two detection paths:
@@ -3639,9 +4203,23 @@ class Agent:
             #    This catches attacks on brand-new nodes before enough
             #    samples exist for a meaningful baseline.
             _absolute_floor = self.server_threshold or 10000
-            _trigger = pps > self.threshold
+            # Lower threshold when 30%+ of source IPs are known-bad (threat intel)
+            _effective_threshold = self.threshold
+            if self.analyser.blocklist_ratio() > 0.3:
+                _effective_threshold = self.threshold * 0.7
+            _trigger = pps > _effective_threshold
             if not self.baseline.baseline_ready and pps >= _absolute_floor:
                 _trigger = True
+
+            # Startup grace period: don't trigger during the first 90 seconds
+            # so the baseline can warm up. This prevents false positives from
+            # normal startup spikes (cache warming, log rotation, etc.).
+            # Exception: truly massive floods (>5x absolute floor) still trigger
+            # immediately because those are unambiguously attacks.
+            if _trigger and not self.baseline.baseline_ready:
+                uptime = time.monotonic() - self._start_mono
+                if uptime < self._STARTUP_GRACE_SECONDS and pps < _absolute_floor * 5:
+                    _trigger = False
 
             if _trigger:
                 # Flush buffered metrics immediately so the dashboard sees the spike
@@ -3748,8 +4326,8 @@ class Agent:
                     # Use the most recent ring file
                     latest = ring_files[-1]
                     out = subprocess.run(
-                        ["tcpdump", "-nn", "-r", latest, "-c", "500", "-q"],
-                        capture_output=True, text=True, timeout=10)
+                        ["tcpdump", "-nn", "-r", latest, "-c", "200", "-q"],
+                        capture_output=True, text=True, timeout=3)
                     for _tline in out.stdout.splitlines():
                         if "UDP" in _tline or "udp" in _tline:
                             _ring_udp += 1
@@ -3782,7 +4360,14 @@ class Agent:
             _init_icmp = self.monitor.icmp_pct
 
         family = classify_attack(_init_tcp, _init_udp, _init_icmp,
-                                 syn_ratio=_syn_est)
+                                 syn_ratio=_syn_est,
+                                 dns_detected=bool(self.analyser.dns_queries),
+                                 top_ports=self.analyser.top_dst_ports(),
+                                 tcp_flags=dict(self.analyser.tcp_flags),
+                                 fragment_pct=self.analyser.fragment_pct())
+        # Enrich classification with IOC threat intel
+        family, _init_subtype, _init_tool, _ = enrich_from_ioc(
+            self.analyser.ioc_hits, family, "")
         started_at = datetime.now(timezone.utc).isoformat()
 
         # Per-VM: identify which inner IP is being attacked (Feature 2)
@@ -3807,11 +4392,14 @@ class Agent:
             "peak_bps": round(self.peak_bps, 1),
             "started_at": started_at,
             "attack_family": family,
+            "attack_subtype": _init_subtype or None,
             "baseline_pps": round(self.baseline.avg_pps, 1),
             "duration": 0,
             # GRE / hypervisor metadata (Features 1 & 2)
             "gre_dedup_active": self.gre_decap.enabled,
         }
+        if _init_tool:
+            inc_data["attack_tool"] = _init_tool
         if target_vm_ip:
             inc_data["inner_ip"] = target_vm_ip
             label = self.vm_labels.get(target_vm_ip, "")
@@ -3918,7 +4506,13 @@ class Agent:
 
         family = "udp_flood"  # most non-service port attacks are UDP
         proto = self._proto_breakdown()
-        family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"])
+        family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"],
+                                 syn_ratio=self.analyser.syn_ratio(),
+                                 dns_detected=bool(self.analyser.dns_queries),
+                                 top_ports=self.analyser.top_dst_ports(),
+                                 tcp_flags=dict(self.analyser.tcp_flags),
+                                 other_pct=proto.get("other", 0.0),
+                                 fragment_pct=self.analyser.fragment_pct())
 
         started_at = datetime.now(timezone.utc).isoformat()
 
@@ -3993,7 +4587,17 @@ class Agent:
             self.velocity_curve[-1] = {"t": round(elapsed, 1), "pps": round(self.monitor.pps, 1)}
 
         proto = self._proto_breakdown()
-        family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"])
+        _frag_pct = self.analyser.fragment_pct()
+        family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"],
+                                 syn_ratio=self.analyser.syn_ratio(),
+                                 dns_detected=bool(self.analyser.dns_queries),
+                                 top_ports=self.analyser.top_dst_ports(),
+                                 tcp_flags=dict(self.analyser.tcp_flags),
+                                 other_pct=proto.get("other", 0.0),
+                                 fragment_pct=_frag_pct)
+        # Enrich classification with IOC threat intel
+        family, _upd_subtype, _upd_tool, _ = enrich_from_ioc(
+            self.analyser.ioc_hits, family, "")
 
         # Merge source IP data: use whichever source (scapy or flow) has more visibility
         _scapy_src_count = len(self.analyser.src_ips)
@@ -4014,6 +4618,7 @@ class Agent:
             "peak_pps": round(self.peak_pps, 1),
             "peak_bps": round(self.peak_bps, 1),
             "attack_family": family,
+            "attack_subtype": _upd_subtype or None,
             "protocol_breakdown": proto,
             "source_ip_count": _src_count,
             "total_packets": self.analyser.total_packets,
@@ -4022,7 +4627,11 @@ class Agent:
             "ioc_hits": list(set(self.analyser.ioc_hits)),
             "spoofing_detected": self.analyser.spoofing_detected(),
             "botnet_detected": self.analyser.botnet_detected(),
+            "fragment_count": self.analyser.fragment_count,
+            "fragment_pct": _frag_pct,
         }
+        if _upd_tool:
+            update_payload["attack_tool"] = _upd_tool
         # Per-VM breakdown update (Feature 2)
         if self.hypervisor_mode and self.analyser.inner_dst_ips:
             top_vm = self.analyser.top_attacked_vm()
@@ -4038,20 +4647,32 @@ class Agent:
         duration = time.time() - self.attack_start
         proto = self._proto_breakdown()
         _top_ports = self.analyser.top_dst_ports()
+        _src_ports = self.analyser.top_src_ports()
         _flags = dict(self.analyser.tcp_flags)
         _avg_pkt = self.analyser.avg_pkt_length()
+        _frag_pct = self.analyser.fragment_pct()
         family = classify_attack(
             proto["tcp"], proto["udp"], proto["icmp"],
             syn_ratio=self.analyser.syn_ratio(),
             dns_detected=bool(self.analyser.dns_queries),
+            top_ports=_top_ports,
+            tcp_flags=_flags,
+            other_pct=proto.get("other", 0.0),
+            fragment_pct=_frag_pct,
         )
         # Derive subtype from port/flag/size evidence
-        subtype = classify_subtype(family, _top_ports, _flags, _avg_pkt)
+        subtype = classify_subtype(family, _top_ports, _flags, _avg_pkt,
+                                   src_ports=_src_ports, fragment_pct=_frag_pct)
         # For TCP-dominant traffic that isn't SYN flood, check for other TCP subtypes
-        if family == "unknown" and proto["tcp"] > 40:
+        if family in ("unknown", "tcp_flood") and proto["tcp"] > 40:
             tcp_sub = classify_tcp_subtype(_flags)
             if tcp_sub:
                 subtype = tcp_sub
+                if family == "unknown":
+                    family = "tcp_flood"
+        # Enrich classification with IOC threat intel
+        family, subtype, _end_tool, _ = enrich_from_ioc(
+            self.analyser.ioc_hits, family, subtype)
 
         logger.warning("ATTACK ENDED — duration=%.0fs peak_pps=%.0f family=%s subtype=%s",
                        duration, self.peak_pps, family, subtype or "none")
@@ -4074,7 +4695,7 @@ class Agent:
             _top_ports_final = [{"port": p, "count": pkts}
                                 for p, pkts in self.flow.aggregator.top_dst_ports(20)]
 
-        self.api.resolve_incident(self.incident_uuid, {
+        _resolve_data = {
             "duration_seconds": round(duration, 1),
             "peak_pps": round(self.peak_pps, 1),
             "peak_bps": round(self.peak_bps, 1),
@@ -4095,7 +4716,12 @@ class Agent:
             "top_src_ips": _top_ips,
             "top_dst_ports": _top_ports_final,
             "avg_pkt_length": self.analyser.avg_pkt_length(),
-        })
+            "fragment_count": self.analyser.fragment_count,
+            "fragment_pct": _frag_pct,
+        }
+        if _end_tool:
+            _resolve_data["attack_tool"] = _end_tool
+        self.api.resolve_incident(self.incident_uuid, _resolve_data)
 
         if self.pcap.enabled:
             pcap_path = self.pcap.stop_capture(self.incident_uuid)
@@ -4122,6 +4748,8 @@ class Agent:
                     "baseline_ready": self.baseline.baseline_ready,
                     "baseline_avg_pps": round(self.baseline.avg_pps, 1),
                     "baseline_p99_pps": round(self.baseline.p99_pps, 1),
+                    "baseline_hourly_ready": self.baseline.hourly_ready,
+                    "baseline_current_hour_p99": round(self.baseline.current_hour_p99, 1),
                     "circuit_breaker": self.api.circuit_breaker_state,
                     "retry_queue_size": len(self.api.retry_queue),
                     # GRE dedup status (Feature 1)
@@ -4185,34 +4813,69 @@ class Agent:
                     logger.info(
                         "Auto-update: newer version %s available (current %s), "
                         "upgrading...", latest, VERSION)
+                    previous_version = VERSION
                     import subprocess
                     pip_cmd = [sys.executable, "-m", "pip", "install",
                                "--upgrade", "ftagent"]
+                    break_system = False
                     result = subprocess.run(
                         pip_cmd, capture_output=True, text=True, timeout=120,
                     )
                     # Handle PEP 668 (externally managed Python on Debian 12+, Ubuntu 23.04+)
                     if result.returncode != 0 and "externally-managed-environment" in result.stderr:
                         pip_cmd.insert(-1, "--break-system-packages")
+                        break_system = True
                         result = subprocess.run(
                             pip_cmd, capture_output=True, text=True, timeout=120,
                         )
-                    if result.returncode == 0:
-                        logger.info(
-                            "Auto-update: ftagent upgraded to %s. "
-                            "Restarting service...", latest)
-                        # Auto-restart via systemd if running as service
-                        try:
-                            subprocess.run(
-                                ["systemctl", "restart", "ftagent"],
-                                capture_output=True, timeout=30,
-                            )
-                        except Exception:
-                            logger.info("Auto-update: restart ftagent manually to use v%s", latest)
-                    else:
+                    if result.returncode != 0:
                         logger.warning(
                             "Auto-update: pip upgrade failed: %s",
                             result.stderr.strip()[:500])
+                        continue
+
+                    # Post-install integrity verification
+                    verified = True
+
+                    # Verify installed version matches PyPI's advertised latest
+                    if not _verify_installed_version(latest):
+                        logger.warning(
+                            "Auto-update: version mismatch after install "
+                            "(expected %s)", latest)
+                        verified = False
+
+                    # Verify the module imports cleanly before restarting
+                    if not _verify_module_imports():
+                        logger.warning(
+                            "Auto-update: new version fails import check")
+                        verified = False
+
+                    if not verified:
+                        logger.warning(
+                            "Auto-update: verification failed, rolling back "
+                            "to v%s", previous_version)
+                        if _pip_install_version(previous_version, break_system):
+                            logger.info(
+                                "Auto-update: rolled back to v%s",
+                                previous_version)
+                        else:
+                            logger.error(
+                                "Auto-update: rollback to v%s failed, "
+                                "manual intervention required",
+                                previous_version)
+                        continue
+
+                    logger.info(
+                        "Auto-update: ftagent upgraded to %s (verified). "
+                        "Restarting service...", latest)
+                    # Auto-restart via systemd if running as service
+                    try:
+                        subprocess.run(
+                            ["systemctl", "restart", "ftagent"],
+                            capture_output=True, timeout=30,
+                        )
+                    except Exception:
+                        logger.info("Auto-update: restart ftagent manually to use v%s", latest)
             except Exception as exc:
                 logger.debug("Auto-update check failed: %s", exc)
 
@@ -4253,6 +4916,48 @@ class Agent:
             data = self.api.get_config()
             if data is None:
                 return
+            # Handle workspace suspension (trial expired / billing inactive)
+            if data.get("suspended"):
+                if not getattr(self, '_suspended_logged', False):
+                    logger.warning("Workspace suspended (billing inactive). "
+                                   "Detection paused. Visit your dashboard to subscribe.")
+                    self._suspended_logged = True
+                # Disable service ports if active
+                if self.sp_detector.enabled:
+                    self.sp_detector.configure({"enabled": False})
+                return
+            self._suspended_logged = False
+            # Server-triggered forced update
+            force_ver = data.get("force_update")
+            if force_ver and isinstance(force_ver, str):
+                def _ver(v):
+                    try: return tuple(int(x) for x in v.split("."))
+                    except: return (0,)
+                if _ver(force_ver) > _ver(VERSION):
+                    logger.warning("Server requests forced update to v%s (current v%s), upgrading...",
+                                   force_ver, VERSION)
+                    import subprocess as _sub
+                    try:
+                        r = _sub.run([sys.executable, "-m", "pip", "install",
+                                      "--no-cache-dir", "--upgrade", f"ftagent=={force_ver}"],
+                                     capture_output=True, text=True, timeout=120)
+                        if r.returncode != 0 and "externally-managed" in r.stderr:
+                            r = _sub.run([sys.executable, "-m", "pip", "install",
+                                          "--no-cache-dir", "--upgrade", "--break-system-packages",
+                                          f"ftagent=={force_ver}"],
+                                         capture_output=True, text=True, timeout=120)
+                        if r.returncode == 0:
+                            logger.warning("Updated to v%s. Restarting...", force_ver)
+                            try:
+                                _sub.run(["systemctl", "restart", "ftagent"],
+                                         capture_output=True, timeout=30)
+                            except Exception:
+                                logger.info("Update installed. Restart ftagent manually.")
+                        else:
+                            logger.warning("Forced update failed: %s", r.stderr[:300])
+                    except Exception as e:
+                        logger.warning("Forced update error: %s", e)
+
             if "pps_threshold" in data and data["pps_threshold"]:
                 self.server_threshold = float(data["pps_threshold"])
                 logger.info("Server threshold: %.0f", self.server_threshold)
@@ -4544,6 +5249,7 @@ class Agent:
             "l7_status_codes": stats.get("status_codes", {}),
             "l7_top_user_agents": stats.get("top_user_agents", {}),
             "l7_threat_patterns": stats.get("threat_patterns", {}),
+            "l7_protocol_versions": stats.get("protocol_versions", {}),
         })
 
     def _l7_update_attack(self, info: dict) -> None:
@@ -4588,6 +5294,7 @@ class Agent:
             "l7_status_codes": accum.get("status_codes", stats.get("status_codes", {})),
             "l7_top_user_agents": accum.get("top_user_agents", stats.get("top_user_agents", {})),
             "l7_threat_patterns": accum.get("threat_patterns", stats.get("threat_patterns", {})),
+            "l7_protocol_versions": accum.get("protocol_versions", stats.get("protocol_versions", {})),
         })
 
     def _l7_end_attack(self, info: dict) -> None:
@@ -4645,6 +5352,7 @@ class Agent:
             "l7_top_user_agents": summary.get("top_user_agents", stats.get("top_user_agents", {})),
             "l7_targeted_paths": summary.get("top_paths", stats.get("top_paths", {})),
             "l7_threat_patterns": summary.get("threat_patterns", stats.get("threat_patterns", {})),
+            "l7_protocol_versions": summary.get("protocol_versions", stats.get("protocol_versions", {})),
         })
         self.l7_incident_uuid = ""
         self.l7_peak_rps = 0
@@ -4670,7 +5378,7 @@ class Agent:
             "iptables ", "ip6tables ", "ipset ", "sysctl ",
             "nft ", "ufw ", "firewall-cmd ", "tc ", "ip route ",
             "fail2ban-client ", "nginx ", "apache2ctl ",
-            "echo ", "sed ", "rm -f /etc/nginx/conf.d/ft_",
+            "rm -f /etc/nginx/conf.d/ft_",
             "rm -f /etc/apache2/conf-enabled/ft_",
             "for cc in ",
         )
@@ -4686,10 +5394,67 @@ class Agent:
                 errors.append(f"Blocked unsafe command: {line}")
                 logger.warning("Blocked unsafe command: %s", line)
                 continue
+            # Block shell metacharacters that enable injection
+            if ';' in line or '`' in line or '$' in line or '|' in line or '>' in line or '<' in line:
+                errors.append(f"Blocked command with shell injection chars: {line}")
+                logger.warning("Blocked shell injection in command: %s", line)
+                continue
+            # Block destructive commands that could lock out the server
+            _tokens = line.split()
+            _destructive_tokens = {"-F", "-X", "--flush", "--delete-chain"}
+            _destructive_policy = [("-P", "INPUT", "DROP"), ("-P", "INPUT", "REJECT")]
+            if any(t in _destructive_tokens for t in _tokens):
+                errors.append(f"Blocked destructive firewall command: {line}")
+                logger.warning("Blocked destructive command: %s", line)
+                continue
+            if any(all(p in _tokens for p in combo) for combo in _destructive_policy):
+                errors.append(f"Blocked destructive firewall command: {line}")
+                logger.warning("Blocked destructive command: %s", line)
+                continue
+            # Sysctl whitelist: only allow known-safe kernel parameters
+            if line.startswith("sysctl "):
+                _safe_sysctl = {
+                    "net.ipv4.tcp_syncookies", "net.ipv4.tcp_max_syn_backlog",
+                    "net.ipv4.tcp_synack_retries", "net.ipv4.tcp_syn_retries",
+                    "net.ipv4.icmp_echo_ignore_broadcasts",
+                    "net.ipv4.icmp_ignore_bogus_error_responses",
+                    "net.ipv4.conf.all.log_martians",
+                    "net.ipv4.tcp_fin_timeout", "net.ipv4.tcp_keepalive_time",
+                    "net.core.somaxconn", "net.core.netdev_max_backlog",
+                }
+                # Extract exact sysctl key: "sysctl -w key=value" or "sysctl key=value"
+                _sysctl_parts = line.split()
+                _sysctl_key = None
+                for _sp in _sysctl_parts[1:]:
+                    if _sp.startswith("-"):
+                        continue
+                    _sysctl_key = _sp.split("=")[0]
+                    break
+                if _sysctl_key not in _safe_sysctl:
+                    errors.append(f"Blocked unsafe sysctl: {line}")
+                    logger.warning("Blocked non-whitelisted sysctl: %s", line)
+                    continue
+            # Block null routes to private/reserved IPs
+            if "blackhole" in line and line.startswith("ip route "):
+                import ipaddress as _ipa
+                _parts = line.split()
+                for _p in _parts:
+                    try:
+                        _addr = _ipa.ip_address(_p.split("/")[0])
+                        if _addr.is_private or _addr.is_loopback or _addr.is_reserved:
+                            errors.append(f"Blocked blackhole route to private/reserved IP: {line}")
+                            logger.warning("Blocked blackhole to private IP: %s", line)
+                            break
+                    except ValueError:
+                        continue
+                else:
+                    pass  # no private IP found, allow
+                if any("Blocked blackhole" in e for e in errors[-1:]):
+                    continue
             try:
                 import subprocess
                 result = subprocess.run(
-                    line, shell=True, capture_output=True, text=True,
+                    shlex.split(line), capture_output=True, text=True,
                     timeout=30,
                 )
                 if result.returncode == 0:
@@ -4809,11 +5574,11 @@ class Agent:
 
             match_expr = " ".join(match_parts)
 
-            if rate_pps:
+            if rate_pps and int(rate_pps) > 0:
                 # Rate-limit mode: allow up to rate_pps, drop excess
                 cmds.append(
                     f"nft add rule inet {nft_table} {nft_chain} "
-                    f"{match_expr} limit rate over {int(rate_pps)}/second "
+                    f"{match_expr} limit rate over {max(1, int(rate_pps))}/second "
                     f"drop comment \"{nft_comment}\""
                 )
             else:
@@ -5113,7 +5878,16 @@ class MirrorAgent(Agent):
                        ip, label_str, snap.pps, baseline.get("threshold", 0))
 
         # Classify from snapshot protocol data
-        family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct)
+        _snap_flags = snap.tcp_flags or {}
+        _snap_flag_total = sum(_snap_flags.values()) if _snap_flags else 0
+        _snap_syn_ratio = (_snap_flags.get("SYN", 0) / _snap_flag_total) if _snap_flag_total > 0 else 0.0
+        _snap_top_ports = [{"port": p, "count": c} for p, c in snap.top_dst_ports] if snap.top_dst_ports else []
+        _snap_frag_pct = getattr(snap, 'fragment_pct', 0.0)
+        family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct,
+                                 syn_ratio=_snap_syn_ratio,
+                                 top_ports=_snap_top_ports,
+                                 tcp_flags=_snap_flags,
+                                 fragment_pct=_snap_frag_pct)
 
         started_at = datetime.now(timezone.utc).isoformat()
 
@@ -5127,6 +5901,7 @@ class MirrorAgent(Agent):
             "inner_ip": ip,
             "mirror_mode": True,
             "source_ip_count": snap.src_ip_count,
+            "fragment_pct": _snap_frag_pct,
         }
         if label:
             inc_data["inner_ip_label"] = label
@@ -5186,7 +5961,16 @@ class MirrorAgent(Agent):
         else:
             state["velocity_curve"][-1] = {"t": round(elapsed, 1), "pps": round(snap.pps, 1)}
 
-        family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct)
+        _snap_flags = snap.tcp_flags or {}
+        _snap_flag_total = sum(_snap_flags.values()) if _snap_flags else 0
+        _snap_syn_ratio = (_snap_flags.get("SYN", 0) / _snap_flag_total) if _snap_flag_total > 0 else 0.0
+        _snap_top_ports = [{"port": p, "count": c} for p, c in snap.top_dst_ports] if snap.top_dst_ports else []
+        _snap_frag_pct = getattr(snap, 'fragment_pct', 0.0)
+        family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct,
+                                 syn_ratio=_snap_syn_ratio,
+                                 top_ports=_snap_top_ports,
+                                 tcp_flags=_snap_flags,
+                                 fragment_pct=_snap_frag_pct)
 
         update_payload = {
             "peak_pps": round(state["peak_pps"], 1),
@@ -5196,6 +5980,7 @@ class MirrorAgent(Agent):
                 "tcp": snap.tcp_pct,
                 "udp": snap.udp_pct,
                 "icmp": snap.icmp_pct,
+                "fragments": _snap_frag_pct,
             },
             "source_ip_count": snap.src_ip_count,
             "top_src_ips": [
@@ -5207,6 +5992,7 @@ class MirrorAgent(Agent):
             "inner_ip": ip,
             "mirror_mode": True,
             "tcp_flag_breakdown": snap.tcp_flags,
+            "fragment_pct": _snap_frag_pct,
         }
         label = self.mirror_ip_labels.get(ip, "")
         if label:
@@ -5227,11 +6013,13 @@ class MirrorAgent(Agent):
         last_snap = self._last_snapshot.get(ip)
         tcp_flags = last_snap.tcp_flags if last_snap else {}
         avg_pkt = last_snap.avg_pkt_size if last_snap else 0
+        _snap_frag_pct = getattr(last_snap, 'fragment_pct', 0.0) if last_snap else 0.0
         top_ports = []
         if last_snap and last_snap.top_dst_ports:
             top_ports = [{"port": p, "count": c} for p, c in last_snap.top_dst_ports]
 
-        subtype = classify_subtype(family, top_ports, tcp_flags, avg_pkt)
+        subtype = classify_subtype(family, top_ports, tcp_flags, avg_pkt,
+                                   fragment_pct=_snap_frag_pct)
 
         label = self.mirror_ip_labels.get(ip, "")
         label_str = f" ({label})" if label else ""
@@ -5254,6 +6042,7 @@ class MirrorAgent(Agent):
                     "tcp": last_snap.tcp_pct,
                     "udp": last_snap.udp_pct,
                     "icmp": last_snap.icmp_pct,
+                    "fragments": _snap_frag_pct,
                 }
                 resolve_data["source_ip_count"] = last_snap.src_ip_count
                 resolve_data["top_src_ips"] = [
@@ -5262,6 +6051,7 @@ class MirrorAgent(Agent):
                 resolve_data["top_dst_ports"] = top_ports
                 resolve_data["tcp_flag_breakdown"] = tcp_flags
                 resolve_data["avg_pkt_length"] = avg_pkt
+                resolve_data["fragment_pct"] = _snap_frag_pct
 
             self.api.resolve_incident(state["incident_uuid"], resolve_data)
 
@@ -5401,6 +6191,8 @@ class MirrorAgent(Agent):
                     "baseline_ready": self.baseline.baseline_ready,
                     "baseline_avg_pps": round(self.baseline.avg_pps, 1),
                     "baseline_p99_pps": round(self.baseline.p99_pps, 1),
+                    "baseline_hourly_ready": self.baseline.hourly_ready,
+                    "baseline_current_hour_p99": round(self.baseline.current_hour_p99, 1),
                     "circuit_breaker": self.api.circuit_breaker_state,
                     "retry_queue_size": len(self.api.retry_queue),
                     "gre_dedup_enabled": self.gre_decap.enabled,
