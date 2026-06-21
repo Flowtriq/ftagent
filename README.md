@@ -152,5 +152,6 @@ Full documentation: [flowtriq.com/docs](https://flowtriq.com/docs)
 ## Support
 
 - Docs: [flowtriq.com/docs](https://flowtriq.com/docs)
+- Discord: [discord.gg/SsTWMYuyGG](https://discord.gg/SsTWMYuyGG)
 - Issues: [github.com/flowtriq/ftagent/issues](https://github.com/flowtriq/ftagent/issues)
 - Email: [hello@flowtriq.com](mailto:hello@flowtriq.com)
