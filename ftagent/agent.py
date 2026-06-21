@@ -906,8 +906,9 @@ class TrafficAnalyser:
         self.tcp_flags = {"SYN": 0, "ACK": 0, "RST": 0, "FIN": 0,
                           "PSH": 0, "URG": 0}
         self.src_ips: dict = {}        # ip -> count
-        self.src_ip_detail: dict = {}  # ip -> {tcp, udp, icmp, syn, ack, bytes, ttls}
+        self.src_ip_detail: dict = {}  # ip -> {tcp, udp, icmp, other, syn, ack, bytes, ttls}
         self.dst_ports: dict = {}
+        self.src_ports: dict = {}      # source port -> count (for amplification detection)
         self.pkt_lengths: list = []
         self.ttl_values: list = []
         self.dns_queries: dict = {}
@@ -990,7 +991,7 @@ class TrafficAnalyser:
             if src in self.src_ip_detail:
                 d = self.src_ip_detail[src]
             elif len(self.src_ip_detail) < self.MAX_SRC_IPS:
-                d = {"tcp": 0, "udp": 0, "icmp": 0, "syn": 0, "ack": 0, "bytes": 0, "ttls": set()}
+                d = {"tcp": 0, "udp": 0, "icmp": 0, "other": 0, "syn": 0, "ack": 0, "bytes": 0, "ttls": set()}
                 self.src_ip_detail[src] = d
             else:
                 d = None
@@ -1003,6 +1004,7 @@ class TrafficAnalyser:
             if stats_pkt.haslayer(TCP):
                 tcp = stats_pkt[TCP]
                 self.dst_ports[tcp.dport] = self.dst_ports.get(tcp.dport, 0) + 1
+                self.src_ports[tcp.sport] = self.src_ports.get(tcp.sport, 0) + 1
                 if d is not None:
                     d["tcp"] += 1
                 flags = tcp.flags
@@ -1024,12 +1026,19 @@ class TrafficAnalyser:
             elif stats_pkt.haslayer(UDP):
                 self.dst_ports[stats_pkt[UDP].dport] = (
                     self.dst_ports.get(stats_pkt[UDP].dport, 0) + 1)
+                self.src_ports[stats_pkt[UDP].sport] = (
+                    self.src_ports.get(stats_pkt[UDP].sport, 0) + 1)
                 if d is not None:
                     d["udp"] += 1
 
             elif stats_pkt.haslayer(ICMP):
                 if d is not None:
                     d["icmp"] += 1
+
+            else:
+                # GRE/ESP/IPIP/other protocols
+                if d is not None:
+                    d["other"] += 1
 
             if stats_pkt.haslayer(DNS) and stats_pkt[DNS].qr == 0:
                 try:
@@ -1153,21 +1162,28 @@ class TrafficAnalyser:
                 for p, c in sorted(self.dst_ports.items(),
                                    key=lambda x: x[1], reverse=True)[:n]]
 
+    def top_src_ports(self, n: int = 20) -> list:
+        return [{"port": p, "count": c}
+                for p, c in sorted(self.src_ports.items(),
+                                   key=lambda x: x[1], reverse=True)[:n]]
+
     def protocol_breakdown(self) -> dict:
         """Compute protocol percentages from actual packet inspection (scapy).
         This is authoritative — unlike /proc/net/snmp which misses dropped packets."""
-        tcp_total = udp_total = icmp_total = 0
+        tcp_total = udp_total = icmp_total = other_total = 0
         for d in self.src_ip_detail.values():
             tcp_total += d["tcp"]
             udp_total += d["udp"]
             icmp_total += d["icmp"]
-        grand = tcp_total + udp_total + icmp_total
+            other_total += d.get("other", 0)
+        grand = tcp_total + udp_total + icmp_total + other_total
         if grand == 0:
-            return {"tcp": 0, "udp": 0, "icmp": 0}
+            return {"tcp": 0, "udp": 0, "icmp": 0, "other": 0}
         return {
             "tcp": round(tcp_total / grand * 100, 1),
             "udp": round(udp_total / grand * 100, 1),
             "icmp": round(icmp_total / grand * 100, 1),
+            "other": round(other_total / grand * 100, 1),
         }
 
     def syn_ratio(self) -> float:
@@ -2646,7 +2662,8 @@ class L7Monitor:
 
 def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
                     syn_ratio: float = 0.0, dns_detected: bool = False,
-                    top_ports: list = None, tcp_flags: dict = None) -> str:
+                    top_ports: list = None, tcp_flags: dict = None,
+                    other_pct: float = 0.0) -> str:
     if dns_detected:
         return "dns_flood"
     if udp_pct > 45:
@@ -2658,46 +2675,79 @@ def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
     elevated = sum(1 for v in (tcp_pct, udp_pct, icmp_pct) if v > 15)
     if elevated >= 2:
         return "multi_vector"
+    # GRE/ESP/IPIP/other protocol floods
+    if other_pct > 30:
+        return "protocol_flood"
     # Last resort: pick dominant protocol.
     if udp_pct >= tcp_pct and udp_pct >= icmp_pct and udp_pct > 5:
         return "udp_flood"
     if tcp_pct >= udp_pct and tcp_pct >= icmp_pct and tcp_pct > 5:
         if syn_ratio >= 0.3:
             return "syn_flood"
-        return "unknown"
+        return "tcp_flood"
     if icmp_pct > 5:
         return "icmp_flood"
+    # Try harder: classify by whichever protocol is non-zero
+    if tcp_pct > 0 or udp_pct > 0 or icmp_pct > 0 or other_pct > 0:
+        dominant = max(
+            ("tcp_flood", tcp_pct), ("udp_flood", udp_pct),
+            ("icmp_flood", icmp_pct), ("protocol_flood", other_pct),
+            key=lambda x: x[1],
+        )
+        return dominant[0]
     return "unknown"
 
 
 def classify_subtype(family: str, top_ports: list = None,
-                     tcp_flags: dict = None, avg_pkt_len: int = 0) -> str:
+                     tcp_flags: dict = None, avg_pkt_len: int = 0,
+                     src_ports: list = None) -> str:
     """Derive attack subtype from port/flag/size evidence."""
-    if not family or family == "unknown":
-        return ""
-
     ports = top_ports or []
     top_port = 0
     if ports:
         entry = ports[0]
         top_port = entry.get("port", 0) if isinstance(entry, dict) else int(entry)
 
+    # Source ports for amplification detection (reflectors respond FROM known ports)
+    _src_ports = src_ports or []
+    top_src_port = 0
+    if _src_ports:
+        entry = _src_ports[0]
+        top_src_port = entry.get("port", 0) if isinstance(entry, dict) else int(entry)
+
+    # ── Unknown/empty family: still try to classify from available evidence ──
+    if not family or family == "unknown":
+        if tcp_flags:
+            tcp_sub = classify_tcp_subtype(tcp_flags)
+            if tcp_sub:
+                return tcp_sub
+        if top_port or top_src_port:
+            # Check for amplification by source port
+            _amp_ports = {53: "dns_amplification", 123: "ntp_amplification",
+                          1900: "ssdp_amplification", 11211: "memcached_amplification",
+                          389: "cldap_amplification", 19: "chargen_amplification",
+                          161: "snmp_amplification", 3702: "wsd_amplification",
+                          5353: "mdns_amplification", 1194: "openvpn_amplification",
+                          3283: "apple_remote_amplification", 3389: "rdp_amplification"}
+            if top_src_port in _amp_ports:
+                return _amp_ports[top_src_port]
+            if top_port in _amp_ports:
+                return _amp_ports[top_port]
+        return ""
+
     # ── UDP subtypes ──
     if family == "udp_flood":
-        if top_port == 53:
-            return "dns_amplification"
-        if top_port == 123:
-            return "ntp_amplification"
-        if top_port == 1900:
-            return "ssdp_amplification"
-        if top_port == 11211:
-            return "memcached_amplification"
-        if top_port == 389:
-            return "cldap_amplification"
-        if top_port == 19:
-            return "chargen_amplification"
-        if top_port == 161:
-            return "snmp_amplification"
+        _amp_ports = {53: "dns_amplification", 123: "ntp_amplification",
+                      1900: "ssdp_amplification", 11211: "memcached_amplification",
+                      389: "cldap_amplification", 19: "chargen_amplification",
+                      161: "snmp_amplification", 3702: "wsd_amplification",
+                      5353: "mdns_amplification", 1194: "openvpn_amplification",
+                      3283: "apple_remote_amplification", 3389: "rdp_amplification"}
+        # Check source ports first (amplification comes FROM reflector ports)
+        if top_src_port in _amp_ports:
+            return _amp_ports[top_src_port]
+        if top_port in _amp_ports:
+            return _amp_ports[top_port]
         if avg_pkt_len > 0 and avg_pkt_len < 100:
             return "small_packet_flood"
         if avg_pkt_len > 1200:
@@ -2706,11 +2756,42 @@ def classify_subtype(family: str, top_ports: list = None,
 
     # ── TCP subtypes (beyond SYN flood) ──
     if family == "syn_flood":
+        # Distinguish SYN vs SYN-ACK flood using flags
+        if tcp_flags:
+            total = sum(tcp_flags.values())
+            if total > 0:
+                syn_r = tcp_flags.get("SYN", 0) / total
+                ack_r = tcp_flags.get("ACK", 0) / total
+                if syn_r > 0.3 and ack_r > 0.3:
+                    return "syn_ack_flood"
         return "syn_flood"
+
+    # ── TCP flood (non-SYN dominant TCP) ──
+    if family == "tcp_flood":
+        if tcp_flags:
+            return classify_tcp_subtype(tcp_flags) or "tcp_generic"
+        return "tcp_generic"
+
+    # ── Multi-vector: identify dominant component ──
+    if family == "multi_vector":
+        if tcp_flags:
+            tcp_sub = classify_tcp_subtype(tcp_flags)
+            if tcp_sub:
+                return "multi_" + tcp_sub
+        # Check for amplification component via source ports
+        _amp_ports = {53: "dns_amplification", 123: "ntp_amplification",
+                      1900: "ssdp_amplification"}
+        if top_src_port in _amp_ports:
+            return "multi_" + _amp_ports[top_src_port]
+        if top_port in _amp_ports:
+            return "multi_" + _amp_ports[top_port]
+        return "multi_mixed"
 
     # ── DNS subtypes ──
     if family == "dns_flood":
         if top_port == 53 and avg_pkt_len > 512:
+            return "dns_amplification"
+        if top_src_port == 53 and avg_pkt_len > 512:
             return "dns_amplification"
         return "dns_query_flood"
 
@@ -2719,6 +2800,13 @@ def classify_subtype(family: str, top_ports: list = None,
         if avg_pkt_len > 1000:
             return "ping_of_death"
         return "ping_flood"
+
+    # ── Protocol flood (GRE/ESP/IPIP) ──
+    if family == "protocol_flood":
+        # Without deep protocol inspection, classify by common protocol floods
+        if tcp_flags:
+            return classify_tcp_subtype(tcp_flags) or "gre_flood"
+        return "gre_flood"
 
     return ""
 
@@ -2736,8 +2824,18 @@ def classify_tcp_subtype(tcp_flags: dict) -> str:
     rst_r = tcp_flags.get("RST", 0) / total
     fin_r = tcp_flags.get("FIN", 0) / total
     psh_r = tcp_flags.get("PSH", 0) / total
+    urg_r = tcp_flags.get("URG", 0) / total
 
-    if rst_r > 0.5:
+    # XMAS flood: FIN+PSH+URG all elevated
+    if fin_r > 0.15 and psh_r > 0.15 and urg_r > 0.15:
+        return "xmas_flood"
+    # NULL flood: all flag ratios near zero but packets exist
+    if total > 0 and syn_r < 0.05 and ack_r < 0.05 and rst_r < 0.05 and fin_r < 0.05 and psh_r < 0.05:
+        return "null_flood"
+    # SYN-ACK flood: both SYN and ACK high
+    if syn_r > 0.3 and ack_r > 0.3:
+        return "syn_ack_flood"
+    if rst_r > 0.4:
         return "rst_flood"
     if fin_r > 0.4:
         return "fin_flood"
@@ -2745,7 +2843,8 @@ def classify_tcp_subtype(tcp_flags: dict) -> str:
         return "ack_flood"
     if psh_r > 0.4 and ack_r > 0.3:
         return "psh_ack_flood"
-    return ""
+    # Fallback: if flags have data, return tcp_generic
+    return "tcp_generic"
 
 
 # ---------------------------------------------------------------------------
@@ -3496,11 +3595,13 @@ class Agent:
                 "tcp": self.flow.aggregator.tcp_pct,
                 "udp": self.flow.aggregator.udp_pct,
                 "icmp": self.flow.aggregator.icmp_pct,
+                "other": 0,
             }
         return {
             "tcp": self.monitor.tcp_pct,
             "udp": self.monitor.udp_pct,
             "icmp": self.monitor.icmp_pct,
+            "other": 0,
         }
 
     def run(self) -> None:
@@ -3912,7 +4013,10 @@ class Agent:
             _init_icmp = self.monitor.icmp_pct
 
         family = classify_attack(_init_tcp, _init_udp, _init_icmp,
-                                 syn_ratio=_syn_est)
+                                 syn_ratio=_syn_est,
+                                 dns_detected=bool(self.analyser.dns_queries),
+                                 top_ports=self.analyser.top_dst_ports(),
+                                 tcp_flags=dict(self.analyser.tcp_flags))
         started_at = datetime.now(timezone.utc).isoformat()
 
         # Per-VM: identify which inner IP is being attacked (Feature 2)
@@ -4048,7 +4152,12 @@ class Agent:
 
         family = "udp_flood"  # most non-service port attacks are UDP
         proto = self._proto_breakdown()
-        family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"])
+        family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"],
+                                 syn_ratio=self.analyser.syn_ratio(),
+                                 dns_detected=bool(self.analyser.dns_queries),
+                                 top_ports=self.analyser.top_dst_ports(),
+                                 tcp_flags=dict(self.analyser.tcp_flags),
+                                 other_pct=proto.get("other", 0.0))
 
         started_at = datetime.now(timezone.utc).isoformat()
 
@@ -4123,7 +4232,12 @@ class Agent:
             self.velocity_curve[-1] = {"t": round(elapsed, 1), "pps": round(self.monitor.pps, 1)}
 
         proto = self._proto_breakdown()
-        family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"])
+        family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"],
+                                 syn_ratio=self.analyser.syn_ratio(),
+                                 dns_detected=bool(self.analyser.dns_queries),
+                                 top_ports=self.analyser.top_dst_ports(),
+                                 tcp_flags=dict(self.analyser.tcp_flags),
+                                 other_pct=proto.get("other", 0.0))
 
         # Merge source IP data: use whichever source (scapy or flow) has more visibility
         _scapy_src_count = len(self.analyser.src_ips)
@@ -4168,20 +4282,26 @@ class Agent:
         duration = time.time() - self.attack_start
         proto = self._proto_breakdown()
         _top_ports = self.analyser.top_dst_ports()
+        _src_ports = self.analyser.top_src_ports()
         _flags = dict(self.analyser.tcp_flags)
         _avg_pkt = self.analyser.avg_pkt_length()
         family = classify_attack(
             proto["tcp"], proto["udp"], proto["icmp"],
             syn_ratio=self.analyser.syn_ratio(),
             dns_detected=bool(self.analyser.dns_queries),
+            top_ports=_top_ports,
+            tcp_flags=_flags,
+            other_pct=proto.get("other", 0.0),
         )
         # Derive subtype from port/flag/size evidence
-        subtype = classify_subtype(family, _top_ports, _flags, _avg_pkt)
+        subtype = classify_subtype(family, _top_ports, _flags, _avg_pkt, src_ports=_src_ports)
         # For TCP-dominant traffic that isn't SYN flood, check for other TCP subtypes
-        if family == "unknown" and proto["tcp"] > 40:
+        if family in ("unknown", "tcp_flood") and proto["tcp"] > 40:
             tcp_sub = classify_tcp_subtype(_flags)
             if tcp_sub:
                 subtype = tcp_sub
+                if family == "unknown":
+                    family = "tcp_flood"
 
         logger.warning("ATTACK ENDED — duration=%.0fs peak_pps=%.0f family=%s subtype=%s",
                        duration, self.peak_pps, family, subtype or "none")
@@ -5331,7 +5451,14 @@ class MirrorAgent(Agent):
                        ip, label_str, snap.pps, baseline.get("threshold", 0))
 
         # Classify from snapshot protocol data
-        family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct)
+        _snap_flags = snap.tcp_flags or {}
+        _snap_flag_total = sum(_snap_flags.values()) if _snap_flags else 0
+        _snap_syn_ratio = (_snap_flags.get("SYN", 0) / _snap_flag_total) if _snap_flag_total > 0 else 0.0
+        _snap_top_ports = [{"port": p, "count": c} for p, c in snap.top_dst_ports] if snap.top_dst_ports else []
+        family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct,
+                                 syn_ratio=_snap_syn_ratio,
+                                 top_ports=_snap_top_ports,
+                                 tcp_flags=_snap_flags)
 
         started_at = datetime.now(timezone.utc).isoformat()
 
@@ -5404,7 +5531,14 @@ class MirrorAgent(Agent):
         else:
             state["velocity_curve"][-1] = {"t": round(elapsed, 1), "pps": round(snap.pps, 1)}
 
-        family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct)
+        _snap_flags = snap.tcp_flags or {}
+        _snap_flag_total = sum(_snap_flags.values()) if _snap_flags else 0
+        _snap_syn_ratio = (_snap_flags.get("SYN", 0) / _snap_flag_total) if _snap_flag_total > 0 else 0.0
+        _snap_top_ports = [{"port": p, "count": c} for p, c in snap.top_dst_ports] if snap.top_dst_ports else []
+        family = classify_attack(snap.tcp_pct, snap.udp_pct, snap.icmp_pct,
+                                 syn_ratio=_snap_syn_ratio,
+                                 top_ports=_snap_top_ports,
+                                 tcp_flags=_snap_flags)
 
         update_payload = {
             "peak_pps": round(state["peak_pps"], 1),
