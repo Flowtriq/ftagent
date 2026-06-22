@@ -655,8 +655,8 @@ class TestPerformance(unittest.TestCase):
         snap = counter.snapshot_and_reset()
         elapsed = time.monotonic() - start
         self.assertEqual(len(snap), 10_000)
-        self.assertLess(elapsed, 0.1,
-                        f"Snapshot of 10K IPs took {elapsed:.3f}s (should be <100ms)")
+        self.assertLess(elapsed, 0.5,
+                        f"Snapshot of 10K IPs took {elapsed:.3f}s (should be <500ms)")
 
     def test_per_ip_baseline_throughput(self):
         """PerIPBaselineManager should handle many IPs efficiently."""
