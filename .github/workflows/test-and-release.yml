@@ -3,6 +3,8 @@ name: Test & Release ftagent
 on:
   push:
     branches: [main, dev]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       skip_publish:
@@ -11,9 +13,45 @@ on:
         default: false
 
 jobs:
-  # ── Stage 1: Deploy to test server and verify agent starts ─────────────────
-  test-on-server:
-    name: Deploy & Smoke Test
+  # ── Stage 1: Unit tests (runs on GitHub-hosted runners, fast) ────────────
+  unit-tests:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[full]" pytest pytest-cov pytest-timeout
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --tb=short \
+            --cov=ftagent --cov-report=term-missing \
+            -x --timeout=60
+
+      - name: Check coverage threshold
+        run: |
+          # Overall threshold is 25% because agent.py's Agent/MirrorAgent classes
+          # (3000+ lines) require root, network interfaces, and systemd to test.
+          # Pure logic functions (classify_attack, BaselineManager, flow parsers)
+          # are thoroughly covered. Integration tests run on the self-hosted runner.
+          pytest tests/ -q --cov=ftagent --cov-fail-under=25 --timeout=60
+
+  # ── Stage 2: Deploy to test server and verify agent starts ─────────────────
+  integration-test:
+    name: Integration Test (Live Server)
+    needs: unit-tests
     runs-on: self-hosted
     timeout-minutes: 5
     steps:
@@ -34,6 +72,11 @@ jobs:
           else
             echo "Config already exists, skipping"
           fi
+
+      - name: Run unit tests on server
+        run: |
+          pip3 install --break-system-packages pytest pytest-cov 2>/dev/null || true
+          pytest tests/ -v --tb=short -x --timeout=60
 
       - name: Verify agent starts
         run: |
@@ -68,10 +111,28 @@ jobs:
             echo "Agent may not be reporting - check manually"
           fi
 
-  # ── Stage 2: Build and publish (only on main branch push) ──────────────────
+      - name: Resource consumption check
+        run: |
+          sleep 5
+          PID=$(pgrep -f "ftagent" | head -1)
+          if [ -n "$PID" ]; then
+            MEM=$(ps -o rss= -p $PID | tr -d ' ')
+            CPU=$(ps -o %cpu= -p $PID | tr -d ' ')
+            echo "Memory: ${MEM}KB, CPU: ${CPU}%"
+            # Fail if memory exceeds 200MB
+            if [ "$MEM" -gt 204800 ]; then
+              echo "FAIL: Memory too high (${MEM}KB > 200MB)"
+              exit 1
+            fi
+            echo "Resource check passed"
+          else
+            echo "Agent process not found (may have exited cleanly)"
+          fi
+
+  # ── Stage 3: Build and publish (only on main branch push) ──────────────────
   publish:
     name: Build & Publish
-    needs: test-on-server
+    needs: integration-test
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || !inputs.skip_publish)
     runs-on: ubuntu-latest
     permissions:
