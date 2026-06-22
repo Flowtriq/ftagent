@@ -76,7 +76,7 @@ jobs:
       - name: Run unit tests on server
         run: |
           pip3 install --break-system-packages pytest pytest-cov 2>/dev/null || true
-          pytest tests/ -v --tb=short -x --timeout=60
+          pytest tests/ -v --tb=short --timeout=60
 
       - name: Verify agent starts
         run: |
