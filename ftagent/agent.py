@@ -3978,6 +3978,8 @@ class Agent:
         self.peak_pps: float = 0.0
         self.peak_bps: float = 0.0
         self.below_count: int = 0
+        self._last_attack_end: float = 0.0
+        self._attack_cooldown: float = 60.0  # suppress re-detection for 60s after attack ends
         self.velocity_curve: list = []
         self._MAX_VELOCITY_POINTS = 2000
         self.last_update: float = 0.0
@@ -4299,6 +4301,16 @@ class Agent:
             if _trigger and not self.baseline.baseline_ready:
                 uptime = time.monotonic() - self._start_mono
                 if uptime < self._STARTUP_GRACE_SECONDS and pps < _absolute_floor * 5:
+                    _trigger = False
+
+            # Post-attack cooldown: suppress re-detection for N seconds after
+            # the last attack ended.  Prevents rapid-fire micro-burst incidents
+            # (e.g. 10s open → 10s close → 10s open) that cause alert fatigue.
+            # Exception: truly massive spikes (>5x floor) bypass the cooldown
+            # because those are unambiguously real attacks.
+            if _trigger and self._last_attack_end > 0:
+                _cd_elapsed = time.monotonic() - self._last_attack_end
+                if _cd_elapsed < self._attack_cooldown and pps < _absolute_floor * 5:
                     _trigger = False
 
             if _trigger:
@@ -4815,6 +4827,7 @@ class Agent:
 
         self.attacking = False
         self.incident_uuid = ""
+        self._last_attack_end = time.monotonic()
 
     def _heartbeat_loop(self) -> None:
         _last_update_check = time.monotonic()
@@ -6456,6 +6469,10 @@ def main() -> None:
                         help="Path to config file")
     parser.add_argument("--setup", action="store_true",
                         help="Run interactive setup wizard")
+    parser.add_argument("--api-key", default=None,
+                        help="API key (skips interactive setup)")
+    parser.add_argument("--node-uuid", default=None,
+                        help="Node UUID (skips interactive setup)")
     parser.add_argument("--test", action="store_true",
                         help="Test API connectivity")
     parser.add_argument("--install-service", action="store_true",
@@ -6470,6 +6487,17 @@ def main() -> None:
 
     if args.update:
         check_for_updates(force=True, interactive=True)
+        return
+
+    # Non-interactive setup: --api-key + --node-uuid writes config directly
+    if args.api_key and args.node_uuid:
+        cfg = dict(DEFAULT_CONFIG)
+        cfg["api_key"] = args.api_key
+        cfg["node_uuid"] = args.node_uuid
+        save_config(args.config, cfg)
+        print(f"  Config written to {args.config}")
+        print(f"  API key: {args.api_key[:8]}...{args.api_key[-4:]}")
+        print(f"  Node UUID: {args.node_uuid}")
         return
 
     if args.setup:
