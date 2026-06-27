@@ -4313,6 +4313,18 @@ class Agent:
                 if _cd_elapsed < self._attack_cooldown and pps < _absolute_floor * 5:
                     _trigger = False
 
+            # Sustained-attack confirmation: require 3 consecutive ticks above
+            # threshold before opening an incident. VoIP registration storms,
+            # CDN cache refills, and game heartbeats produce brief 1-2 tick
+            # spikes that aren't attacks. Real DDoS sustains for many seconds.
+            # Exception: massive floods (>5x floor) trigger immediately.
+            if _trigger:
+                self._above_count = getattr(self, '_above_count', 0) + 1
+                if self._above_count < 3 and pps < _absolute_floor * 5:
+                    _trigger = False  # wait for sustained confirmation
+            else:
+                self._above_count = 0
+
             if _trigger:
                 # Flush buffered metrics immediately so the dashboard sees the spike
                 self._flush_metrics()
