@@ -4967,10 +4967,18 @@ class Agent:
                             ["systemctl", "restart", "ftagent"],
                             capture_output=True, timeout=30,
                         )
-                    except Exception:
-                        logger.info("Auto-update: restart ftagent manually to use v%s", latest)
+                    except Exception as restart_exc:
+                        logger.warning("Auto-update: systemctl restart failed (%s), restart ftagent manually to use v%s", restart_exc, latest)
             except Exception as exc:
-                logger.debug("Auto-update check failed: %s", exc)
+                logger.warning("Auto-update check failed: %s", exc)
+                # Report update failure to dashboard so operators can see it
+                try:
+                    self.api.post("heartbeat", {
+                        "update_error": str(exc)[:200],
+                        "current_version": VERSION,
+                    })
+                except Exception:
+                    pass
 
     def _command_poll_loop(self) -> None:
         """Poll for pending commands (iptables rules).
