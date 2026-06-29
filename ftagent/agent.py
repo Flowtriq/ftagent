@@ -18,6 +18,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +64,9 @@ DEFAULT_CONFIG = {
     "mirror_subnets": [],          # Only monitor these destination CIDRs ["10.0.0.0/24"]
     "mirror_ip_labels": {},        # {"10.0.0.5": "Web Server", "10.0.0.6": "DB Server"}
     "mirror_capture_mode": "af_packet",  # "af_packet" (Linux, high perf) or "tcpdump" (fallback)
+    # Agones GameServer integration — label attacked pods via SDK sidecar
+    "agones_sidecar": False,
+    "agones_sidecar_port": 59358,      # Agones SDK HTTP port (default 59358)
 }
 
 # Flow collector (built-in, no extra deps)
@@ -3910,6 +3914,56 @@ class ServicePortDetector:
 
 
 # ---------------------------------------------------------------------------
+# Agones SDK Sidecar Client
+# ---------------------------------------------------------------------------
+
+class AgonesSidecar:
+    """Communicates with the Agones SDK sidecar REST API running in the same pod.
+    Used to label GameServer resources when attacks are detected/resolved."""
+
+    LABEL_PREFIX = "flowtriq.com/"
+
+    def __init__(self, port: int = 59358):
+        self.base = f"http://localhost:{port}"
+
+    def set_label(self, key: str, value: str) -> bool:
+        url = f"{self.base}/metadata/label"
+        body = json.dumps({"key": f"{self.LABEL_PREFIX}{key}", "value": value})
+        try:
+            req = urllib.request.Request(
+                url, data=body.encode(), method="PUT",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return resp.status == 200
+        except Exception as exc:
+            logger.warning("Agones sidecar label %s=%s failed: %s", key, value, exc)
+            return False
+
+    def delete_label(self, key: str) -> bool:
+        url = f"{self.base}/metadata/label"
+        body = json.dumps({"key": f"{self.LABEL_PREFIX}{key}"})
+        try:
+            req = urllib.request.Request(
+                url, data=body.encode(), method="DELETE",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return resp.status == 200
+        except Exception as exc:
+            logger.debug("Agones sidecar delete label %s: %s", key, exc)
+            return False
+
+    def mark_under_attack(self, family: str, peak_pps: float) -> None:
+        self.set_label("under-attack", "true")
+        self.set_label("attack-family", family)
+        self.set_label("attack-pps", str(int(peak_pps)))
+
+    def clear_attack(self) -> None:
+        self.set_label("under-attack", "false")
+        self.delete_label("attack-family")
+        self.delete_label("attack-pps")
+
+
+# ---------------------------------------------------------------------------
 # Agent Core
 # ---------------------------------------------------------------------------
 
@@ -3971,6 +4025,13 @@ class Agent:
         self.sp_detector.detect_local_ips()
         self._sp_last_metrics_push: float = 0.0
         self._sp_metrics_interval = 5  # push split metrics every 5s
+
+        # Agones GameServer sidecar integration
+        self.agones: AgonesSidecar | None = None
+        if cfg.get("agones_sidecar"):
+            self.agones = AgonesSidecar(port=cfg.get("agones_sidecar_port", 59358))
+            logger.info("Agones sidecar integration enabled (port %d)",
+                        cfg.get("agones_sidecar_port", 59358))
 
         self.attacking = False
         self.attack_start: float = 0.0
@@ -4548,6 +4609,12 @@ class Agent:
             "pps": round(self.peak_pps, 1),
         })
 
+        # Label Agones GameServer as under attack
+        if self.agones:
+            threading.Thread(
+                target=self.agones.mark_under_attack,
+                args=(family, self.peak_pps), daemon=True).start()
+
         # Immediately fetch config to pick up any mitigation commands
         # queued by the server in response to the incident we just opened
         threading.Thread(target=self._fetch_config, daemon=True,
@@ -4836,6 +4903,10 @@ class Agent:
                     daemon=True,
                 ).start()
             self.pcap.cleanup_pcaps()
+
+        # Clear Agones GameServer attack labels
+        if self.agones:
+            threading.Thread(target=self.agones.clear_attack, daemon=True).start()
 
         self.attacking = False
         self.incident_uuid = ""
