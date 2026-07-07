@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import signal
 import shlex
@@ -939,6 +940,54 @@ class BaselineManager:
         current_hour = datetime.now().hour
         return self._hourly_p99.get(current_hour, 0.0)
 
+    def save_state(self, path: str) -> None:
+        """Serialize baseline state to disk for persistence across restarts."""
+        state = {
+            'samples': list(self.samples),
+            'bps_samples': list(self.bps_samples),
+            'avg_pps': self.avg_pps,
+            'p99_pps': self.p99_pps,
+            'avg_bps': self.avg_bps,
+            'p99_bps': self.p99_bps,
+            'threshold': self.threshold,
+            'bps_threshold': self.bps_threshold,
+            'baseline_ready': self.baseline_ready,
+        }
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + '.tmp', 'w') as f:
+                json.dump(state, f)
+            os.replace(path + '.tmp', path)
+        except Exception as e:
+            logger.debug("Baseline save failed: %s", e)
+
+    def restore_state(self, path: str) -> bool:
+        """Restore baseline state from disk. Returns True if restored."""
+        try:
+            with open(path) as f:
+                state = json.load(f)
+            samples = state.get('samples', [])
+            if not samples or len(samples) < 50:
+                return False
+            self.samples = collections.deque(samples, maxlen=self.WINDOW)
+            self._running_sum = sum(self.samples)
+            bps_s = state.get('bps_samples', [])
+            if bps_s:
+                self.bps_samples = collections.deque(bps_s, maxlen=self.WINDOW)
+                self._bps_running_sum = sum(self.bps_samples)
+            self.avg_pps = state.get('avg_pps', 0.0)
+            self.p99_pps = state.get('p99_pps', 0.0)
+            self.avg_bps = state.get('avg_bps', 0.0)
+            self.p99_bps = state.get('p99_bps', 0.0)
+            self.threshold = state.get('threshold', self._DEFAULT_FLOOR)
+            self.bps_threshold = state.get('bps_threshold', 0.0)
+            self.baseline_ready = state.get('baseline_ready', False)
+            logger.info("Baseline restored from disk: %d samples, p99=%.0f, threshold=%.0f",
+                        len(self.samples), self.p99_pps, self.threshold)
+            return True
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
+            return False
+
 
 # ---------------------------------------------------------------------------
 # Per-IP Baseline Manager (Mirror Mode)
@@ -1046,6 +1095,51 @@ class PerIPBaselineManager:
 
 
 # ---------------------------------------------------------------------------
+# HyperLogLog (probabilistic cardinality estimator)
+# ---------------------------------------------------------------------------
+
+class HyperLogLog:
+    """Probabilistic cardinality estimator. O(1) per add, O(1) count, ~0.8% error at 16KB."""
+    def __init__(self, p: int = 14):
+        self.p = p
+        self.m = 1 << p
+        self.registers = bytearray(self.m)
+        self._alpha = 0.7213 / (1 + 1.079 / self.m)
+
+    def add(self, item: str) -> None:
+        h = hash(item) & 0xFFFFFFFFFFFFFFFF
+        idx = h & (self.m - 1)
+        w = h >> self.p
+        self.registers[idx] = max(self.registers[idx], self._rho(w))
+
+    @staticmethod
+    def _rho(w: int) -> int:
+        return (w.bit_length() - 64 + 1) if w else 65  # position of first 1-bit
+
+    def count(self) -> int:
+        z = sum(2.0 ** (-r) for r in self.registers)
+        e = self._alpha * self.m * self.m / z
+        # Small range correction
+        if e <= 2.5 * self.m:
+            v = self.registers.count(0)
+            if v > 0:
+                e = self.m * math.log(self.m / v)
+        return int(e)
+
+
+# Known amplification payload signatures (first bytes of response packets)
+_PAYLOAD_SIGS = {
+    b'\x17\x00\x03\x2a': 'ntp_monlist',      # NTP monlist response
+    b'\xd7\x00\x03\x2a': 'ntp_monlist',      # NTP monlist alt
+    b'STAT\r\n': 'memcached',                 # Memcached stats response
+    b'VALUE ': 'memcached',                    # Memcached value response
+    b'\x30\x84': 'cldap',                     # CLDAP SearchResult (ASN.1 long form)
+    b'\x30\x82': 'cldap',                     # CLDAP SearchResult (ASN.1)
+    b'\xff\xff\xff\xff\xff\xff': 'chargen',   # Chargen padding
+}
+
+
+# ---------------------------------------------------------------------------
 # Traffic Analyser
 # ---------------------------------------------------------------------------
 
@@ -1074,32 +1168,23 @@ class TrafficAnalyser:
         self.total_packets = 0
         self.fragment_count = 0        # IP fragmented packets (MF flag or frag offset > 0)
         self.ioc_hits: list = []
+        self.payload_signatures: dict = {}  # {"ntp_monlist": 5, "memcached": 0, ...}
+        self._src_ip_hll = HyperLogLog()
         self._src_ip_overflow = False   # flag: True once we hit cap
         # Per-VM tracking (Feature 2): inner dst IP after GRE decapsulation
         self.inner_dst_ips: dict = {}  # inner_dst_ip -> packet count
         self.per_vm_detail: dict = {}  # inner_dst_ip -> {pps, bps, tcp, udp, icmp, src_ips}
 
     def _evict_low_count_ips(self) -> None:
-        """Evict bottom 20% of source IPs by count to make room for new ones.
-        Keeps high-count IPs (the real attackers) and removes low-count noise."""
-        if not self.src_ips:
+        """Cap src_ips dict at MAX_SRC_IPS. Instead of sorting all entries,
+        just stop inserting new IPs once full. The HLL tracks true cardinality."""
+        if len(self.src_ips) <= self.MAX_SRC_IPS:
             return
-        # Find the 20th percentile count threshold
-        counts = sorted(self.src_ips.values())
-        cutoff_idx = len(counts) // 5  # bottom 20%
-        cutoff_count = counts[cutoff_idx] if cutoff_idx < len(counts) else 1
-
-        to_remove = [ip for ip, cnt in self.src_ips.items() if cnt <= cutoff_count]
-        # Don't evict more than 20% to avoid over-pruning
-        to_remove = to_remove[:len(self.src_ips) // 5]
-
-        for ip in to_remove:
+        # Simple strategy: remove IPs with count == 1 (one-hit wonders)
+        to_remove = [ip for ip, c in self.src_ips.items() if c <= 1]
+        for ip in to_remove[:len(self.src_ips) - self.MAX_SRC_IPS + 1000]:
             del self.src_ips[ip]
             self.src_ip_detail.pop(ip, None)
-
-        if to_remove:
-            logger.debug("Evicted %d low-count source IPs (threshold=%d, remaining=%d)",
-                         len(to_remove), cutoff_count, len(self.src_ips))
 
     def process_packet(self, pkt, ioc_matcher=None, gre_decap=None,
                        hypervisor_mode: bool = False) -> None:
@@ -1142,8 +1227,9 @@ class TrafficAnalyser:
             elif len(self.src_ips) < self.MAX_SRC_IPS:
                 self.src_ips[src] = 1
             else:
-                # Evict bottom 20% by count to make room for new IPs
+                # Evict one-hit wonders to make room for new IPs
                 self._evict_low_count_ips()
+            self._src_ip_hll.add(src)
 
             # Bounded packet length / TTL samples (use inner packet length)
             if len(self.pkt_lengths) < self.MAX_PKT_SAMPLES:
@@ -1241,6 +1327,14 @@ class TrafficAnalyser:
             hit = ioc_matcher.check(bytes(pkt[Raw].load))
             if hit and len(self.ioc_hits) < self.MAX_IOC_HITS:
                 self.ioc_hits.append(hit)
+
+        # Payload signature matching for amplification identification
+        if pkt.haslayer(Raw) and len(self.payload_signatures) < 100:
+            payload = bytes(pkt[Raw].load[:8])
+            for sig, name in _PAYLOAD_SIGS.items():
+                if payload.startswith(sig):
+                    self.payload_signatures[name] = self.payload_signatures.get(name, 0) + 1
+                    break
 
     def src_ip_entropy(self) -> float:
         total = sum(self.src_ips.values())
@@ -1721,6 +1815,7 @@ class PcapCapture:
         # as a fallback for pre-attack packet capture in Scapy mode.
         _ring_size = 200 if self.pcap_mode == "scapy" else 1000
         self.ring_buffer: collections.deque = collections.deque(maxlen=_ring_size)
+        self._ring_lock = threading.Lock()
         self.capture_packets: list = []
         self._capture_lock = threading.Lock()
         self.capturing = False
@@ -1868,51 +1963,24 @@ class PcapCapture:
         try:
             import subprocess
 
-            # Auto-install tcpdump if not present
             if subprocess.run(["which", "tcpdump"], capture_output=True).returncode != 0:
-                logger.info("tcpdump not found, attempting to install...")
-                installed = False
-                for pm_cmd in [
-                    ["apt-get", "install", "-y", "tcpdump"],
-                    ["yum", "install", "-y", "tcpdump"],
-                    ["dnf", "install", "-y", "tcpdump"],
-                    ["apk", "add", "tcpdump"],
-                    ["pacman", "-S", "--noconfirm", "tcpdump"],
-                ]:
-                    try:
-                        r = subprocess.run(pm_cmd, capture_output=True, timeout=60)
-                        if r.returncode == 0:
-                            logger.info("tcpdump installed via %s", pm_cmd[0])
-                            installed = True
-                            break
-                    except (FileNotFoundError, subprocess.TimeoutExpired):
-                        continue
-                if not installed:
-                    self._tcpdump_unavailable(
-                        "tcpdump is not installed and automatic installation failed.  "
-                        "Install it manually (e.g. apt-get install tcpdump) and restart the agent."
-                    )
-                    return
+                self._tcpdump_unavailable(
+                    "tcpdump is not installed. Install it manually:\n"
+                    "  Debian/Ubuntu:  apt-get install -y tcpdump\n"
+                    "  RHEL/CentOS:    yum install -y tcpdump\n"
+                    "  Alpine:         apk add tcpdump\n"
+                    "  Arch:           pacman -S tcpdump"
+                )
+                return
 
-            # Also ensure mergecap is available (for merging ring files on capture stop)
             if subprocess.run(["which", "mergecap"], capture_output=True).returncode != 0:
-                for pm_cmd in [
-                    ["apt-get", "install", "-y", "wireshark-common"],
-                    ["yum", "install", "-y", "wireshark-cli"],
-                    ["dnf", "install", "-y", "wireshark-cli"],
-                ]:
-                    try:
-                        r = subprocess.run(pm_cmd, capture_output=True, timeout=120)
-                        if r.returncode == 0:
-                            logger.info("mergecap installed via %s", pm_cmd[0])
-                            break
-                    except (FileNotFoundError, subprocess.TimeoutExpired):
-                        continue
+                logger.warning("mergecap not found -- PCAP merging disabled. "
+                               "Install wireshark-common (apt) or wireshark-cli (yum) for full PCAP support.")
 
             self._tcpdump_proc = subprocess.Popen(
                 tcpdump_cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
             _restarts = 0
             _last_start = time.monotonic()
@@ -1927,6 +1995,13 @@ class PcapCapture:
                     else:
                         logger.warning("tcpdump exited (code %d, ran %.0fs)",
                                        _exit_code, _ran_for)
+                        _stderr_out = ""
+                        try:
+                            _stderr_out = self._tcpdump_proc.stderr.read().decode(errors='replace').strip()
+                        except Exception:
+                            pass
+                        if _stderr_out:
+                            logger.warning("tcpdump stderr: %s", _stderr_out[:500])
                         _restarts += 1
                     if _restarts > 5:
                         self._tcpdump_unavailable(
@@ -1950,7 +2025,7 @@ class PcapCapture:
                                     _restarts, _backoff)
                         self._tcpdump_proc = subprocess.Popen(
                             tcpdump_cmd, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+                            stderr=subprocess.PIPE)
                         _last_start = time.monotonic()
 
             self._tcpdump_proc.terminate()
@@ -1977,7 +2052,8 @@ class PcapCapture:
             logger.warning("Ring buffer sniff error: %s", exc)
 
     def _ring_cb(self, pkt) -> None:
-        self.ring_buffer.append(pkt)
+        with self._ring_lock:
+            self.ring_buffer.append(pkt)
         if self.capturing and len(self.capture_packets) < self.max_capture:
             with self._capture_lock:
                 self.capture_packets.append(pkt)  # always store original (unstripped) for forensics
@@ -4034,6 +4110,8 @@ class Agent:
         self.monitor = PPSMonitor(cfg.get("interface", "auto"))
         self.baseline = BaselineManager(
             window=cfg.get("baseline_window", 300))
+        self._baseline_path = '/var/lib/ftagent/baseline.json'
+        self.baseline.restore_state(self._baseline_path)
         self.analyser = TrafficAnalyser()
         self.ioc_matcher = IOCMatcher()
         self.ip_blocklist: set = set()  # threat intel IPs from server
@@ -4106,9 +4184,18 @@ class Agent:
         self.last_update: float = 0.0
         self.server_threshold: float | None = None
 
+        # Velocity detection (opt-in via config)
+        self._velocity_detection = bool(cfg.get("velocity_detection", False))
+        self._prev_tick_pps: float = 0.0
+
+        # Classification voting / locking
+        self._classification_votes: dict = {}  # {"tcp_flood": 3, "udp_flood": 1}
+        self._classification_locked: str = ""  # locked family once confident
+
         # Metrics batching: buffer locally, POST every N seconds
         self._metrics_interval = 5  # seconds between API POSTs
         self._metrics_buffer: list = []
+        self._metrics_queue: queue.Queue = queue.Queue(maxsize=100)
         self._last_metrics_push: float = 0.0
         self._start_mono: float = time.monotonic()
 
@@ -4167,6 +4254,8 @@ class Agent:
                              name="config"),
             threading.Thread(target=self._command_poll_loop, daemon=True,
                              name="command-poll"),
+            threading.Thread(target=self._metrics_sender_loop, daemon=True,
+                             name="metrics-sender"),
         ]
 
         # PCAP sniffer thread (tracked for watchdog restart)
@@ -4288,6 +4377,10 @@ class Agent:
                 capture_output=True, timeout=5)
         except Exception:
             pass
+        try:
+            self.baseline.save_state(self._baseline_path)
+        except Exception as e:
+            logger.debug("Baseline save on shutdown: %s", e)
         self.shutdown.set()
 
     def _tick(self) -> None:
@@ -4423,6 +4516,16 @@ class Agent:
                 if bps > self.baseline.bps_threshold:
                     _trigger = True
 
+            # Velocity detection (opt-in): trigger on extreme rate-of-change even
+            # if absolute threshold isn't crossed. Catches ramp-up phases of attacks.
+            # Disabled by default -- can produce false positives on bursty workloads.
+            if not _trigger and self._velocity_detection and self.baseline.baseline_ready:
+                _delta = pps - self._prev_tick_pps
+                if _delta > self.baseline.avg_pps * 5 and pps > self.baseline.avg_pps * 2:
+                    _trigger = True
+                    logger.info("Velocity trigger: delta=%.0f (%.0fx avg), pps=%.0f",
+                                _delta, _delta / max(self.baseline.avg_pps, 1), pps)
+
             # Startup grace period: don't trigger during the first 90 seconds
             # so the baseline can warm up. This prevents false positives from
             # normal startup spikes (cache warming, log rotation, etc.).
@@ -4479,6 +4582,8 @@ class Agent:
             elif time.monotonic() - self.last_update >= 5:
                 self._update_attack()
 
+        self._prev_tick_pps = pps
+
     def _flush_metrics(self) -> None:
         """Aggregate buffered metrics and send a single API POST."""
         buf = self._metrics_buffer
@@ -4498,7 +4603,22 @@ class Agent:
             "samples":   n,
         }
         self._metrics_buffer = []
-        self.api.send_metrics(agg)
+        try:
+            self._metrics_queue.put_nowait(agg)
+        except queue.Full:
+            pass  # drop oldest if queue is full (backpressure)
+
+    def _metrics_sender_loop(self) -> None:
+        """Background thread: drains metrics queue and POSTs to API."""
+        while not self.shutdown.is_set():
+            try:
+                agg = self._metrics_queue.get(timeout=2)
+            except queue.Empty:
+                continue
+            try:
+                self.api.send_metrics(agg)
+            except Exception as e:
+                logger.debug("Metrics POST failed: %s", e)
 
     def _flush_vm_stats(self) -> None:
         """Send per-VM inner IP stats to the backend (Feature 2)."""
@@ -4519,6 +4639,8 @@ class Agent:
             self.peak_pps = self.flow.aggregator.pps
             self.peak_bps = self.flow.aggregator.bps
         self.below_count = 0
+        self._classification_votes = {}
+        self._classification_locked = ""
         self.velocity_curve = []
         self.analyser.reset()
         self.last_update = time.monotonic()
@@ -4532,10 +4654,8 @@ class Agent:
         _syn_est = 0.0
         _ring_tcp = _ring_udp = _ring_icmp = 0
         if SCAPY_AVAILABLE and self.pcap.ring_buffer:
-            try:
+            with self.pcap._ring_lock:
                 _ring_snapshot = list(self.pcap.ring_buffer)
-            except RuntimeError:
-                _ring_snapshot = []
             _syn_c = _ack_c = 0
             for _rpkt in _ring_snapshot:
                 if _rpkt.haslayer(TCP):
@@ -4828,22 +4948,31 @@ class Agent:
 
         proto = self._proto_breakdown()
         _frag_pct = self.analyser.fragment_pct()
-        family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"],
-                                 syn_ratio=self.analyser.syn_ratio(),
-                                 dns_detected=bool(self.analyser.dns_queries),
-                                 top_ports=self.analyser.top_dst_ports(),
-                                 tcp_flags=dict(self.analyser.tcp_flags),
-                                 other_pct=proto.get("other", 0.0),
-                                 fragment_pct=_frag_pct)
-        # Enrich classification with IOC threat intel
-        family, _upd_subtype, _upd_tool, _ = enrich_from_ioc(
-            self.analyser.ioc_hits, family, "")
+        if not self._classification_locked:
+            family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"],
+                                     syn_ratio=self.analyser.syn_ratio(),
+                                     dns_detected=bool(self.analyser.dns_queries),
+                                     top_ports=self.analyser.top_dst_ports(),
+                                     tcp_flags=dict(self.analyser.tcp_flags),
+                                     other_pct=proto.get("other", 0.0),
+                                     fragment_pct=_frag_pct)
+            family, _upd_subtype, _upd_tool, _ = enrich_from_ioc(
+                self.analyser.ioc_hits, family, "")
+            # Track votes and lock once a family has 3+ consecutive votes
+            self._classification_votes[family] = self._classification_votes.get(family, 0) + 1
+            if self._classification_votes[family] >= 3:
+                self._classification_locked = family
+                logger.info("Classification locked: %s (3+ consistent votes)", family)
+        else:
+            family = self._classification_locked
+            _upd_subtype = None
+            _upd_tool = None
 
         # Merge source IP data: use whichever source (scapy or flow) has more visibility
         _scapy_src_count = len(self.analyser.src_ips)
         _scapy_top_ips = self.analyser.top_src_ips()
         _scapy_top_ports = self.analyser.top_dst_ports()
-        _src_count = _scapy_src_count
+        _src_count = max(_scapy_src_count, self.analyser._src_ip_hll.count())
         _top_ips = _scapy_top_ips
         _top_ports = _scapy_top_ports
         if self.flow and self.flow.aggregator.src_ip_count > _scapy_src_count:
@@ -4914,6 +5043,34 @@ class Agent:
         family, subtype, _end_tool, _ioc_conf_boost = enrich_from_ioc(
             self.analyser.ioc_hits, family, subtype)
 
+        # Override subtype from payload signatures if we have strong evidence
+        if self.analyser.payload_signatures:
+            top_sig = max(self.analyser.payload_signatures.items(), key=lambda x: x[1])
+            if top_sig[1] >= 5:  # at least 5 matching packets
+                _sig_subtypes = {
+                    'ntp_monlist': 'ntp_amplification',
+                    'memcached': 'memcached_amplification',
+                    'cldap': 'cldap_amplification',
+                    'chargen': 'chargen_amplification',
+                }
+                if top_sig[0] in _sig_subtypes:
+                    subtype = _sig_subtypes[top_sig[0]]
+                    if family in ('udp_flood', 'unknown', 'multi_vector'):
+                        family = 'udp_flood'
+
+        # Merge source IP data: prefer flow collector if it has broader visibility
+        _scapy_src_count = len(self.analyser.src_ips)
+        _src_count = max(_scapy_src_count, self.analyser._src_ip_hll.count())
+        _top_ips = self.analyser.top_src_ips()
+        _top_ports_final = _top_ports
+        if self.flow and self.flow.aggregator.src_ip_count > _src_count:
+            _src_count = self.flow.aggregator.src_ip_count
+            _top_ips = [{"ip": ip, "count": pkts}
+                        for ip, pkts in self.flow.aggregator.top_src_ips(20)]
+        if self.flow and len(self.flow.aggregator.top_dst_ports(20)) > len(_top_ports):
+            _top_ports_final = [{"port": p, "count": pkts}
+                                for p, pkts in self.flow.aggregator.top_dst_ports(20)]
+
         # Compute incident-level confidence score (0-100).
         # Combines multiple signals to distinguish real attacks from traffic spikes.
         _conf = 30  # base
@@ -4946,26 +5103,13 @@ class Agent:
             _conf += 10
         _conf = max(0, min(100, _conf))
 
-        logger.warning("ATTACK ENDED — duration=%.0fs peak_pps=%.0f family=%s subtype=%s confidence=%d",
+        logger.warning("ATTACK ENDED -- duration=%.0fs peak_pps=%.0f family=%s subtype=%s confidence=%d",
                        duration, self.peak_pps, family, subtype or "none", _conf)
 
         if not self.incident_uuid:
-            logger.error("Cannot resolve incident — UUID is empty (open_incident likely failed)")
+            logger.error("Cannot resolve incident -- UUID is empty (open_incident likely failed)")
             self.attacking = False
             return
-
-        # Merge source IP data: prefer flow collector if it has broader visibility
-        _scapy_src_count = len(self.analyser.src_ips)
-        _src_count = _scapy_src_count
-        _top_ips = self.analyser.top_src_ips()
-        _top_ports_final = _top_ports
-        if self.flow and self.flow.aggregator.src_ip_count > _scapy_src_count:
-            _src_count = self.flow.aggregator.src_ip_count
-            _top_ips = [{"ip": ip, "count": pkts}
-                        for ip, pkts in self.flow.aggregator.top_src_ips(20)]
-        if self.flow and len(self.flow.aggregator.top_dst_ports(20)) > len(_top_ports):
-            _top_ports_final = [{"port": p, "count": pkts}
-                                for p, pkts in self.flow.aggregator.top_dst_ports(20)]
 
         _resolve_data = {
             "duration_seconds": round(duration, 1),
