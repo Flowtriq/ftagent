@@ -2977,7 +2977,11 @@ def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
         return "syn_flood"
     if icmp_pct > 30:
         return "icmp_flood"
-    elevated = sum(1 for v in (tcp_pct, udp_pct, icmp_pct) if v > 15)
+    # Multi-vector requires at least two protocols with SIGNIFICANT presence (>25%).
+    # Normal internet traffic is typically ~65% TCP / ~30% UDP / ~1% ICMP, which
+    # should NOT be classified as multi-vector. The old 15% threshold caused most
+    # traffic spikes on mixed-protocol networks to appear as coordinated attacks.
+    elevated = sum(1 for v in (tcp_pct, udp_pct, icmp_pct) if v > 25)
     if elevated >= 2:
         return "multi_vector"
     # GRE/ESP/IPIP/other protocol floods
