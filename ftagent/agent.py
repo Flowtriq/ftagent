@@ -1963,19 +1963,46 @@ class PcapCapture:
         try:
             import subprocess
 
+            # Auto-install tcpdump if not present (it's a prerequisite)
             if subprocess.run(["which", "tcpdump"], capture_output=True).returncode != 0:
-                self._tcpdump_unavailable(
-                    "tcpdump is not installed. Install it manually:\n"
-                    "  Debian/Ubuntu:  apt-get install -y tcpdump\n"
-                    "  RHEL/CentOS:    yum install -y tcpdump\n"
-                    "  Alpine:         apk add tcpdump\n"
-                    "  Arch:           pacman -S tcpdump"
-                )
-                return
+                logger.info("tcpdump not found, attempting to install...")
+                installed = False
+                for pm_cmd in [
+                    ["apt-get", "install", "-y", "tcpdump"],
+                    ["yum", "install", "-y", "tcpdump"],
+                    ["dnf", "install", "-y", "tcpdump"],
+                    ["apk", "add", "tcpdump"],
+                    ["pacman", "-S", "--noconfirm", "tcpdump"],
+                ]:
+                    try:
+                        r = subprocess.run(pm_cmd, capture_output=True, timeout=60)
+                        if r.returncode == 0:
+                            logger.info("tcpdump installed via %s", pm_cmd[0])
+                            installed = True
+                            break
+                    except (FileNotFoundError, subprocess.TimeoutExpired):
+                        continue
+                if not installed:
+                    self._tcpdump_unavailable(
+                        "tcpdump is not installed and automatic installation failed.  "
+                        "Install it manually (e.g. apt-get install tcpdump) and restart the agent."
+                    )
+                    return
 
+            # Auto-install mergecap for PCAP merging
             if subprocess.run(["which", "mergecap"], capture_output=True).returncode != 0:
-                logger.warning("mergecap not found -- PCAP merging disabled. "
-                               "Install wireshark-common (apt) or wireshark-cli (yum) for full PCAP support.")
+                for pm_cmd in [
+                    ["apt-get", "install", "-y", "wireshark-common"],
+                    ["yum", "install", "-y", "wireshark-cli"],
+                    ["dnf", "install", "-y", "wireshark-cli"],
+                ]:
+                    try:
+                        r = subprocess.run(pm_cmd, capture_output=True, timeout=120)
+                        if r.returncode == 0:
+                            logger.info("mergecap installed via %s", pm_cmd[0])
+                            break
+                    except (FileNotFoundError, subprocess.TimeoutExpired):
+                        continue
 
             self._tcpdump_proc = subprocess.Popen(
                 tcpdump_cmd,
