@@ -761,7 +761,7 @@ class PPSMonitor:
         try:
             with open("/proc/net/dev") as f:
                 for line in f:
-                    if self.interface in line:
+                    if line.strip().startswith(self.interface + ":"):
                         fields = line.split(":")[1].split()
                         return int(fields[1]), int(fields[0])
         except (OSError, IndexError, ValueError):
@@ -830,6 +830,11 @@ class BaselineManager:
     # Per-hour deque size: 360 samples = ~6 hours of data for each hour slot.
     _HOURLY_WINDOW = 360
 
+    # BPS baseline: catch amplification attacks that are low PPS but high bandwidth.
+    # NTP amplification at 2000 PPS with 1400-byte packets = 22 Gbps.
+    _BPS_MULTIPLIER = 3  # trigger at 3x p99 BPS
+    _MIN_READY_BPS_THRESHOLD = 50_000_000  # 50 Mbps minimum (below this, BPS trigger is off)
+
     def __init__(self, window: int = 300):
         self.WINDOW = window
         self.samples: collections.deque = collections.deque(maxlen=self.WINDOW)
@@ -840,6 +845,12 @@ class BaselineManager:
         self.baseline_ready = False
         self._since_recalc = 0
         self._running_sum = 0.0
+        # BPS baseline for bandwidth-based detection
+        self.bps_samples: collections.deque = collections.deque(maxlen=self.WINDOW)
+        self.avg_bps = 0.0
+        self.p99_bps = 0.0
+        self.bps_threshold = 0.0
+        self._bps_running_sum = 0.0
         # Time-of-day baselines: per-hour deques for adaptive thresholds
         self._hourly_baselines: dict[int, collections.deque] = {
             h: collections.deque(maxlen=self._HOURLY_WINDOW) for h in range(24)
@@ -847,12 +858,18 @@ class BaselineManager:
         self._hourly_p99: dict[int, float] = {}
         self._hourly_ready: bool = False  # True once current hour has enough data
 
-    def add(self, pps: float) -> None:
+    def add(self, pps: float, bps: float = 0.0) -> None:
         # Track evicted sample for running sum
         if len(self.samples) == self.samples.maxlen:
             self._running_sum -= self.samples[0]
         self.samples.append(pps)
         self._running_sum += pps
+
+        # BPS tracking for bandwidth-based detection
+        if len(self.bps_samples) == self.bps_samples.maxlen:
+            self._bps_running_sum -= self.bps_samples[0]
+        self.bps_samples.append(bps)
+        self._bps_running_sum += bps
 
         # Feed into the hourly bucket for time-of-day awareness
         current_hour = datetime.now().hour
@@ -869,8 +886,19 @@ class BaselineManager:
         if self._since_recalc >= self._RECALC_EVERY:
             self._since_recalc = 0
             sorted_s = sorted(self.samples)
-            self.p95_pps = sorted_s[int(n * 0.95)]
-            self.p99_pps = sorted_s[int(n * 0.99)]
+            # Use min(index, n-1) to avoid index-equals-max for small sample sets
+            self.p95_pps = sorted_s[min(int(n * 0.95), n - 1)]
+            self.p99_pps = sorted_s[min(int(n * 0.99), n - 1)]
+
+            # BPS percentile
+            bps_n = len(self.bps_samples)
+            if bps_n >= 2:
+                self.avg_bps = self._bps_running_sum / bps_n
+                sorted_bps = sorted(self.bps_samples)
+                self.p99_bps = sorted_bps[min(int(bps_n * 0.99), bps_n - 1)]
+                if self.baseline_ready:
+                    self.bps_threshold = max(self.p99_bps * self._BPS_MULTIPLIER,
+                                             self._MIN_READY_BPS_THRESHOLD)
 
             # Compute hourly p99 for the current hour if enough samples
             hourly_samples = self._hourly_baselines[current_hour]
@@ -1240,11 +1268,27 @@ class TrafficAnalyser:
         return round(entropy, 3)
 
     def spoofing_detected(self) -> bool:
-        return self.ttl_entropy() < 1.5 and len(self.src_ips) > 100
+        # Spoofing = high source IP diversity + high TTL entropy (random fake IPs
+        # traverse different path lengths producing varied TTLs) + uniform packet
+        # characteristics (attack tools produce identical packets from different "sources").
+        # The OLD heuristic (low TTL entropy + many IPs) was inverted: that pattern
+        # indicates a real botnet (many hosts at similar hop counts), not spoofing.
+        if len(self.src_ips) < 500:
+            return False
+        ttl_ent = self.ttl_entropy()
+        src_ent = self.src_ip_entropy()
+        # High TTL entropy (>4.0) with high source entropy (>8.0) suggests spoofing
+        if ttl_ent > 4.0 and src_ent > 8.0:
+            return True
+        # Very high source count with near-uniform distribution (each IP sends ~same count)
+        if len(self.src_ips) > 5000 and src_ent > 10.0:
+            return True
+        return False
 
     def botnet_detected(self) -> bool:
-        # Heuristic: many source IPs
-        if len(self.src_ips) > 300:
+        # Heuristic: many source IPs (raised from 300 to 5000 to avoid flagging
+        # legitimate flash crowds from viral events or product launches)
+        if len(self.src_ips) > 5000:
             return True
         # IOC-based: any botnet family signature matched
         botnet_keywords = ("mirai", "gafgyt", "bashlite", "mozi", "xorddos",
@@ -1382,6 +1426,14 @@ class TrafficAnalyser:
         if not self.pkt_lengths:
             return 0.0
         return round(sum(self.pkt_lengths) / len(self.pkt_lengths), 1)
+
+    def pkt_length_std(self) -> float:
+        """Standard deviation of packet lengths. Low std = uniform sizes (attack tool signature)."""
+        if len(self.pkt_lengths) < 2:
+            return 999.0  # not enough data, return high value (= not uniform)
+        avg = sum(self.pkt_lengths) / len(self.pkt_lengths)
+        variance = sum((x - avg) ** 2 for x in self.pkt_lengths) / len(self.pkt_lengths)
+        return round(variance ** 0.5, 1)
 
     def dns_query_stats(self) -> dict:
         return {
@@ -2969,7 +3021,10 @@ def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
     # Fragment flood: overwhelmingly fragmented traffic is its own family
     if fragment_pct > 50:
         return "fragment_flood"
-    if dns_detected:
+    # DNS flood requires DNS to be a significant portion of traffic, not just
+    # one query in the ring buffer. A single DNS lookup during a UDP flood
+    # should not reclassify the entire attack as dns_flood.
+    if dns_detected and udp_pct > 40:
         return "dns_flood"
     if udp_pct > 45:
         return "udp_flood"
@@ -4043,6 +4098,7 @@ class Agent:
         self.peak_pps: float = 0.0
         self.peak_bps: float = 0.0
         self.below_count: int = 0
+        self._above_count: int = 0  # sustained confirmation counter
         self._last_attack_end: float = 0.0
         self._attack_cooldown: float = 60.0  # suppress re-detection for 60s after attack ends
         self.velocity_curve: list = []
@@ -4266,9 +4322,12 @@ class Agent:
         # threshold and make future detection less sensitive.
         # Also skip samples above the absolute floor when baseline isn't ready,
         # so a new node getting attacked doesn't build a baseline from attack data.
+        # Also skip samples during the sustained-confirmation window (_above_count > 0)
+        # to prevent threshold creep from repeated attack probes.
         _abs_floor = self.server_threshold or 10000
-        if not self.attacking and (self.baseline.baseline_ready or pps < _abs_floor):
-            self.baseline.add(pps)
+        _in_confirmation = getattr(self, '_above_count', 0) > 0
+        if not self.attacking and not _in_confirmation and (self.baseline.baseline_ready or pps < _abs_floor):
+            self.baseline.add(pps, bps)
 
         # Buffer metrics locally, flush every _metrics_interval seconds.
         # Detection still runs every 1s tick — only the API POST is batched.
@@ -4357,6 +4416,12 @@ class Agent:
             _trigger = pps > _effective_threshold
             if not self.baseline.baseline_ready and pps >= _absolute_floor:
                 _trigger = True
+            # BPS-based trigger: catch amplification attacks that are low PPS but
+            # high bandwidth. Only fires after baseline is ready and BPS threshold
+            # is meaningful (above 50 Mbps floor).
+            if not _trigger and self.baseline.baseline_ready and self.baseline.bps_threshold > 0:
+                if bps > self.baseline.bps_threshold:
+                    _trigger = True
 
             # Startup grace period: don't trigger during the first 90 seconds
             # so the baseline can warm up. This prevents false positives from
@@ -4846,11 +4911,43 @@ class Agent:
                 if family == "unknown":
                     family = "tcp_flood"
         # Enrich classification with IOC threat intel
-        family, subtype, _end_tool, _ = enrich_from_ioc(
+        family, subtype, _end_tool, _ioc_conf_boost = enrich_from_ioc(
             self.analyser.ioc_hits, family, subtype)
 
-        logger.warning("ATTACK ENDED — duration=%.0fs peak_pps=%.0f family=%s subtype=%s",
-                       duration, self.peak_pps, family, subtype or "none")
+        # Compute incident-level confidence score (0-100).
+        # Combines multiple signals to distinguish real attacks from traffic spikes.
+        _conf = 30  # base
+        # PPS/threshold ratio: higher ratio = more confident
+        _ratio = self.peak_pps / max(self.threshold, 1)
+        _conf += min(25, int(_ratio * 5))  # up to +25 for 5x+ threshold
+        # Source IP analysis
+        if _src_count > 5000:
+            _conf += 10  # large distributed attack
+        elif _src_count > 1000:
+            _conf += 5
+        # Protocol homogeneity: single-protocol floods are more suspicious
+        _dominant = max(proto.get("tcp", 0), proto.get("udp", 0), proto.get("icmp", 0))
+        if _dominant > 80:
+            _conf += 10  # single protocol dominance
+        # Packet size uniformity: attack tools produce uniform sizes
+        if _avg_pkt > 0 and self.analyser.pkt_length_std() < 50:
+            _conf += 10
+        # Duration: longer attacks are more likely real
+        if duration > 60:
+            _conf += 5
+        elif duration < 15:
+            _conf -= 10  # very short, likely noise
+        # IOC matches boost
+        _conf += min(20, _ioc_conf_boost)
+        # Spoofing/botnet indicators
+        if self.analyser.spoofing_detected():
+            _conf += 10
+        if self.analyser.botnet_detected():
+            _conf += 10
+        _conf = max(0, min(100, _conf))
+
+        logger.warning("ATTACK ENDED — duration=%.0fs peak_pps=%.0f family=%s subtype=%s confidence=%d",
+                       duration, self.peak_pps, family, subtype or "none", _conf)
 
         if not self.incident_uuid:
             logger.error("Cannot resolve incident — UUID is empty (open_incident likely failed)")
@@ -4876,6 +4973,7 @@ class Agent:
             "peak_bps": round(self.peak_bps, 1),
             "attack_family": family,
             "attack_subtype": subtype or None,
+            "confidence": _conf,
             "protocol_breakdown": proto,
             "ioc_hits": list(set(self.analyser.ioc_hits)),
             "spoofing_detected": self.analyser.spoofing_detected(),
