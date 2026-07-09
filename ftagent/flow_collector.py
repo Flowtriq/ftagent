@@ -911,6 +911,16 @@ class FlowCollector:
             try:
                 records = self._parse(data, source_ip)
                 if records:
+                    # Apply sample rate override for protocols that don't embed
+                    # sampling info (NetFlow v9, IPFIX).  sFlow and NetFlow v5
+                    # already inflate packet/octet counts during parsing, so
+                    # only touch records still at the default sample_rate=1.
+                    if self.sample_rate_override > 1:
+                        for rec in records:
+                            if rec.sample_rate <= 1:
+                                rec.packets *= self.sample_rate_override
+                                rec.octets *= self.sample_rate_override
+                                rec.sample_rate = self.sample_rate_override
                     self._records_parsed += len(records)
                     self.aggregator.ingest(records)
             except Exception as e:

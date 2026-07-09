@@ -751,6 +751,69 @@ class TestFlowCollector:
         records = fc._auto_parse(b"\x00\x01", "10.0.0.1")
         assert records == []
 
+    def test_sample_rate_override_netflow_v9(self):
+        """sample_rate_override inflates NetFlow v9 records (sample_rate=1)."""
+        cfg = {"flow_protocol": "netflow_v9", "flow_port": 0,
+               "flow_bind": "0.0.0.0", "flow_sample_rate": 2048,
+               "flow_source_ips": []}
+        fc = FlowCollector(cfg)
+        assert fc.sample_rate_override == 2048
+
+        # Build a NetFlow v9 record that parses with sample_rate=1
+        cache = fc.template_cache
+        fields = [
+            (IE_SOURCE_IPV4_ADDRESS, 4),
+            (IE_DEST_IPV4_ADDRESS, 4),
+            (IE_PROTOCOL_IDENTIFIER, 1),
+            (IE_PACKET_DELTA_COUNT, 4),
+            (IE_OCTET_DELTA_COUNT, 4),
+        ]
+        tpl_data = _build_netflow_v9_template(100, 256, fields)
+        parse_netflow_v9(tpl_data, "10.0.0.1", cache)
+
+        record = socket.inet_aton("1.2.3.4") + socket.inet_aton("5.6.7.8")
+        record += struct.pack("!B", PROTO_TCP)
+        record += struct.pack("!II", 10, 5000)
+        data_pkt = _build_netflow_v9_data(100, 256, record)
+
+        records = fc._parse(data_pkt, "10.0.0.1")
+        assert len(records) == 1
+        assert records[0].sample_rate == 1  # raw from parser
+
+        # Simulate what the start() loop does after parsing
+        for rec in records:
+            if rec.sample_rate <= 1:
+                rec.packets *= fc.sample_rate_override
+                rec.octets *= fc.sample_rate_override
+                rec.sample_rate = fc.sample_rate_override
+
+        assert records[0].packets == 10 * 2048
+        assert records[0].octets == 5000 * 2048
+        assert records[0].sample_rate == 2048
+
+    def test_sample_rate_override_skips_sflow(self):
+        """sample_rate_override does NOT double-inflate sFlow records."""
+        cfg = {"flow_protocol": "auto", "flow_port": 0,
+               "flow_bind": "0.0.0.0", "flow_sample_rate": 2048,
+               "flow_source_ips": []}
+        fc = FlowCollector(cfg)
+        data = _build_sflow_v5_flow_sample(
+            src_ip="192.168.1.1", dst_ip="10.0.0.1",
+            src_port=54321, dst_port=80,
+            sampling_rate=1000)
+        records = fc._auto_parse(data, "10.0.0.1")
+        assert len(records) >= 1
+        assert records[0].sample_rate == 1000  # already inflated by parser
+
+        # Override should NOT apply since sample_rate > 1
+        for rec in records:
+            if rec.sample_rate <= 1:
+                rec.packets *= fc.sample_rate_override
+                rec.octets *= fc.sample_rate_override
+                rec.sample_rate = fc.sample_rate_override
+
+        assert records[0].sample_rate == 1000  # unchanged
+
     def test_stats_property(self):
         cfg = {"flow_protocol": "sflow", "flow_port": 0,
                "flow_bind": "0.0.0.0", "flow_sample_rate": 0,
