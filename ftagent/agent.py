@@ -4409,7 +4409,11 @@ class Agent:
             on_disk["_dashboard"] = overrides if overrides else {}
             changed = True
         if changed:
-            save_config(config_path, on_disk)
+            try:
+                save_config(config_path, on_disk)
+            except OSError as e:
+                logger.debug("Could not write dashboard overrides to %s: %s",
+                             config_path, e)
 
     def _signal_handler(self, signum, frame) -> None:
         logger.info("Received signal %d, shutting down...", signum)
