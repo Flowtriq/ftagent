@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.29"
+VERSION = "1.9.30"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -4388,6 +4388,29 @@ class Agent:
 
         logger.info("Agent shutting down")
 
+    def _save_dashboard_overrides(self, overrides: dict) -> None:
+        """Write dashboard-managed values back to config.json so the user can
+        see which settings are being controlled by the dashboard vs local."""
+        config_path = self.cfg.get("_config_path", CONFIG_PATH)
+        try:
+            with open(config_path) as f:
+                on_disk = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+        changed = False
+        # Update effective values in the main config body
+        for key, val in overrides.items():
+            if on_disk.get(key) != val:
+                on_disk[key] = val
+                changed = True
+        # Write the _dashboard section so user can see what the server pushed
+        prev = on_disk.get("_dashboard", {})
+        if prev != overrides:
+            on_disk["_dashboard"] = overrides if overrides else {}
+            changed = True
+        if changed:
+            save_config(config_path, on_disk)
+
     def _signal_handler(self, signum, frame) -> None:
         logger.info("Received signal %d, shutting down...", signum)
         # Clean up service port firewall rules before exit
@@ -5471,22 +5494,42 @@ class Agent:
                             self._executed_command_ids = set(list(self._executed_command_ids)[-250:])
 
             # Flow collector config from server (dashboard can enable/configure per node)
+            # Dashboard values override local config.json; local values act as
+            # fallback for anything the dashboard leaves at its default.
+            # After merging, the effective config + a _dashboard section are
+            # written back to config.json so the user can see what's in effect.
             flow_cfg = data.get("flow", {})
             if flow_cfg.get("enabled") and not self.flow:
                 # Server enabled flow collection — start collector
                 merged = dict(self.cfg)
                 merged["flow_enabled"] = True
-                merged["flow_protocol"] = flow_cfg.get("protocol", "auto")
-                merged["flow_port"] = flow_cfg.get("port", 0)
-                merged["flow_sample_rate"] = flow_cfg.get("sample_rate", 0)
-                merged["flow_source_ips"] = flow_cfg.get("source_ips", [])
+                # Dashboard overrides local config; local is fallback
+                _dash_overrides = {}
+                for local_key, dash_key, default in [
+                    ("flow_protocol", "protocol", "auto"),
+                    ("flow_port", "port", 0),
+                    ("flow_sample_rate", "sample_rate", 0),
+                    ("flow_source_ips", "source_ips", []),
+                ]:
+                    dash_val = flow_cfg.get(dash_key, default)
+                    if dash_val != default:
+                        # Dashboard has an explicit value — override local
+                        if merged.get(local_key, default) != dash_val:
+                            logger.info("Flow config: dashboard overrides %s "
+                                        "(%s -> %s)", local_key,
+                                        merged.get(local_key, default), dash_val)
+                        merged[local_key] = dash_val
+                        _dash_overrides[local_key] = dash_val
+                    # else: keep whatever is in local config (fallback)
                 self.flow = FlowCollector(merged)
                 self.flow.aggregator.node_ip = flow_cfg.get("node_ip", "")
                 threading.Thread(
                     target=self.flow.start, args=(self.shutdown,),
                     daemon=True, name="flow-collector").start()
-                logger.info("Flow collector enabled by server config: %s port %d (filtering dst_ip=%s)",
+                logger.info("Flow collector enabled: %s port %d (filtering dst_ip=%s)",
                            merged["flow_protocol"], self.flow.port, flow_cfg.get("node_ip", ""))
+                # Write effective config + dashboard overrides back to config.json
+                self._save_dashboard_overrides(_dash_overrides)
             elif flow_cfg.get("enabled") and self.flow:
                 # Update node IP filter (in case node IP changes)
                 self.flow.aggregator.node_ip = flow_cfg.get("node_ip", "")
