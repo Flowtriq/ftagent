@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.31"
+VERSION = "1.9.32"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1799,6 +1799,11 @@ class PcapCapture:
                  hypervisor_mode: bool = False):
         self.pcap_mode = cfg.get("pcap_mode", "tcpdump")
         self.enabled = cfg.get("pcap_enabled", True) and (SCAPY_AVAILABLE or self.pcap_mode == "tcpdump")
+
+        # Warn loudly when scapy mode is configured but scapy isn't installed
+        if self.pcap_mode == "scapy" and not SCAPY_AVAILABLE and cfg.get("pcap_enabled", True):
+            self._scapy_unavailable(cfg.get("_config_path", CONFIG_PATH))
+
         self.config_path = cfg.get("_config_path", CONFIG_PATH)
         self.pcap_dir = cfg.get("pcap_dir", "/var/lib/ftagent/pcaps")
         self.snaplen = cfg.get("pcap_snaplen", 0)  # 0 = full packet, or set to e.g. 256 for high-traffic links
@@ -1912,6 +1917,46 @@ class PcapCapture:
                 "Install tcpdump and restart the agent to restore full functionality."
             )
             self.enabled = False
+
+    def _scapy_unavailable(self, config_path: str) -> None:
+        """Handle scapy mode configured but scapy not installed.
+        Mirrors the tcpdump diagnostic so the user knows exactly what happened."""
+        border = "=" * 72
+        msg = f"""
+{border}
+  PCAP CAPTURE UNAVAILABLE - scapy is not installed
+{border}
+
+  Your pcap_mode is set to "scapy" but the scapy package is not installed.
+  Packet captures will be DISABLED until scapy is installed.
+
+  To fix this, run:
+      pip install scapy
+
+  Or switch to tcpdump mode in {config_path}:
+      "pcap_mode": "tcpdump"
+
+  tcpdump must be installed:
+      apt install tcpdump    (Debian/Ubuntu)
+      yum install tcpdump    (RHEL/CentOS)
+      apk add tcpdump        (Alpine)
+
+  You can also ingest traffic data from an upstream router or switch
+  using our built-in flow collector instead of local packet capture.
+  We support sFlow, NetFlow v5, NetFlow v9, and IPFIX.
+  Enable it in your config with "flow_enabled": true.
+
+{border}
+"""
+        # Log it so it always appears in journalctl / log file
+        for line in msg.strip().splitlines():
+            logger.warning(line)
+
+        # Also print to stderr for immediate visibility during startup
+        try:
+            print(msg, file=sys.stderr)
+        except Exception:
+            pass
 
     def _cleanup_ring_dir(self, keep_latest: int = 3) -> None:
         """Hard-enforce ring buffer size: keep only the newest `keep_latest`
@@ -6775,9 +6820,54 @@ def setup_wizard(config_path: str) -> None:
     base = input(f"  API Base URL [{cfg['api_base']}]: ").strip()
     if base:
         cfg["api_base"] = base
-    iface = input(f"  Network interface [{cfg['interface']}]: ").strip()
-    if iface:
+    # Discover available network interfaces
+    available_ifaces = []
+    try:
+        if PSUTIL_AVAILABLE:
+            available_ifaces = sorted(psutil.net_if_addrs().keys())
+        else:
+            available_ifaces = sorted(os.listdir('/sys/class/net/'))
+    except (OSError, FileNotFoundError):
+        pass
+
+    if available_ifaces:
+        print("\n  Available interfaces:")
+        for i, name in enumerate(available_ifaces, 1):
+            label = " (loopback)" if name == "lo" else ""
+            print(f"    {i}) {name}{label}")
+        print()
+
+    while True:
+        iface = input(f"  Network interface [{cfg['interface']}]: ").strip()
+        if not iface:
+            break  # keep default ("auto")
+
+        # Allow picking by number
+        if iface.isdigit() and available_ifaces:
+            idx = int(iface) - 1
+            if 0 <= idx < len(available_ifaces):
+                iface = available_ifaces[idx]
+            else:
+                print(f"  Invalid selection. Pick 1-{len(available_ifaces)} or type the interface name.")
+                continue
+
+        # Validate the interface exists (if we have a list)
+        if available_ifaces and iface != "auto" and iface not in available_ifaces:
+            print(f"  Warning: '{iface}' was not found in the available interfaces.")
+            confirm = input("  Use it anyway? [y/N]: ").strip().lower()
+            if confirm not in ("y", "yes"):
+                continue
+
+        # Warn about loopback
+        if iface == "lo":
+            print("  Warning: 'lo' is the loopback interface. It only sees traffic to/from localhost.")
+            confirm = input("  Are you sure? [y/N]: ").strip().lower()
+            if confirm not in ("y", "yes"):
+                continue
+
         cfg["interface"] = iface
+        break
+
     pcap = input("  Enable PCAP capture? [Y/n]: ").strip().lower()
     cfg["pcap_enabled"] = pcap != "n"
 
