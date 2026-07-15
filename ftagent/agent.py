@@ -4724,18 +4724,19 @@ class Agent:
             if _syn_c + _ack_c > 0:
                 _syn_est = _syn_c / (_syn_c + _ack_c)
 
-        # tcpdump mode: parse ring files for protocol classification
+        # tcpdump mode: parse ring files for protocol classification + source IPs
         _ring_total = _ring_tcp + _ring_udp + _ring_icmp
+        _tcpdump_src_ips: dict[str, int] = {}
         if self.pcap.pcap_mode == "tcpdump" and _ring_total == 0 and self.pcap._ring_dir:
             try:
                 import glob, subprocess
                 ring_files = sorted(glob.glob(os.path.join(self.pcap._ring_dir, "ring_*.pcap")))
                 if ring_files:
-                    # Use the most recent ring file
+                    # Read up to 500 packets from the most recent ring file
                     latest = ring_files[-1]
                     out = subprocess.run(
-                        ["tcpdump", "-nn", "-r", latest, "-c", "200", "-q"],
-                        capture_output=True, text=True, timeout=3)
+                        ["tcpdump", "-nn", "-r", latest, "-c", "500", "-q"],
+                        capture_output=True, text=True, timeout=5)
                     for _tline in out.stdout.splitlines():
                         if "UDP" in _tline or "udp" in _tline:
                             _ring_udp += 1
@@ -4747,8 +4748,17 @@ class Agent:
                                 _ack_c += 1
                         elif "ICMP" in _tline or "icmp" in _tline:
                             _ring_icmp += 1
+                        # Extract source IP: format is "IP <src_ip>.<port> > <dst>"
+                        # or "IP <src_ip> > <dst>" for ICMP
+                        _ip_match = re.match(r'.* IP (\d+\.\d+\.\d+\.\d+)', _tline)
+                        if _ip_match:
+                            _src = _ip_match.group(1)
+                            _tcpdump_src_ips[_src] = _tcpdump_src_ips.get(_src, 0) + 1
                     if _syn_c + _ack_c > 0:
                         _syn_est = _syn_c / (_syn_c + _ack_c)
+                    if _tcpdump_src_ips:
+                        logger.info("tcpdump ring: extracted %d unique source IPs from %s",
+                                    len(_tcpdump_src_ips), os.path.basename(latest))
             except Exception as _e:
                 logger.debug("tcpdump ring parse for classify: %s", _e)
 
@@ -4815,7 +4825,8 @@ class Agent:
                 inc_data["inner_ip_label"] = label
         if self.hypervisor_mode and self.analyser.inner_dst_ips:
             inc_data["vm_breakdown"] = self.analyser.per_vm_breakdown(self.vm_labels)
-        # Include flow collector source IPs + ports for immediate visibility
+        # Include source IPs for immediate visibility: prefer flow collector,
+        # fall back to tcpdump ring extraction for PPS-only mode
         if self.flow and self.flow.aggregator.src_ip_count > 0:
             inc_data["top_src_ips"] = [
                 {"ip": ip, "count": pkts}
@@ -4826,6 +4837,10 @@ class Agent:
                 for port, pkts in self.flow.aggregator.top_dst_ports(20)
             ]
             inc_data["source_ip_count"] = self.flow.aggregator.src_ip_count
+        elif _tcpdump_src_ips:
+            _sorted_td = sorted(_tcpdump_src_ips.items(), key=lambda x: x[1], reverse=True)[:20]
+            inc_data["top_src_ips"] = [{"ip": ip, "count": c} for ip, c in _sorted_td]
+            inc_data["source_ip_count"] = len(_tcpdump_src_ips)
         result = self.api.open_incident(inc_data)
 
         if result and "uuid" in result:
@@ -5022,7 +5037,7 @@ class Agent:
             _upd_subtype = None
             _upd_tool = None
 
-        # Merge source IP data: use whichever source (scapy or flow) has more visibility
+        # Merge source IP data: use whichever source (scapy, flow, or tcpdump) has more visibility
         _scapy_src_count = len(self.analyser.src_ips)
         _scapy_top_ips = self.analyser.top_src_ips()
         _scapy_top_ports = self.analyser.top_dst_ports()
@@ -5036,6 +5051,27 @@ class Agent:
         if self.flow and len(self.flow.aggregator.top_dst_ports(20)) > len(_scapy_top_ports):
             _top_ports = [{"port": p, "count": pkts}
                           for p, pkts in self.flow.aggregator.top_dst_ports(20)]
+        # Fallback: extract source IPs from tcpdump ring if scapy and flow have nothing
+        if not _top_ips and self.pcap.pcap_mode == "tcpdump" and self.pcap._ring_dir:
+            try:
+                import glob, subprocess
+                _ring_files = sorted(glob.glob(os.path.join(self.pcap._ring_dir, "ring_*.pcap")))
+                if _ring_files:
+                    _out = subprocess.run(
+                        ["tcpdump", "-nn", "-r", _ring_files[-1], "-c", "500", "-q"],
+                        capture_output=True, text=True, timeout=5)
+                    _td_ips: dict[str, int] = {}
+                    for _tl in _out.stdout.splitlines():
+                        _m = re.match(r'.* IP (\d+\.\d+\.\d+\.\d+)', _tl)
+                        if _m:
+                            _s = _m.group(1)
+                            _td_ips[_s] = _td_ips.get(_s, 0) + 1
+                    if _td_ips:
+                        _sorted_td = sorted(_td_ips.items(), key=lambda x: x[1], reverse=True)[:20]
+                        _top_ips = [{"ip": ip, "count": c} for ip, c in _sorted_td]
+                        _src_count = max(_src_count, len(_td_ips))
+            except Exception:
+                pass
 
         update_payload = {
             "peak_pps": round(self.peak_pps, 1),
