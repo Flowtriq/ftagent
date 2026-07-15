@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.32"
+VERSION = "1.9.33"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -180,8 +180,10 @@ def check_for_updates(force: bool = False, interactive: bool = True) -> None:
 
         _do_pip_upgrade()
 
-    except Exception:
-        pass  # Never let update check break the agent
+    except Exception as exc:
+        if interactive:
+            print(f"  Update check failed: {exc}")
+        # Never let update check break the agent
 
 
 def _verify_installed_version(expected_version: str) -> bool:
@@ -238,31 +240,80 @@ def _get_pypi_latest_version() -> str | None:
         return None
 
 
+def _get_binary_version() -> str | None:
+    """Run the ftagent binary from PATH and return its reported version."""
+    import subprocess as _sp
+    import shutil
+    ftagent_bin = shutil.which("ftagent")
+    if not ftagent_bin:
+        return None
+    try:
+        result = _sp.run(
+            [ftagent_bin, "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            # Output is like "ftagent 1.9.32"
+            return result.stdout.strip().split()[-1]
+    except Exception:
+        pass
+    return None
+
+
 def _do_pip_upgrade() -> None:
     """Run pip upgrade with post-install integrity verification."""
     import subprocess as _sp
+    import shutil
 
     previous_version = VERSION
     # Determine what PyPI says is latest before we install
     pypi_latest = _get_pypi_latest_version()
+    target = pypi_latest or "latest"
 
-    pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "ftagent"]
     break_system = False
 
+    def _run_pip(cmd, sudo=False):
+        """Run a pip command, handling PEP 668. Returns (success, break_system_used)."""
+        nonlocal break_system
+        if sudo:
+            cmd = ["sudo"] + cmd
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0 and "externally-managed-environment" in result.stderr:
+            cmd.insert(-1, "--break-system-packages")
+            break_system = True
+            result = _sp.run(cmd, capture_output=True, text=True, timeout=120)
+        return result.returncode == 0, result.stderr.strip()[:300]
+
+    # Step 1: Try normal pip upgrade
     print("  Updating ftagent...")
-    result = _sp.run(pip_cmd, capture_output=True, text=True, timeout=120)
-
-    # PEP 668: externally managed Python (Debian 12+, Ubuntu 23.04+)
-    if result.returncode != 0 and "externally-managed-environment" in result.stderr:
-        print("  System Python detected. Retrying with --break-system-packages...")
-        pip_cmd.insert(-1, "--break-system-packages")
-        break_system = True
-        result = _sp.run(pip_cmd, capture_output=True, text=True, timeout=120)
-
-    if result.returncode != 0:
-        print(f"  Update failed: {result.stderr.strip()}")
+    pip_cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir",
+               "--upgrade", "ftagent"]
+    ok, err = _run_pip(pip_cmd)
+    if not ok:
+        print(f"  Update failed: {err}")
         print("  Try manually: pip install --upgrade ftagent")
         return
+
+    # Step 2: Check if the actual binary picked up the new version
+    binary_ver = _get_binary_version()
+    if binary_ver and pypi_latest and binary_ver != pypi_latest:
+        # pip likely installed to user site but binary loads from system site.
+        # Retry with --force-reinstall (no-deps to keep it fast) then sudo.
+        print(f"  Binary still reports v{binary_ver}, forcing reinstall...")
+        force_cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                     "--force-reinstall", "--no-deps", f"ftagent=={pypi_latest}"]
+        ok, _ = _run_pip(force_cmd)
+        binary_ver = _get_binary_version() if ok else binary_ver
+
+        if binary_ver != pypi_latest:
+            print(f"  Binary still v{binary_ver}, retrying with sudo...")
+            sudo_cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                        "--force-reinstall", "--no-deps", f"ftagent=={pypi_latest}"]
+            ok, err = _run_pip(sudo_cmd, sudo=True)
+            if ok:
+                binary_ver = _get_binary_version()
+            else:
+                print(f"  sudo install failed: {err}")
 
     # Post-install verification
     verified = True
@@ -272,8 +323,6 @@ def _do_pip_upgrade() -> None:
         if not _verify_installed_version(pypi_latest):
             print(f"  WARNING: Version mismatch after install (expected {pypi_latest})")
             verified = False
-    else:
-        print("  WARNING: Could not query PyPI to verify target version")
 
     # 2. Verify the module imports cleanly
     if not _verify_module_imports():
@@ -289,8 +338,22 @@ def _do_pip_upgrade() -> None:
             print(f"  Try: pip install ftagent=={previous_version}")
         return
 
-    print("  Updated successfully. Restart the agent to use the new version.")
-    print("  Run: systemctl restart ftagent")
+    # 3. Final check: verify the actual binary reports the correct version
+    binary_ver = _get_binary_version()
+    if binary_ver and pypi_latest and binary_ver != pypi_latest:
+        # Don't rollback here — pip metadata is fine, it's a PATH/install location issue
+        print(f"  WARNING: ftagent binary still reports v{binary_ver} instead of v{pypi_latest}")
+        print(f"  The package was installed but the binary in PATH may be from a different install.")
+        print(f"  Try: sudo {sys.executable} -m pip install --force-reinstall ftagent=={pypi_latest}")
+        return
+
+    print(f"  Updated successfully to v{binary_ver or pypi_latest}.")
+
+    # Re-exec so the user immediately sees the new version
+    ftagent_bin = shutil.which("ftagent")
+    if ftagent_bin:
+        print("  Restarting with new version...\n")
+        os.execv(ftagent_bin, ["ftagent", "--version"])
 
 
 # ---------------------------------------------------------------------------
@@ -5373,7 +5436,7 @@ class Agent:
                     previous_version = VERSION
                     import subprocess
                     pip_cmd = [sys.executable, "-m", "pip", "install",
-                               "--upgrade", "ftagent"]
+                               "--no-cache-dir", "--upgrade", "ftagent"]
                     break_system = False
                     result = subprocess.run(
                         pip_cmd, capture_output=True, text=True, timeout=120,
@@ -5391,6 +5454,20 @@ class Agent:
                             result.stderr.strip()[:500])
                         continue
 
+                    # Check if binary actually picked up the new version
+                    binary_ver = _get_binary_version()
+                    if binary_ver and binary_ver != latest:
+                        logger.info(
+                            "Auto-update: binary still v%s, force-reinstalling...",
+                            binary_ver)
+                        force_cmd = [sys.executable, "-m", "pip", "install",
+                                     "--no-cache-dir", "--force-reinstall",
+                                     "--no-deps", f"ftagent=={latest}"]
+                        if break_system:
+                            force_cmd.insert(-1, "--break-system-packages")
+                        subprocess.run(
+                            force_cmd, capture_output=True, text=True, timeout=120)
+
                     # Post-install integrity verification
                     verified = True
 
@@ -5405,6 +5482,14 @@ class Agent:
                     if not _verify_module_imports():
                         logger.warning(
                             "Auto-update: new version fails import check")
+                        verified = False
+
+                    # Verify the actual binary version
+                    binary_ver = _get_binary_version()
+                    if binary_ver and binary_ver != latest:
+                        logger.warning(
+                            "Auto-update: binary reports v%s, expected v%s",
+                            binary_ver, latest)
                         verified = False
 
                     if not verified:
