@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.33"
+VERSION = "1.9.34"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -36,7 +36,6 @@ DEFAULT_CONFIG = {
     "pcap_dir": "/var/lib/ftagent/pcaps",
     "log_file": "/var/log/ftagent.log",
     "log_level": "INFO",
-    "dynamic_threshold": True,
     "baseline_window": 300,
     "health_port": 9100,
     "auto_update": True,
@@ -65,6 +64,9 @@ DEFAULT_CONFIG = {
     "mirror_subnets": [],          # Only monitor these destination CIDRs ["10.0.0.0/24"]
     "mirror_ip_labels": {},        # {"10.0.0.5": "Web Server", "10.0.0.6": "DB Server"}
     "mirror_capture_mode": "af_packet",  # "af_packet" (Linux, high perf) or "tcpdump" (fallback)
+    # Velocity detection — triggers on rapid PPS ramp-up even before absolute
+    # threshold is crossed.  Opt-in because bursty workloads can false-positive.
+    "velocity_detection": False,
     # Agones GameServer integration — label attacked pods via SDK sidecar
     "agones_sidecar": False,
     "agones_sidecar_port": 59358,      # Agones SDK HTTP port (default 59358)
@@ -972,7 +974,7 @@ class BaselineManager:
 
             if hour_has_data:
                 sorted_h = sorted(hourly_samples)
-                hourly_p99 = sorted_h[int(hourly_n * 0.99)]
+                hourly_p99 = sorted_h[min(int(hourly_n * 0.99), hourly_n - 1)]
                 self._hourly_p99[current_hour] = hourly_p99
                 # Hourly p99 drives the threshold, but never below half of
                 # the flat p99 to avoid dangerously low thresholds.
@@ -3598,7 +3600,7 @@ class ServicePortDetector:
         self.min_block_pps = 10  # minimum PPS from a source before blocking
 
     def detect_local_ips(self) -> None:
-        """Detect local IPs and add to auto-safelist. Called once on startup."""
+        """Detect local IPs and add to auto-safelist. Called on startup and refreshed periodically."""
         import subprocess
         safe = {"127.0.0.1", "127.0.0.53"}  # always protect localhost
         try:
@@ -4219,7 +4221,7 @@ class AgonesSidecar:
             with urllib.request.urlopen(req, timeout=3) as resp:
                 return resp.status == 200
         except Exception as exc:
-            logger.debug("Agones sidecar delete label %s: %s", key, exc)
+            logger.warning("Agones sidecar delete label %s: %s", key, exc)
             return False
 
     def mark_under_attack(self, family: str, peak_pps: float) -> None:
@@ -4249,7 +4251,14 @@ class Agent:
         self.baseline.restore_state(self._baseline_path)
         self.analyser = TrafficAnalyser()
         self.ioc_matcher = IOCMatcher()
-        self.ip_blocklist: set = set()  # threat intel IPs from server
+        self.ip_blocklist: set = set()  # threat intel IPs from server or local config
+
+        # Load local IOC patterns and blocklist if configured (for air-gapped deployments)
+        if cfg.get("ioc_patterns"):
+            self.ioc_matcher.load(cfg["ioc_patterns"])
+        if cfg.get("ip_blocklist") and isinstance(cfg["ip_blocklist"], list):
+            self.ip_blocklist = {e["indicator"] for e in cfg["ip_blocklist"]
+                                 if isinstance(e, dict) and e.get("indicator")}
 
         # GRE deduplication (Feature 1)
         self.gre_decap = GREDecapsulator(
@@ -4274,6 +4283,10 @@ class Agent:
         self.hypervisor_mode = bool(cfg.get("hypervisor_mode", False))
         self.vm_labels: dict = cfg.get("vm_labels", {})
         if self.hypervisor_mode:
+            if cfg.get("pcap_mode", "tcpdump") == "tcpdump":
+                logger.warning("Hypervisor mode requires pcap_mode='scapy' for per-VM tracking. "
+                               "Switching pcap_mode to 'scapy'. Set pcap_mode='scapy' in config to silence this.")
+                cfg["pcap_mode"] = "scapy"
             logger.info("Hypervisor mode enabled — per-VM inner IP tracking active")
 
         self.pcap = PcapCapture(
@@ -4304,6 +4317,10 @@ class Agent:
             self.agones = AgonesSidecar(port=cfg.get("agones_sidecar_port", 59358))
             logger.info("Agones sidecar integration enabled (port %d)",
                         cfg.get("agones_sidecar_port", 59358))
+            # Verify sidecar is reachable
+            if not self.agones.set_label("agent-ready", "true"):
+                logger.warning("Agones sidecar not reachable at localhost:%d — labels will fail until sidecar is running",
+                               cfg.get("agones_sidecar_port", 59358))
 
         self.attacking = False
         self.attack_start: float = 0.0
@@ -4314,8 +4331,7 @@ class Agent:
         self._above_count: int = 0  # sustained confirmation counter
         self._last_attack_end: float = 0.0
         self._attack_cooldown: float = 60.0  # suppress re-detection for 60s after attack ends
-        self.velocity_curve: list = []
-        self._MAX_VELOCITY_POINTS = 2000
+        self.velocity_curve: collections.deque = collections.deque(maxlen=2000)
         self.last_update: float = 0.0
         self.server_threshold: float | None = None
 
@@ -4803,7 +4819,7 @@ class Agent:
         self.below_count = 0
         self._classification_votes = {}
         self._classification_locked = ""
-        self.velocity_curve = []
+        self.velocity_curve.clear()
         self.analyser.reset()
         self.last_update = time.monotonic()
 
@@ -5033,7 +5049,7 @@ class Agent:
         self.peak_pps = max(self.monitor.pps, self.sp_detector.non_service_pps)
         self.peak_bps = max(self.monitor.bps, self.sp_detector.non_service_bps)
         self.below_count = 0
-        self.velocity_curve = []
+        self.velocity_curve.clear()
         self.analyser.reset()
         self.last_update = time.monotonic()
 
@@ -5114,14 +5130,10 @@ class Agent:
             return
         self.last_update = time.monotonic()
         elapsed = time.time() - self.attack_start
-        if len(self.velocity_curve) < self._MAX_VELOCITY_POINTS:
-            self.velocity_curve.append({
-                "t": round(elapsed, 1),
-                "pps": round(self.monitor.pps, 1),
-            })
-        else:
-            # Past cap: update the last point so we always have the latest reading
-            self.velocity_curve[-1] = {"t": round(elapsed, 1), "pps": round(self.monitor.pps, 1)}
+        self.velocity_curve.append({
+            "t": round(elapsed, 1),
+            "pps": round(self.monitor.pps, 1),
+        })
 
         proto = self._proto_breakdown()
         _frag_pct = self.analyser.fragment_pct()
@@ -5135,11 +5147,14 @@ class Agent:
                                      fragment_pct=_frag_pct)
             family, _upd_subtype, _upd_tool, _ = enrich_from_ioc(
                 self.analyser.ioc_hits, family, "")
-            # Track votes and lock once a family has 3+ consecutive votes
-            self._classification_votes[family] = self._classification_votes.get(family, 0) + 1
+            # Track consecutive votes: reset counter when family changes
+            if family == self._classification_votes.get("_last"):
+                self._classification_votes[family] = self._classification_votes.get(family, 0) + 1
+            else:
+                self._classification_votes = {"_last": family, family: 1}
             if self._classification_votes[family] >= 3:
                 self._classification_locked = family
-                logger.info("Classification locked: %s (3+ consistent votes)", family)
+                logger.info("Classification locked: %s (3 consecutive votes)", family)
         else:
             family = self._classification_locked
             _upd_subtype = None
@@ -5327,7 +5342,7 @@ class Agent:
             "dns_query_stats": self.analyser.dns_query_stats(),
             "pkt_length_histogram": self.analyser.pkt_length_histogram(),
             "ttl_distribution": self.analyser.ttl_distribution(),
-            "velocity_curve": self.velocity_curve,
+            "velocity_curve": list(self.velocity_curve),
             "top_src_ips": _top_ips,
             "top_dst_ports": _top_ports_final,
             "avg_pkt_length": self.analyser.avg_pkt_length(),
@@ -5582,7 +5597,7 @@ class Agent:
             if force_ver and isinstance(force_ver, str):
                 def _ver(v):
                     try: return tuple(int(x) for x in v.split("."))
-                    except: return (0,)
+                    except (ValueError, AttributeError): return (0,)
                 if _ver(force_ver) > _ver(VERSION):
                     logger.warning("Server requests forced update to v%s (current v%s), upgrading...",
                                    force_ver, VERSION)
@@ -5723,14 +5738,24 @@ class Agent:
                         l7t = threading.Thread(
                             target=self._l7_loop, daemon=True, name="l7-monitor")
                         l7t.start()
+                elif not self.l7 and not was_enabled:
+                    logger.warning("L7: enabled but no log_path configured and auto-detect not requested. "
+                                   "Configure a log path in dashboard Settings → L7 Detection.")
             elif self.l7:
                 logger.info("L7: disabled by server config")
                 self.l7 = None
                 self.l7_enabled = False
 
+            # Velocity detection (server can override local config)
+            if "velocity_detection" in data:
+                self.baseline._velocity_detection = bool(data["velocity_detection"])
+
             # Service Ports config from server
             sp_cfg = data.get("service_ports", {})
             self.sp_detector.configure(sp_cfg)
+            # Refresh local IP safelist in case NICs changed
+            if sp_cfg.get("enabled"):
+                self.sp_detector.detect_local_ips()
 
             # Mirror mode config from server
             if data.get("mirror_blocked"):
@@ -5876,7 +5901,7 @@ class Agent:
                        subtype, rps, baseline_rps, info["reasons"])
         self.l7_peak_rps = rps
         self.l7_baseline_rps = baseline_rps
-        self.l7_velocity_curve = [{"t": 0, "rps": round(rps, 1)}]
+        self.l7_velocity_curve = collections.deque([{"t": 0, "rps": round(rps, 1)}], maxlen=2000)
         self.l7_attack_start = time.time()
         stats = info.get("stats", {})
         payload = {
@@ -5931,14 +5956,11 @@ class Agent:
         stats = info.get("stats", {})
         subtype = _classify_l7_subtype(stats) if stats else "l7_flood"
 
-        # Track RPS velocity curve (capped to prevent memory bloat on long attacks)
+        # Track RPS velocity curve
         elapsed = time.time() - getattr(self, 'l7_attack_start', time.time())
-        curve = getattr(self, 'l7_velocity_curve', [])
-        if len(curve) < self._MAX_VELOCITY_POINTS:
-            curve.append({"t": round(elapsed, 1), "rps": round(rps, 1)})
-        else:
-            curve[-1] = {"t": round(elapsed, 1), "rps": round(rps, 1)}
-        self.l7_velocity_curve = curve
+        if not hasattr(self, 'l7_velocity_curve') or not isinstance(self.l7_velocity_curve, collections.deque):
+            self.l7_velocity_curve = collections.deque(maxlen=2000)
+        self.l7_velocity_curve.append({"t": round(elapsed, 1), "rps": round(rps, 1)})
 
         bot_pct = stats.get("bot_request_pct", 0)
         # Use accumulated attack-wide data for IPs, paths, UAs, status codes
@@ -5996,7 +6018,7 @@ class Agent:
         bot_pct = stats.get("bot_request_pct", summary.get("bot_request_pct", 0))
 
         # Finalize velocity curve
-        velocity = getattr(self, 'l7_velocity_curve', [])
+        velocity = getattr(self, 'l7_velocity_curve', collections.deque(maxlen=2000))
         velocity.append({"t": round(duration, 1), "rps": round(info.get("rps", 0), 1)})
 
         self.api.resolve_incident(self.l7_incident_uuid, {
@@ -6011,7 +6033,7 @@ class Agent:
             "source_ip_count": len(summary.get("top_ips", stats.get("top_ips", {}))),
             "total_packets": summary.get("total_requests", stats.get("total_requests", 0)),
             "botnet_detected": bot_pct > 70,
-            "velocity_curve": velocity,
+            "velocity_curve": list(velocity),
             # Use accumulated attack-wide data (summary), not last-window (stats)
             "top_src_ips": [{"ip": ip, "count": cnt}
                            for ip, cnt in list(summary.get("top_ips", stats.get("top_ips", {})).items())[:50]],
@@ -6430,26 +6452,26 @@ class MirrorAgent(Agent):
         # 1. Snapshot per-IP counters from mirror capture engine
         ip_snapshots = self.mirror_counter.snapshot_and_reset()
 
-        # Merge flow collector per-IP data when available (takes higher PPS per IP)
+        # Merge flow collector per-IP data when available.
+        # Flow data from upstream routers is authoritative (sees all traffic),
+        # so it always overrides mirror capture data for the same IP.
+        # Mirror capture supplements flow with IPs the router doesn't report.
         if self.flow and self.flow.aggregator.read(dt=1.0):
             flow_per_ip = self.flow.aggregator.per_dst_ip_data
             if flow_per_ip:
                 from ftagent.mirror_engine import IPSnapshot, IPStats
                 for dst_ip, fdata in flow_per_ip.items():
-                    existing = ip_snapshots.get(dst_ip)
-                    if existing is None or fdata["packets"] > existing.packets:
-                        # Build IPSnapshot from flow data
-                        stats = IPStats()
-                        stats.packets = fdata["packets"]
-                        stats.octets = fdata["octets"]
-                        stats.tcp_packets = fdata.get("tcp", 0)
-                        stats.udp_packets = fdata.get("udp", 0)
-                        stats.icmp_packets = fdata.get("icmp", 0)
-                        stats.src_ips = fdata.get("src_ips", {})
-                        stats.dst_ports = fdata.get("dst_ports", {})
-                        stats.tcp_flags = fdata.get("tcp_flags", {
-                            "SYN": 0, "ACK": 0, "RST": 0, "FIN": 0, "PSH": 0, "URG": 0})
-                        ip_snapshots[dst_ip] = IPSnapshot(dst_ip, stats)
+                    stats = IPStats()
+                    stats.packets = fdata["packets"]
+                    stats.octets = fdata["octets"]
+                    stats.tcp_packets = fdata.get("tcp", 0)
+                    stats.udp_packets = fdata.get("udp", 0)
+                    stats.icmp_packets = fdata.get("icmp", 0)
+                    stats.src_ips = fdata.get("src_ips", {})
+                    stats.dst_ports = fdata.get("dst_ports", {})
+                    stats.tcp_flags = fdata.get("tcp_flags", {
+                        "SYN": 0, "ACK": 0, "RST": 0, "FIN": 0, "PSH": 0, "URG": 0})
+                    ip_snapshots[dst_ip] = IPSnapshot(dst_ip, stats)
 
         self._last_snapshot = ip_snapshots
 
@@ -6604,7 +6626,7 @@ class MirrorAgent(Agent):
             "peak_bps": snap.bps,
             "below_count": 0,
             "last_update": time.monotonic(),
-            "velocity_curve": [{"t": 0, "pps": round(snap.pps, 1)}],
+            "velocity_curve": collections.deque([{"t": 0, "pps": round(snap.pps, 1)}], maxlen=2000),
             "family": family,
         }
 
@@ -6623,13 +6645,10 @@ class MirrorAgent(Agent):
 
         state["last_update"] = time.monotonic()
         elapsed = time.time() - state["attack_start"]
-        if len(state["velocity_curve"]) < 2000:
-            state["velocity_curve"].append({
-                "t": round(elapsed, 1),
-                "pps": round(snap.pps, 1),
-            })
-        else:
-            state["velocity_curve"][-1] = {"t": round(elapsed, 1), "pps": round(snap.pps, 1)}
+        state["velocity_curve"].append({
+            "t": round(elapsed, 1),
+            "pps": round(snap.pps, 1),
+        })
 
         _snap_flags = snap.tcp_flags or {}
         _snap_flag_total = sum(_snap_flags.values()) if _snap_flags else 0
@@ -6705,7 +6724,7 @@ class MirrorAgent(Agent):
                 "attack_subtype": subtype or None,
                 "inner_ip": ip,
                 "mirror_mode": True,
-                "velocity_curve": state["velocity_curve"],
+                "velocity_curve": list(state["velocity_curve"]),
             }
             if last_snap:
                 resolve_data["protocol_breakdown"] = {
@@ -6839,14 +6858,18 @@ class MirrorAgent(Agent):
                 "src_ip_count": snap.src_ip_count,
             })
 
-        self.api._post("/agent/mirror-metrics", {
+        mirror_payload = {
             "ips": ip_stats,
             "total_pps": round(self._last_aggregate_pps, 1),
             "total_bps": round(self._last_aggregate_bps, 1),
             "tracked_ip_count": len(ip_snapshots),
             "active_attacks": len(self.active_attacks),
             "mirror_engine": self.mirror_engine.stats,
-        }, timeout=10)
+        }
+        threading.Thread(
+            target=lambda: self.api._post("/agent/mirror-metrics", mirror_payload, timeout=10),
+            daemon=True, name="mirror-metrics-push",
+        ).start()
 
     def _heartbeat_loop(self) -> None:
         """Override heartbeat to include mirror-specific stats."""
