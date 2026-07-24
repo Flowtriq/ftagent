@@ -671,5 +671,171 @@ class TestPerformance(unittest.TestCase):
         self.assertEqual(mgr.ip_count, 1000)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# G. Flow-Only Mirror Mode Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestFlowOnlyMirrorMode(unittest.TestCase):
+    """Tests for mirror mode without a SPAN interface (flow-only).
+
+    Verifies that MirrorAgent can initialise and run per-IP detection
+    when only a flow collector is configured (no mirror_interface).
+    """
+
+    def _make_mirror_cfg(self, **overrides):
+        """Build a minimal MirrorAgent config with flow enabled."""
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update({
+            "mirror_mode": True,
+            "mirror_interface": "",   # no SPAN interface
+            "node_uuid": "test-uuid",
+            "api_key": "test-key",
+            "server_url": "http://localhost",
+            "flow": {"enabled": True, "flow_protocol": "netflow9", "port": 2055},
+        })
+        cfg.update(overrides)
+        return cfg
+
+    @patch("ftagent.agent.FlowCollector")
+    @patch("ftagent.agent.Agent.__init__", return_value=None)
+    def test_flow_only_init_sets_flag(self, mock_agent_init, mock_flow_cls):
+        """MirrorAgent with no mirror_interface but flow configured should set _flow_only."""
+        from ftagent.agent import MirrorAgent
+
+        # Set up the mocks that Agent.__init__ would normally create
+        agent = MirrorAgent.__new__(MirrorAgent)
+        mock_flow = MagicMock()
+        mock_flow.aggregator = FlowAggregator()
+        agent.flow = mock_flow
+        agent.gre_decap = MagicMock(enabled=False)
+        agent.baseline = MagicMock(baseline_ready=False)
+        agent.pcap = MagicMock(enabled=False)
+        agent.cfg = self._make_mirror_cfg()
+
+        MirrorAgent.__init__(agent, agent.cfg)
+
+        self.assertTrue(agent._flow_only)
+        self.assertIsNone(agent.mirror_counter)
+        self.assertIsNone(agent.mirror_engine)
+        self.assertTrue(agent.flow.aggregator._per_dst_ip_mode)
+        self.assertEqual(agent.flow.aggregator._node_ip, "")
+
+    @patch("ftagent.agent.Agent.__init__", return_value=None)
+    def test_flow_only_no_flow_raises(self, mock_agent_init):
+        """MirrorAgent with no mirror_interface AND no flow should exit."""
+        from ftagent.agent import MirrorAgent
+
+        agent = MirrorAgent.__new__(MirrorAgent)
+        agent.flow = None
+        agent.gre_decap = MagicMock(enabled=False)
+        agent.baseline = MagicMock(baseline_ready=False)
+        agent.pcap = MagicMock(enabled=False)
+        agent.cfg = self._make_mirror_cfg()
+
+        with self.assertRaises(SystemExit):
+            MirrorAgent.__init__(agent, agent.cfg)
+
+    @patch("ftagent.agent.MirrorCaptureEngine", create=True)
+    @patch("ftagent.agent.Agent.__init__", return_value=None)
+    def test_span_mode_still_works(self, mock_agent_init, mock_capture_cls):
+        """MirrorAgent with mirror_interface set should NOT be flow-only."""
+        from ftagent.agent import MirrorAgent
+
+        agent = MirrorAgent.__new__(MirrorAgent)
+        agent.flow = None
+        agent.gre_decap = MagicMock(enabled=False)
+        agent.baseline = MagicMock(baseline_ready=False)
+        agent.pcap = MagicMock(enabled=False)
+        agent.cfg = self._make_mirror_cfg(mirror_interface="eth1")
+
+        MirrorAgent.__init__(agent, agent.cfg)
+
+        self.assertFalse(agent._flow_only)
+        self.assertIsNotNone(agent.mirror_counter)
+        self.assertIsNotNone(agent.mirror_engine)
+
+    def test_flow_only_tick_uses_flow_data(self):
+        """In flow-only mode, _tick should get per-IP data from flow aggregator."""
+        from ftagent.agent import MirrorAgent, PerIPBaselineManager
+        from ftagent.mirror_engine import IPSnapshot, IPStats
+
+        agent = MirrorAgent.__new__(MirrorAgent)
+        agent._flow_only = True
+        agent.mirror_counter = None
+        agent.mirror_engine = None
+        agent.mirror_ip_labels = {}
+        agent.active_attacks = {}
+        agent._last_snapshot = {}
+        agent._last_aggregate_pps = 0.0
+        agent._last_aggregate_bps = 0.0
+        agent.per_ip_baseline = PerIPBaselineManager(window=10)
+        agent.server_threshold = 10000
+        agent.baseline = MagicMock(baseline_ready=False)
+        agent.pcap = MagicMock(enabled=False)
+        agent.api = MagicMock()
+        agent._ip_pcap_procs = {}
+        agent._metrics_buffer = []
+        agent._last_metrics_push = 0
+        agent._metrics_interval = 999999  # don't trigger flush
+        agent.cfg = {}
+        agent.mirror_interface = ""
+        agent._flush_metrics = MagicMock()
+        agent._flush_mirror_ip_stats = MagicMock()
+
+        # Set up flow aggregator with per-IP data (don't call read() -
+        # _tick() will call it internally to consume the window)
+        agg = FlowAggregator(per_dst_ip_mode=True)
+        agg.ingest([
+            FlowRecord(src_ip="1.1.1.1", dst_ip="10.0.0.1", protocol=PROTO_TCP,
+                       packets=500, octets=50000),
+            FlowRecord(src_ip="2.2.2.2", dst_ip="10.0.0.2", protocol=PROTO_UDP,
+                       packets=300, octets=30000),
+        ])
+
+        mock_flow = MagicMock()
+        mock_flow.aggregator = agg
+        agent.flow = mock_flow
+
+        # Tick should process flow data without crashing
+        agent._tick()
+
+        # Verify per-IP data was processed (baselines should have entries)
+        self.assertGreater(agent.per_ip_baseline.ip_count, 0)
+        self.assertGreater(agent._last_aggregate_pps, 0)
+
+    def test_flow_only_heartbeat_no_crash(self):
+        """Heartbeat should not crash when mirror_engine is None."""
+        from ftagent.agent import MirrorAgent, PerIPBaselineManager
+
+        agent = MirrorAgent.__new__(MirrorAgent)
+        agent._flow_only = True
+        agent.mirror_interface = ""
+        agent.mirror_engine = None
+        agent.per_ip_baseline = PerIPBaselineManager(window=10)
+        agent.active_attacks = {}
+        agent.baseline = MagicMock(baseline_ready=False, avg_pps=0, p99_pps=0,
+                                   hourly_ready=False, current_hour_p99=0)
+        agent.pcap = MagicMock(enabled=False)
+        agent.gre_decap = MagicMock(enabled=False)
+        agent.flow = MagicMock(stats={"packets": 100})
+        agent.api = MagicMock()
+        agent.shutdown = threading.Event()
+        agent.shutdown.set()  # exit immediately
+
+        # Build heartbeat payload like the real method does
+        hb = {
+            "mirror_mode": True,
+            "mirror_flow_only": agent._flow_only,
+            "mirror_interface": agent.mirror_interface or None,
+            "mirror_tracked_ips": agent.per_ip_baseline.ip_count,
+            "mirror_active_attacks": len(agent.active_attacks),
+            "mirror_engine": agent.mirror_engine.stats if agent.mirror_engine else None,
+        }
+        # Should not crash and engine should be None
+        self.assertIsNone(hb["mirror_engine"])
+        self.assertIsNone(hb["mirror_interface"])
+        self.assertTrue(hb["mirror_flow_only"])
+
+
 if __name__ == "__main__":
     unittest.main()

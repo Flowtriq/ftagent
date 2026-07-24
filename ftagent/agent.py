@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.34"
+VERSION = "1.9.35"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -6339,25 +6339,34 @@ class MirrorAgent(Agent):
 
         # Mirror-specific config
         self.mirror_interface = cfg.get("mirror_interface", "")
-        if not self.mirror_interface:
-            logger.error("mirror_mode=True but mirror_interface not set. "
-                         "Set it to the NIC connected to your SPAN/mirror port.")
-            raise SystemExit(1)
-
         self.mirror_ip_labels: dict = cfg.get("mirror_ip_labels", {})
         mirror_subnets = cfg.get("mirror_subnets", [])
-        gre_strip = self.gre_decap.enabled
 
-        # Per-IP tracking
-        from ftagent.mirror_engine import PerIPCounter, MirrorCaptureEngine
-        self.mirror_counter = PerIPCounter()
-        self.mirror_engine = MirrorCaptureEngine(
-            interface=self.mirror_interface,
-            counter=self.mirror_counter,
-            mode=cfg.get("mirror_capture_mode", "af_packet"),
-            subnets=mirror_subnets if mirror_subnets else None,
-            gre_strip=gre_strip,
-        )
+        # Flow-only mode: no SPAN interface, per-IP detection driven entirely
+        # by the flow collector (NetFlow/sFlow/IPFIX from upstream routers).
+        self._flow_only = not self.mirror_interface
+
+        if self._flow_only:
+            if not self.flow:
+                logger.error("mirror_mode=True but neither mirror_interface nor "
+                             "flow collector configured. Set mirror_interface to "
+                             "the NIC connected to your SPAN port, or enable flow "
+                             "collection from your router.")
+                raise SystemExit(1)
+            logger.info("Mirror mode (flow-only): per-IP detection via flow collector")
+            self.mirror_counter = None
+            self.mirror_engine = None
+        else:
+            gre_strip = self.gre_decap.enabled
+            from ftagent.mirror_engine import PerIPCounter, MirrorCaptureEngine
+            self.mirror_counter = PerIPCounter()
+            self.mirror_engine = MirrorCaptureEngine(
+                interface=self.mirror_interface,
+                counter=self.mirror_counter,
+                mode=cfg.get("mirror_capture_mode", "af_packet"),
+                subnets=mirror_subnets if mirror_subnets else None,
+                gre_strip=gre_strip,
+            )
         self.per_ip_baseline = PerIPBaselineManager(
             window=cfg.get("baseline_window", 300))
 
@@ -6381,8 +6390,12 @@ class MirrorAgent(Agent):
         self._last_aggregate_bps: float = 0.0
 
     def run(self) -> None:
-        logger.info("Flowtriq Mirror Agent %s starting on SPAN interface %s",
-                     VERSION, self.mirror_interface)
+        if self._flow_only:
+            logger.info("Flowtriq Mirror Agent %s starting in flow-only mode",
+                         VERSION)
+        else:
+            logger.info("Flowtriq Mirror Agent %s starting on SPAN interface %s",
+                         VERSION, self.mirror_interface)
 
         check_for_updates()
 
@@ -6398,10 +6411,11 @@ class MirrorAgent(Agent):
                              name="command-poll"),
         ]
 
-        # Mirror capture engine thread
-        threads.append(threading.Thread(
-            target=self.mirror_engine.start, args=(self.shutdown,),
-            daemon=True, name="mirror-capture"))
+        # Mirror capture engine thread (skip in flow-only mode)
+        if self.mirror_engine:
+            threads.append(threading.Thread(
+                target=self.mirror_engine.start, args=(self.shutdown,),
+                daemon=True, name="mirror-capture"))
 
         # Health check
         health_port = self.cfg.get("health_port", 9100)
@@ -6450,7 +6464,7 @@ class MirrorAgent(Agent):
 
     def _tick(self) -> None:
         # 1. Snapshot per-IP counters from mirror capture engine
-        ip_snapshots = self.mirror_counter.snapshot_and_reset()
+        ip_snapshots = self.mirror_counter.snapshot_and_reset() if self.mirror_counter else {}
 
         # Merge flow collector per-IP data when available.
         # Flow data from upstream routers is authoritative (sees all traffic),
@@ -6754,7 +6768,7 @@ class MirrorAgent(Agent):
     def _start_ip_pcap(self, ip: str, incident_uuid: str) -> None:
         """Start a BPF-filtered tcpdump capture for a specific attacked IP."""
         import subprocess
-        if not self.pcap.enabled:
+        if not self.pcap.enabled or not self.mirror_interface:
             return
         if len(self._ip_pcap_procs) >= self._MAX_IP_PCAP_PROCS:
             logger.warning("Mirror PCAP cap reached (%d), skipping %s",
@@ -6864,8 +6878,9 @@ class MirrorAgent(Agent):
             "total_bps": round(self._last_aggregate_bps, 1),
             "tracked_ip_count": len(ip_snapshots),
             "active_attacks": len(self.active_attacks),
-            "mirror_engine": self.mirror_engine.stats,
         }
+        if self.mirror_engine:
+            mirror_payload["mirror_engine"] = self.mirror_engine.stats
         threading.Thread(
             target=lambda: self.api._post("/agent/mirror-metrics", mirror_payload, timeout=10),
             daemon=True, name="mirror-metrics-push",
@@ -6894,10 +6909,11 @@ class MirrorAgent(Agent):
                     "flow_active": self.flow is not None,
                     # Mirror-specific
                     "mirror_mode": True,
-                    "mirror_interface": self.mirror_interface,
+                    "mirror_flow_only": self._flow_only,
+                    "mirror_interface": self.mirror_interface or None,
                     "mirror_tracked_ips": self.per_ip_baseline.ip_count,
                     "mirror_active_attacks": len(self.active_attacks),
-                    "mirror_engine": self.mirror_engine.stats,
+                    "mirror_engine": self.mirror_engine.stats if self.mirror_engine else None,
                 }
                 if self.flow:
                     hb["flow_collector"] = self.flow.stats
