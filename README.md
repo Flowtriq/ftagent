@@ -41,6 +41,16 @@ The agent monitors traffic at the packet level, learns your normal traffic patte
 
 ## Install
 
+### One-liner (recommended)
+
+```bash
+curl -sSL https://flowtriq.com/install.sh | sudo bash
+```
+
+This handles everything: installs dependencies, installs ftagent from PyPI, runs the setup wizard, and starts the systemd service.
+
+### From PyPI
+
 ```bash
 pip install ftagent[full]
 sudo ftagent --setup
@@ -48,7 +58,7 @@ sudo ftagent --install-service
 sudo systemctl enable --now ftagent
 ```
 
-That's it. Your node appears in the [Flowtriq dashboard](https://flowtriq.com/dashboard) within 30 seconds. 14-day free trial, no credit card required.
+Either way, your node appears in the [Flowtriq dashboard](https://flowtriq.com/dashboard) within 30 seconds. 14-day free trial, no credit card required.
 
 ### Requirements
 
