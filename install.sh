@@ -148,7 +148,9 @@ FTCFG
     ok "Config written to /etc/ftagent/config.json"
 else
     echo ""
-    "$FTAGENT_BIN" --setup
+    # When piped via curl|bash, stdin is the script itself.
+    # Redirect stdin to /dev/tty so the setup wizard can read user input.
+    "$FTAGENT_BIN" --setup </dev/tty
 fi
 
 # ── Install and start systemd service ────────────────────────────────
