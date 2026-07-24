@@ -36,7 +36,7 @@ Show
 Sleep 500ms
 
 # Scene 1: Install
-Type "pip install ftagent[full]"
+Type "curl -sSL https://flowtriq.com/install.sh | sudo bash"
 Sleep 200ms
 Enter
 Sleep 400ms
