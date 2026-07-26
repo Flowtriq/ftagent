@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.36"
+VERSION = "1.9.37"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -2067,6 +2067,7 @@ class PcapCapture:
         tcpdump_cmd = [
             "tcpdump", "-i", self.iface, "-w", ring_file,
             "-G", "30", "-W", "3", "-s", snaplen, "-q",
+            "-Z", "root",  # Don't drop privileges — ring dir is root-owned 0700
         ]
 
         logger.info("PCAP ring buffer active on %s (tcpdump mode)", self.iface)
