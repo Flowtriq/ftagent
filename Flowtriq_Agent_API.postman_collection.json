@@ -1,0 +1,402 @@
+{
+  "info": {
+    "name": "Flowtriq Agent API",
+    "description": "Every API endpoint the ftagent communicates with. Use this to debug agent connectivity, simulate agent behavior, or build custom integrations.\n\nSet the `api_key` and `node_uuid` variables before sending requests.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{api_key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "https://flowtriq.com/api/v1"
+    },
+    {
+      "key": "api_key",
+      "value": "YOUR_API_KEY"
+    },
+    {
+      "key": "node_uuid",
+      "value": "YOUR_NODE_UUID"
+    },
+    {
+      "key": "incident_uuid",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "Heartbeat & Config",
+      "item": [
+        {
+          "name": "Heartbeat",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"version\": \"1.9.25\",\n  \"baseline_ready\": true,\n  \"baseline_avg_pps\": 1200.5,\n  \"baseline_p99_pps\": 5000.2,\n  \"circuit_breaker\": \"closed\",\n  \"retry_queue_size\": 0,\n  \"gre_dedup_enabled\": false,\n  \"hypervisor_mode\": false,\n  \"pcap_active\": true,\n  \"flow_active\": false,\n  \"mirror_mode\": false,\n  \"mirror_interface\": \"\",\n  \"l7_enabled\": false,\n  \"l7_status\": \"\",\n  \"test\": false,\n  \"vm_count\": 0,\n  \"flow_collector\": null\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/heartbeat",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "heartbeat"]
+            },
+            "description": "Keep-alive ping sent every 30 seconds. Reports agent version, baseline status, and active features. Response includes server time and node status."
+          }
+        },
+        {
+          "name": "Get Config",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/agent/config",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "config"]
+            },
+            "description": "Fetched every 5 minutes (every 10 seconds during attacks). Returns thresholds, IOC patterns, IP blocklist, pending commands, L7 config, flow config, mirror config, service ports, and more."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Metrics",
+      "item": [
+        {
+          "name": "Send Traffic Metrics",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pps\": 12345,\n  \"bps\": 98765432,\n  \"tcp_pct\": 45.5,\n  \"udp_pct\": 30.2,\n  \"icmp_pct\": 24.3,\n  \"conn_count\": 1024,\n  \"threshold\": 50000,\n  \"avg_pps\": 12000,\n  \"samples\": 5\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/metrics",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "metrics"]
+            },
+            "description": "Sent every ~5 seconds with current traffic snapshot. PPS, BPS, protocol percentages, connection count, and baseline average."
+          }
+        },
+        {
+          "name": "Send L7 Metrics",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rps\": 500,\n  \"error_rate\": 2.5,\n  \"unique_ips\": 150,\n  \"avg_response_ms\": 120,\n  \"top_paths\": [{\"path\": \"/api/login\", \"count\": 200}],\n  \"top_ips\": [{\"ip\": \"1.2.3.4\", \"count\": 50}],\n  \"status_codes\": {\"200\": 4000, \"500\": 100},\n  \"top_user_agents\": [\"Mozilla/5.0\"],\n  \"threat_patterns\": []\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/l7/metrics",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "l7", "metrics"]
+            },
+            "description": "Sent every 10 seconds when L7 monitoring is active. HTTP request rates, error rates, top paths, source IPs, status codes, and user agents."
+          }
+        },
+        {
+          "name": "Send VM Stats (Hypervisor)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vms\": [\n    {\n      \"inner_ip\": \"192.168.1.100\",\n      \"pps\": 25000,\n      \"bps\": 200000000,\n      \"tcp_pct\": 45.5,\n      \"udp_pct\": 30.2,\n      \"icmp_pct\": 24.3,\n      \"src_ip_count\": 5\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/vm-stats",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "vm-stats"]
+            },
+            "description": "Sent every 10 seconds in hypervisor mode. Per-VM traffic breakdown from GRE decapsulation."
+          }
+        },
+        {
+          "name": "Send Mirror Metrics",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ips\": [\n    {\n      \"ip\": \"10.0.0.100\",\n      \"label\": \"Web-01\",\n      \"pps\": 10000,\n      \"bps\": 80000000,\n      \"tcp_pct\": 50.0,\n      \"udp_pct\": 30.0,\n      \"icmp_pct\": 20.0,\n      \"baseline_pps\": 5000,\n      \"threshold_pps\": 15000,\n      \"status\": \"normal\",\n      \"src_ip_count\": 10\n    }\n  ],\n  \"total_pps\": 10000\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/mirror-metrics",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "mirror-metrics"]
+            },
+            "description": "Sent every 10 seconds in mirror/SPAN mode. Per-destination-IP traffic with individual baselines and thresholds."
+          }
+        },
+        {
+          "name": "Send Service Port Metrics",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"service_pps\": 10000,\n  \"service_bps\": 80000000,\n  \"non_service_pps\": 40000,\n  \"non_service_bps\": 300000000,\n  \"blocked_pps\": 5000,\n  \"active_blocks\": 2\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/sp/metrics",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "sp", "metrics"]
+            },
+            "description": "Sent every 10 seconds when service ports are configured. Reports traffic split between service and non-service port zones."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Incidents",
+      "item": [
+        {
+          "name": "Create Incident",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json.uuid) {",
+                  "    pm.collectionVariables.set('incident_uuid', json.uuid);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"peak_pps\": 500000,\n  \"peak_bps\": 4000000000,\n  \"started_at\": \"2026-06-10T12:00:00+00:00\",\n  \"attack_family\": \"udp_flood\",\n  \"attack_subtype\": null,\n  \"baseline_pps\": 1200,\n  \"rps\": 0,\n  \"baseline_rps\": 0,\n  \"duration\": 0,\n  \"gre_dedup_active\": false,\n  \"top_src_ips\": [\n    {\"ip\": \"1.2.3.4\", \"count\": 150},\n    {\"ip\": \"5.6.7.8\", \"count\": 98}\n  ],\n  \"top_dst_ports\": [\n    {\"port\": 53, \"count\": 50000}\n  ],\n  \"protocol_breakdown\": {\n    \"tcp\": 5.0,\n    \"udp\": 92.0,\n    \"icmp\": 3.0\n  },\n  \"source_ip_count\": 2,\n  \"total_packets\": 100000,\n  \"ioc_hits\": [],\n  \"spoofing_detected\": false,\n  \"botnet_detected\": false,\n  \"inner_ip\": null,\n  \"inner_ip_label\": null,\n  \"vm_breakdown\": null,\n  \"sp_zone\": null,\n  \"sp_service_pps\": 0,\n  \"sp_non_service_pps\": 0,\n  \"sp_top_sources\": [],\n  \"sp_blocks_deployed\": 0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/incidents",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "incidents"]
+            },
+            "description": "Opens a new attack incident. Response includes the incident UUID (auto-saved to collection variable) and any pending mitigation commands."
+          }
+        },
+        {
+          "name": "Update Incident",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"peak_pps\": 550000,\n  \"peak_bps\": 4200000000,\n  \"attack_family\": \"udp_flood\",\n  \"attack_subtype\": null,\n  \"protocol_breakdown\": {\"tcp\": 5.0, \"udp\": 92.0, \"icmp\": 3.0},\n  \"source_ip_count\": 5,\n  \"total_packets\": 500000,\n  \"top_src_ips\": [{\"ip\": \"1.2.3.4\", \"count\": 200}],\n  \"top_dst_ports\": [{\"port\": 53, \"count\": 80000}],\n  \"ioc_hits\": [],\n  \"spoofing_detected\": false,\n  \"botnet_detected\": false,\n  \"tcp_flag_breakdown\": null,\n  \"dns_query_stats\": null,\n  \"pkt_length_histogram\": null,\n  \"ttl_distribution\": null,\n  \"velocity_curve\": null,\n  \"avg_pkt_length\": 512\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/incidents/{{incident_uuid}}",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "incidents", "{{incident_uuid}}"]
+            },
+            "description": "Sent every 5-10 seconds during an active attack. Updates peak metrics, source IPs, protocol breakdown, and forensic data."
+          }
+        },
+        {
+          "name": "Resolve Incident",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"duration_seconds\": 300,\n  \"peak_pps\": 600000,\n  \"peak_bps\": 4500000000,\n  \"peak_rps\": 0,\n  \"baseline_rps\": 0,\n  \"attack_family\": \"udp_flood\",\n  \"attack_subtype\": null,\n  \"severity\": \"high\",\n  \"total_packets\": 2000000,\n  \"source_ip_count\": 8,\n  \"protocol_breakdown\": {\"tcp\": 5.0, \"udp\": 92.0, \"icmp\": 3.0},\n  \"tcp_flag_breakdown\": null,\n  \"dns_query_stats\": null,\n  \"pkt_length_histogram\": null,\n  \"ttl_distribution\": null,\n  \"velocity_curve\": null,\n  \"top_src_ips\": [{\"ip\": \"1.2.3.4\", \"count\": 500}],\n  \"top_dst_ports\": [{\"port\": 53, \"count\": 200000}],\n  \"ioc_hits\": [],\n  \"spoofing_detected\": false,\n  \"botnet_detected\": false,\n  \"src_ip_entropy\": 3.45,\n  \"avg_pkt_length\": 512,\n  \"l7_error_rate\": 0,\n  \"l7_status_codes\": null,\n  \"l7_top_user_agents\": null\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/incidents/{{incident_uuid}}/resolve",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "incidents", "{{incident_uuid}}", "resolve"]
+            },
+            "description": "Finalizes the incident with complete attack statistics. Sent when traffic returns to baseline."
+          }
+        },
+        {
+          "name": "Upload PCAP (single file)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "pcap",
+                  "description": "Select a .pcap or .pcapng file to upload",
+                  "type": "file",
+                  "src": "/tmp/sample.pcap"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/incidents/{{incident_uuid}}/pcap",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "incidents", "{{incident_uuid}}", "pcap"]
+            },
+            "description": "Upload a PCAP capture file (< 2MB) for an incident via multipart form.\n\n**How to use:** Click the file selector in the Body > form-data tab and pick a .pcap or .pcapng file from disk.\n\nFor files larger than 2MB, use the chunked upload request instead."
+          }
+        },
+        {
+          "name": "Upload PCAP (chunked)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/octet-stream" },
+              { "key": "X-Chunk-Index", "value": "0" },
+              { "key": "X-Chunk-Total", "value": "1" },
+              { "key": "X-Upload-Id", "value": "test-upload-001" }
+            ],
+            "body": {
+              "mode": "file",
+              "file": {
+                "src": "/tmp/sample.pcap"
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/incidents/{{incident_uuid}}/pcap",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "incidents", "{{incident_uuid}}", "pcap"]
+            },
+            "description": "Chunked PCAP upload for large files (> 2MB).\n\n**How to use:**\n1. Go to Body > binary and select your .pcap file\n2. Set X-Chunk-Index to the chunk number (0-based)\n3. Set X-Chunk-Total to the total number of 2MB chunks\n4. Set X-Upload-Id to any unique string for this upload session\n5. Send once per chunk. Server responds with `{\"chunk_received\": N, \"of\": total}`\n6. On the final chunk, server reassembles and stores the full PCAP\n\nFor single small files (< 2MB), use the single file upload request instead."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Commands & Blocks",
+      "item": [
+        {
+          "name": "Acknowledge Command",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"command_id\": 1,\n  \"status\": \"applied\",\n  \"error\": null\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/commands/ack",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "commands", "ack"]
+            },
+            "description": "Acknowledge execution of a dashboard-issued command (iptables, nftables, XDP, etc). Status is 'applied' or 'failed'."
+          }
+        },
+        {
+          "name": "Report Service Port Blocks",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"blocks\": [\n    {\n      \"source_ip\": \"1.2.3.4\",\n      \"block_scope\": \"non_service\",\n      \"src_pps\": 50000,\n      \"dst_ports\": [80, 443],\n      \"cooldown\": 300\n    }\n  ],\n  \"incident_uuid\": \"{{incident_uuid}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/sp/blocks",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "sp", "blocks"]
+            },
+            "description": "Report on-node firewall blocks deployed by the service port protection engine."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Detection Features",
+      "item": [
+        {
+          "name": "Report L7 Web Server Detection",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"web_server\": \"nginx\",\n  \"server_version\": \"1.24.0\",\n  \"detected_paths\": [\n    \"/var/log/nginx/access.log\",\n    \"/var/log/nginx/error.log\"\n  ],\n  \"active_log_path\": \"/var/log/nginx/access.log\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/l7/detect",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "l7", "detect"]
+            },
+            "description": "Reports auto-detected web server type and log file paths for L7 HTTP flood monitoring."
+          }
+        },
+        {
+          "name": "Report GRE Tunnels",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Node-UUID", "value": "{{node_uuid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tunnels\": [\n    {\n      \"name\": \"gre0\",\n      \"type\": \"gre\",\n      \"remote_ip\": \"203.0.113.5\",\n      \"local_ip\": \"10.0.0.1\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/agent/gre-tunnels",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "gre-tunnels"]
+            },
+            "description": "Reports detected GRE tunnel endpoints. Server responds with whitelisted IPs to prevent false positive detections on tunnel traffic."
+          }
+        }
+      ]
+    }
+  ]
+}

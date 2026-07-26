@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.35"
+VERSION = "1.9.36"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -2074,7 +2074,10 @@ class PcapCapture:
             import subprocess
 
             # Auto-install tcpdump if not present (it's a prerequisite)
-            if subprocess.run(["which", "tcpdump"], capture_output=True).returncode != 0:
+            # Use shutil.which instead of shell `which` — more reliable under systemd
+            # where PATH may be restricted
+            import shutil
+            if not shutil.which("tcpdump"):
                 logger.info("tcpdump not found, attempting to install...")
                 installed = False
                 for pm_cmd in [
@@ -2100,7 +2103,7 @@ class PcapCapture:
                     return
 
             # Auto-install mergecap for PCAP merging
-            if subprocess.run(["which", "mergecap"], capture_output=True).returncode != 0:
+            if not shutil.which("mergecap"):
                 for pm_cmd in [
                     ["apt-get", "install", "-y", "wireshark-common"],
                     ["yum", "install", "-y", "wireshark-cli"],
