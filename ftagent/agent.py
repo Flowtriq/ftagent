@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.39"
+VERSION = "1.9.40"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -5793,7 +5793,8 @@ class Agent:
                         self.per_ip_baseline._max_ips = min(ip_limit, 100000)
                     logger.debug("Mirror IP limit set to %d", ip_limit)
             if "mirror_ip_labels" in data and hasattr(self, 'mirror_ip_labels'):
-                self.mirror_ip_labels = data["mirror_ip_labels"]
+                labels = data["mirror_ip_labels"]
+                self.mirror_ip_labels = labels if isinstance(labels, dict) else {}
             # Update monitored subnets from server config
             if "mirror_subnets" in data and hasattr(self, '_monitored_networks'):
                 import ipaddress
