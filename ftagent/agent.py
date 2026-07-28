@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.38"
+VERSION = "1.9.39"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -5784,13 +5784,29 @@ class Agent:
                 if hasattr(self, 'mirror_engine'):
                     logger.warning("Mirror mode blocked by server: %s",
                                    data.get("mirror_message", 'subscription required'))
-            if "mirror_ip_limit" in data and hasattr(self, 'mirror_counter'):
+            if "mirror_ip_limit" in data:
                 ip_limit = int(data["mirror_ip_limit"])
                 if ip_limit > 0:
-                    self.mirror_counter._max_ips = min(ip_limit, 100000)
+                    if self.mirror_counter is not None:
+                        self.mirror_counter._max_ips = min(ip_limit, 100000)
+                    if hasattr(self, 'per_ip_baseline'):
+                        self.per_ip_baseline._max_ips = min(ip_limit, 100000)
                     logger.debug("Mirror IP limit set to %d", ip_limit)
             if "mirror_ip_labels" in data and hasattr(self, 'mirror_ip_labels'):
                 self.mirror_ip_labels = data["mirror_ip_labels"]
+            # Update monitored subnets from server config
+            if "mirror_subnets" in data and hasattr(self, '_monitored_networks'):
+                import ipaddress
+                new_nets = []
+                for cidr in (data["mirror_subnets"] or []):
+                    try:
+                        new_nets.append(ipaddress.ip_network(cidr, strict=False))
+                    except (ValueError, TypeError):
+                        pass
+                if new_nets != self._monitored_networks:
+                    self._monitored_networks = new_nets
+                    if new_nets:
+                        logger.info("Mirror subnets updated: %d networks", len(new_nets))
 
         except Exception as exc:
             logger.error("Config fetch error: %s", exc)
@@ -6364,6 +6380,19 @@ class MirrorAgent(Agent):
         self.mirror_ip_labels: dict = cfg.get("mirror_ip_labels", {})
         mirror_subnets = cfg.get("mirror_subnets", [])
 
+        # Parse monitored subnets for IP filtering (both SPAN and flow-only modes)
+        import ipaddress
+        self._monitored_networks: list = []
+        for cidr in mirror_subnets:
+            try:
+                self._monitored_networks.append(ipaddress.ip_network(cidr, strict=False))
+            except (ValueError, TypeError):
+                logger.warning("Invalid mirror subnet ignored: %s", cidr)
+        if self._monitored_networks:
+            logger.info("Mirror subnet filter active: %d networks (%s)",
+                        len(self._monitored_networks),
+                        ", ".join(str(n) for n in self._monitored_networks[:5]))
+
         # Flow-only mode: no SPAN interface, per-IP detection driven entirely
         # by the flow collector (NetFlow/sFlow/IPFIX from upstream routers).
         self._flow_only = not self.mirror_interface
@@ -6508,6 +6537,19 @@ class MirrorAgent(Agent):
                     stats.tcp_flags = fdata.get("tcp_flags", {
                         "SYN": 0, "ACK": 0, "RST": 0, "FIN": 0, "PSH": 0, "URG": 0})
                     ip_snapshots[dst_ip] = IPSnapshot(dst_ip, stats)
+
+        # Filter to monitored subnets (if configured)
+        if self._monitored_networks and ip_snapshots:
+            import ipaddress
+            filtered = {}
+            for ip, snap in ip_snapshots.items():
+                try:
+                    addr = ipaddress.ip_address(ip)
+                    if any(addr in net for net in self._monitored_networks):
+                        filtered[ip] = snap
+                except (ValueError, TypeError):
+                    pass
+            ip_snapshots = filtered
 
         self._last_snapshot = ip_snapshots
 
