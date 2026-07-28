@@ -53,8 +53,13 @@ IE_DEST_TRANSPORT_PORT   = 11
 IE_DEST_IPV4_ADDRESS     = 12
 IE_SOURCE_IPV6_ADDRESS   = 27
 IE_DEST_IPV6_ADDRESS     = 28
+IE_SAMPLING_INTERVAL         = 34   # samplingPacketInterval / samplerRandomInterval (Cisco)
+IE_SAMPLING_ALGORITHM        = 35   # samplingAlgorithm
+IE_SAMPLER_ID                = 48   # samplerId
 IE_FLOW_START_MILLISECONDS = 152
 IE_FLOW_END_MILLISECONDS   = 153
+IE_SAMPLING_PKT_INTERVAL    = 305  # samplingPacketInterval (IANA)
+IE_SAMPLING_PKT_SPACE        = 304  # samplingPacketSpace (IANA)
 
 # Max unique source IPs tracked per aggregation window
 MAX_FLOW_SRC_IPS = 50_000
@@ -406,7 +411,9 @@ class TemplateCache:
 
 
 def parse_netflow_v9(data: bytes, source_ip: str,
-                     cache: TemplateCache) -> list[FlowRecord]:
+                     cache: TemplateCache,
+                     options_template_ids: Optional[set] = None,
+                     device_sampling_rates: Optional[dict] = None) -> list[FlowRecord]:
     """Parse NetFlow v9 datagram with template handling."""
     records = []
     if len(data) < 20:
@@ -435,13 +442,22 @@ def parse_netflow_v9(data: bytes, source_ip: str,
             _parse_v9_template_flowset(data, offset + 4, flowset_len - 4,
                                        source_ip, source_id, cache)
         elif flowset_id == 1:
-            # Options Template FlowSet — skip
-            pass
+            # Options Template FlowSet
+            _parse_v9_options_template_flowset(data, offset + 4, flowset_len - 4,
+                                               source_ip, source_id, cache,
+                                               options_template_ids)
         elif flowset_id >= 256:
-            # Data FlowSet
-            recs = _parse_v9_data_flowset(data, offset + 4, flowset_len - 4,
-                                          flowset_id, source_ip, source_id, cache)
-            records.extend(recs)
+            # Data FlowSet — check if this is an Options data record
+            if (options_template_ids is not None
+                    and (source_ip, source_id, flowset_id) in options_template_ids
+                    and device_sampling_rates is not None):
+                _extract_sampling_from_data(data, offset + 4, flowset_len - 4,
+                                            flowset_id, source_ip, source_id,
+                                            cache, device_sampling_rates)
+            else:
+                recs = _parse_v9_data_flowset(data, offset + 4, flowset_len - 4,
+                                              flowset_id, source_ip, source_id, cache)
+                records.extend(recs)
 
         offset = next_flowset
 
@@ -449,7 +465,9 @@ def parse_netflow_v9(data: bytes, source_ip: str,
 
 
 def parse_ipfix(data: bytes, source_ip: str,
-                cache: TemplateCache) -> list[FlowRecord]:
+                cache: TemplateCache,
+                options_template_ids: Optional[set] = None,
+                device_sampling_rates: Optional[dict] = None) -> list[FlowRecord]:
     """Parse IPFIX (NetFlow v10) message."""
     records = []
     if len(data) < 16:
@@ -476,13 +494,22 @@ def parse_ipfix(data: bytes, source_ip: str,
             _parse_ipfix_template_set(data, offset + 4, set_len - 4,
                                       source_ip, domain_id, cache)
         elif set_id == 3:
-            # Options Template Set — skip
-            pass
+            # Options Template Set
+            _parse_ipfix_options_template_set(data, offset + 4, set_len - 4,
+                                              source_ip, domain_id, cache,
+                                              options_template_ids)
         elif set_id >= 256:
-            # Data Set
-            recs = _parse_v9_data_flowset(data, offset + 4, set_len - 4,
-                                          set_id, source_ip, domain_id, cache)
-            records.extend(recs)
+            # Data Set — check if this is an Options data record
+            if (options_template_ids is not None
+                    and (source_ip, domain_id, set_id) in options_template_ids
+                    and device_sampling_rates is not None):
+                _extract_sampling_from_data(data, offset + 4, set_len - 4,
+                                            set_id, source_ip, domain_id,
+                                            cache, device_sampling_rates)
+            else:
+                recs = _parse_v9_data_flowset(data, offset + 4, set_len - 4,
+                                              set_id, source_ip, domain_id, cache)
+                records.extend(recs)
 
         offset = next_set
 
@@ -542,6 +569,134 @@ def _parse_ipfix_template_set(data: bytes, offset: int, length: int,
             cache.store(source_ip, domain_id, template_id, fields)
             logger.debug("Cached IPFIX template %d from %s: %d fields",
                         template_id, source_ip, len(fields))
+
+
+def _parse_v9_options_template_flowset(data: bytes, offset: int, length: int,
+                                        source_ip: str, domain_id: int,
+                                        cache: TemplateCache,
+                                        options_template_ids: Optional[set] = None) -> None:
+    """Parse NetFlow v9 Options Template FlowSet and store in cache.
+
+    Format per template:
+      - Template ID           (2 bytes)
+      - Option Scope Length   (2 bytes)  — total bytes of scope fields
+      - Option Length         (2 bytes)  — total bytes of option fields
+      - Scope fields          (field_id + field_len pairs, scope_length bytes)
+      - Option fields         (field_id + field_len pairs, option_length bytes)
+    """
+    end = offset + length
+    while offset + 6 <= end:
+        template_id = struct.unpack_from("!H", data, offset)[0]
+        scope_length = struct.unpack_from("!H", data, offset + 2)[0]
+        option_length = struct.unpack_from("!H", data, offset + 4)[0]
+        offset += 6
+
+        fields = []
+
+        # Parse scope fields (each is 4 bytes: field_id + field_len)
+        scope_end = offset + scope_length
+        while offset + 4 <= scope_end and offset + 4 <= end:
+            fid = struct.unpack_from("!H", data, offset)[0]
+            flen = struct.unpack_from("!H", data, offset + 2)[0]
+            fields.append((fid, flen))
+            offset += 4
+
+        # Parse option fields (each is 4 bytes: field_id + field_len)
+        option_end = offset + option_length
+        while offset + 4 <= option_end and offset + 4 <= end:
+            fid = struct.unpack_from("!H", data, offset)[0]
+            flen = struct.unpack_from("!H", data, offset + 2)[0]
+            fields.append((fid, flen))
+            offset += 4
+
+        if fields:
+            cache.store(source_ip, domain_id, template_id, fields)
+            if options_template_ids is not None:
+                options_template_ids.add((source_ip, domain_id, template_id))
+            logger.debug("Cached v9 options template %d from %s: %d fields",
+                        template_id, source_ip, len(fields))
+
+
+def _parse_ipfix_options_template_set(data: bytes, offset: int, length: int,
+                                       source_ip: str, domain_id: int,
+                                       cache: TemplateCache,
+                                       options_template_ids: Optional[set] = None) -> None:
+    """Parse IPFIX Options Template Set and store in cache.
+
+    Format per template:
+      - Template ID         (2 bytes)
+      - Total Field Count   (2 bytes)
+      - Scope Field Count   (2 bytes)
+      - Fields              (field_id + field_len pairs, same as regular template)
+    """
+    end = offset + length
+    while offset + 6 <= end:
+        template_id = struct.unpack_from("!H", data, offset)[0]
+        field_count = struct.unpack_from("!H", data, offset + 2)[0]
+        scope_field_count = struct.unpack_from("!H", data, offset + 4)[0]
+        offset += 6
+
+        fields = []
+        for _ in range(field_count):
+            if offset + 4 > end:
+                return
+            fid_raw = struct.unpack_from("!H", data, offset)[0]
+            flen = struct.unpack_from("!H", data, offset + 2)[0]
+            # IPFIX: bit 15 = enterprise bit
+            fid = fid_raw & 0x7FFF
+            enterprise = bool(fid_raw & 0x8000)
+            offset += 4
+            if enterprise:
+                if offset + 4 > end:
+                    return
+                offset += 4  # skip enterprise number
+            fields.append((fid, flen))
+
+        if fields:
+            cache.store(source_ip, domain_id, template_id, fields)
+            if options_template_ids is not None:
+                options_template_ids.add((source_ip, domain_id, template_id))
+            logger.debug("Cached IPFIX options template %d from %s: %d fields "
+                        "(%d scope)",
+                        template_id, source_ip, len(fields), scope_field_count)
+
+
+# Sampling-rate Information Element IDs to look for in Options data records
+_SAMPLING_RATE_IES = {
+    IE_SAMPLING_INTERVAL,      # 34
+    IE_SAMPLING_PKT_INTERVAL,  # 305
+}
+
+
+def _extract_sampling_from_data(data: bytes, offset: int, length: int,
+                                 template_id: int, source_ip: str,
+                                 domain_id: int, cache: TemplateCache,
+                                 device_sampling_rates: dict) -> None:
+    """Decode Options data records and extract sampling rate fields."""
+    template = cache.get(source_ip, domain_id, template_id)
+    if template is None:
+        return
+
+    record_len = sum(flen for _, flen in template)
+    if record_len == 0:
+        return
+
+    end = offset + length
+    while offset + record_len <= end:
+        pos = offset
+        for field_id, field_len in template:
+            if pos + field_len > len(data):
+                return
+            if field_id in _SAMPLING_RATE_IES and field_len <= 4:
+                value = int.from_bytes(data[pos:pos + field_len], "big")
+                if value > 0:
+                    prev = device_sampling_rates.get(source_ip, 0)
+                    device_sampling_rates[source_ip] = value
+                    if prev != value:
+                        logger.info("Auto-detected sampling rate %d from %s "
+                                    "(IE %d)", value, source_ip, field_id)
+            pos += field_len
+        offset += record_len
 
 
 def _parse_v9_data_flowset(data: bytes, offset: int, length: int,
@@ -865,6 +1020,10 @@ class FlowCollector:
         self.template_cache = TemplateCache()
         self._sock: Optional[socket.socket] = None
         self._running = False
+        # Auto-detected sampling rates from Options Templates (per source IP)
+        self._device_sampling_rates: dict[str, int] = {}
+        # Track which template IDs are Options Templates (scope+option fields)
+        self._options_template_ids: set[tuple] = set()  # (source_ip, domain_id, template_id)
         # Metrics
         self._datagrams_received = 0
         self._datagrams_errors = 0
@@ -911,16 +1070,21 @@ class FlowCollector:
             try:
                 records = self._parse(data, source_ip)
                 if records:
-                    # Apply sample rate override for protocols that don't embed
-                    # sampling info (NetFlow v9, IPFIX).  sFlow and NetFlow v5
-                    # already inflate packet/octet counts during parsing, so
-                    # only touch records still at the default sample_rate=1.
-                    if self.sample_rate_override > 1:
+                    # Determine effective sample rate:
+                    #   manual override > auto-detected from Options Templates > 1
+                    # sFlow and NetFlow v5 already inflate packet/octet counts
+                    # during parsing, so only touch records still at sample_rate=1.
+                    effective_rate = self.sample_rate_override
+                    if effective_rate <= 1:
+                        effective_rate = self._device_sampling_rates.get(source_ip, 0)
+
+                    if effective_rate > 1:
                         for rec in records:
                             if rec.sample_rate <= 1:
-                                rec.packets *= self.sample_rate_override
-                                rec.octets *= self.sample_rate_override
-                                rec.sample_rate = self.sample_rate_override
+                                rec.packets *= effective_rate
+                                rec.octets *= effective_rate
+                                rec.sample_rate = effective_rate
+
                     self._records_parsed += len(records)
                     self.aggregator.ingest(records)
             except Exception as e:
@@ -947,9 +1111,13 @@ class FlowCollector:
         elif self.protocol == "netflow_v5":
             return parse_netflow_v5(data)
         elif self.protocol == "netflow_v9":
-            return parse_netflow_v9(data, source_ip, self.template_cache)
+            return parse_netflow_v9(data, source_ip, self.template_cache,
+                                    self._options_template_ids,
+                                    self._device_sampling_rates)
         elif self.protocol == "ipfix":
-            return parse_ipfix(data, source_ip, self.template_cache)
+            return parse_ipfix(data, source_ip, self.template_cache,
+                               self._options_template_ids,
+                               self._device_sampling_rates)
 
         return self._auto_parse(data, source_ip)
 
@@ -968,9 +1136,13 @@ class FlowCollector:
         if version == 5 and len(data) >= 24:
             return parse_netflow_v5(data)
         elif version == 9:
-            return parse_netflow_v9(data, source_ip, self.template_cache)
+            return parse_netflow_v9(data, source_ip, self.template_cache,
+                                    self._options_template_ids,
+                                    self._device_sampling_rates)
         elif version == 10:
-            return parse_ipfix(data, source_ip, self.template_cache)
+            return parse_ipfix(data, source_ip, self.template_cache,
+                               self._options_template_ids,
+                               self._device_sampling_rates)
 
         return []
 
@@ -987,4 +1159,5 @@ class FlowCollector:
             "running": self._running,
             "node_ip_filter": self.aggregator.node_ip or "none",
             "records_filtered": self.aggregator._records_filtered,
+            "device_sampling_rates": dict(self._device_sampling_rates),
         }

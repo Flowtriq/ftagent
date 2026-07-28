@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
     "vm_labels": {},          # {"10.0.0.5": "Customer A", "10.0.0.6": "Customer B"}
     # Mirror/SPAN mode — monitor an entire network segment from a SPAN port
     # Instead of monitoring this server's own traffic, capture mirrored packets
-    # and run per-destination-IP detection (like FastNetMon's mirror mode).
+    # and run per-destination-IP detection across an entire network segment.
     "mirror_mode": False,
     "mirror_interface": "",        # NIC connected to SPAN/mirror port (required when mirror_mode=True)
     "mirror_subnets": [],          # Only monitor these destination CIDRs ["10.0.0.0/24"]
@@ -70,6 +70,7 @@ DEFAULT_CONFIG = {
     # Agones GameServer integration — label attacked pods via SDK sidecar
     "agones_sidecar": False,
     "agones_sidecar_port": 59358,      # Agones SDK HTTP port (default 59358)
+    "pcap_lazy": False,  # Only capture PCAP during attacks (saves disk/CPU)
 }
 
 # Flow collector (built-in, no extra deps)
@@ -4297,6 +4298,12 @@ class Agent:
             cfg, self.monitor.interface, self.analyser, self.ioc_matcher,
             gre_decap=self.gre_decap, hypervisor_mode=self.hypervisor_mode)
 
+        # Lazy PCAP: defer capture until an attack is detected
+        self._pcap_lazy = bool(cfg.get("pcap_lazy", False))
+        if self._pcap_lazy and self.pcap.enabled:
+            self.pcap.enabled = False
+            logger.info("Lazy PCAP mode: capture will start on attack detection")
+
         # Flow collector (sFlow/NetFlow/IPFIX)
         self.flow: Optional[FlowCollector] = None
         if cfg.get("flow_enabled"):
@@ -4815,6 +4822,12 @@ class Agent:
     def _begin_attack(self) -> None:
         self.attacking = True
         self.attack_start = time.time()
+
+        # Lazy PCAP: start capture now that an attack is detected
+        if self._pcap_lazy and not self.pcap.enabled:
+            self.pcap.enabled = True
+            logger.info("Lazy PCAP: starting capture for attack")
+
         self.peak_pps = self.monitor.pps
         self.peak_bps = self.monitor.bps
         if self.flow and self.flow.aggregator.pps > self.peak_pps:
@@ -5370,6 +5383,11 @@ class Agent:
         # Clear Agones GameServer attack labels
         if self.agones:
             threading.Thread(target=self.agones.clear_attack, daemon=True).start()
+
+        # Lazy PCAP: stop capture now that the attack is resolved
+        if self._pcap_lazy and self.pcap.enabled:
+            self.pcap.enabled = False
+            logger.info("Lazy PCAP: stopping capture, attack resolved")
 
         self.attacking = False
         self.incident_uuid = ""
@@ -6580,6 +6598,11 @@ class MirrorAgent(Agent):
         """Open a new incident for a specific destination IP."""
         from ftagent.mirror_engine import IPSnapshot
 
+        # Lazy PCAP: start capture when first attack is detected
+        if self._pcap_lazy and not self.pcap.enabled:
+            self.pcap.enabled = True
+            logger.info("Lazy PCAP: starting capture for mirror attack on %s", ip)
+
         baseline = self.per_ip_baseline.get_baseline(ip)
         label = self.mirror_ip_labels.get(ip, "")
         label_str = f" ({label})" if label else ""
@@ -6766,6 +6789,11 @@ class MirrorAgent(Agent):
         self._stop_ip_pcap(ip, state.get("incident_uuid", ""))
 
         del self.active_attacks[ip]
+
+        # Lazy PCAP: stop capture when all mirror attacks are resolved
+        if self._pcap_lazy and self.pcap.enabled and len(self.active_attacks) == 0:
+            self.pcap.enabled = False
+            logger.info("Lazy PCAP: stopping capture, all mirror attacks resolved")
 
     _MAX_IP_PCAP_PROCS = 10  # prevent subprocess explosion during wide DDoS
 
