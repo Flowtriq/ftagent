@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.40"
+VERSION = "1.9.41"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -4341,7 +4341,8 @@ class Agent:
         self.below_count: int = 0
         self._above_count: int = 0  # sustained confirmation counter
         self._last_attack_end: float = 0.0
-        self._attack_cooldown: float = 60.0  # suppress re-detection for 60s after attack ends
+        self._attack_cooldown: float = 60.0  # suppress re-detection for N seconds after attack ends
+        self._attack_holddown: int = 10     # consecutive below-threshold ticks before resolving
         self.velocity_curve: collections.deque = collections.deque(maxlen=2000)
         self.last_update: float = 0.0
         self.server_threshold: float | None = None
@@ -4763,7 +4764,7 @@ class Agent:
             else:
                 self.below_count = 0
 
-            if self.below_count >= 10:
+            if self.below_count >= self._attack_holddown:
                 # Flush metrics immediately so dashboard sees the resolution
                 self._flush_metrics()
                 self._last_metrics_push = now
@@ -5771,6 +5772,12 @@ class Agent:
             # Velocity detection (server can override local config)
             if "velocity_detection" in data:
                 self.baseline._velocity_detection = bool(data["velocity_detection"])
+
+            # Attack holddown & cooldown (configurable per node)
+            if "attack_holddown" in data:
+                self._attack_holddown = max(3, int(data["attack_holddown"]))
+            if "attack_cooldown" in data:
+                self._attack_cooldown = max(10, float(data["attack_cooldown"]))
 
             # Service Ports config from server
             sp_cfg = data.get("service_ports", {})
