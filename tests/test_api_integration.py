@@ -339,18 +339,19 @@ class TestRetryQueue:
         client.retry_queue.append(("POST", "/test2", {"b": 2}, 10))
         client.retry_queue.append(("POST", "/test3", {"c": 3}, 10))
 
-        # First succeeds, second fails -- flush breaks on failure
+        # First succeeds, second fails, third succeeds
+        # Flush continues past individual failures (breaks after 3 consecutive)
         mock_resp_ok = MagicMock()
         mock_resp_ok.status_code = 200
         client.session.post.side_effect = [
             mock_resp_ok,
             requests.ConnectionError("fail"),
+            mock_resp_ok,
         ]
 
         client.flush_retry_queue()
-        # flush_retry_queue poplefts before trying, so failed item is lost
-        # but third item should remain since the loop broke
-        assert len(client.retry_queue) == 1
+        # All items popped (failed item skipped, not re-queued)
+        assert len(client.retry_queue) == 0
 
     def test_flush_empty_queue(self):
         client = _make_client()
