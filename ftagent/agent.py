@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.45"
+VERSION = "1.9.46"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -675,6 +675,7 @@ class APIClient:
 
     def flush_retry_queue(self) -> None:
         flushed = 0
+        _consecutive_failures = 0
         while self.retry_queue:
             method, path, payload, timeout = self.retry_queue.popleft()
             url = f"{self.base}{path}"
@@ -682,8 +683,11 @@ class APIClient:
                 resp = self.session.post(url, json=payload, timeout=timeout)
                 resp.raise_for_status()
                 flushed += 1
-            except Exception:
-                break
+            except Exception as exc:
+                _consecutive_failures += 1
+                if _consecutive_failures >= 3:
+                    break  # API is down, stop trying
+                continue  # skip this item, try next
         if flushed:
             logger.info("Flushed %d queued requests", flushed)
 
@@ -4736,6 +4740,10 @@ class Agent:
         pps = self.monitor.pps
         bps = self.monitor.bps
 
+        # Snapshot config values to avoid race with config thread mid-tick
+        _holddown = self._attack_holddown
+        _cooldown = self._attack_cooldown
+
         # GRE deduplication: subtract encapsulation overhead from BPS (Feature 1).
         # PPS doesn't change (one outer packet = one inner packet).
         # BPS is deflated by the GRE overhead ratio observed in the last window.
@@ -4894,7 +4902,7 @@ class Agent:
             # because those are unambiguously real attacks.
             if _trigger and self._last_attack_end > 0:
                 _cd_elapsed = time.monotonic() - self._last_attack_end
-                if _cd_elapsed < self._attack_cooldown and pps < _absolute_floor * 5:
+                if _cd_elapsed < _cooldown and pps < _absolute_floor * 5:
                     _trigger = False
 
             # Sustained-attack confirmation: require 3 consecutive ticks above
@@ -4926,7 +4934,7 @@ class Agent:
                 self.below_count = 0
                 self._above_count = 0  # reset confirmation counter on recovery
 
-            if self.below_count >= self._attack_holddown:
+            if self.below_count >= _holddown:
                 # Flush metrics immediately so dashboard sees the resolution
                 self._flush_metrics()
                 self._last_metrics_push = now
@@ -5949,6 +5957,16 @@ class Agent:
                                    "Configure a log path in dashboard Settings → L7 Detection.")
             elif self.l7:
                 logger.info("L7: disabled by server config")
+                # Resolve any active L7 incident before disabling
+                if hasattr(self, 'l7_incident_uuid') and self.l7_incident_uuid:
+                    try:
+                        self.api.resolve_incident(self.l7_incident_uuid, {
+                            "duration_seconds": 0, "attack_family": "http_flood",
+                            "confidence": 50, "status": "resolved"
+                        })
+                        self.l7_incident_uuid = None
+                    except Exception:
+                        pass
                 self.l7 = None
                 self.l7_enabled = False
 
