@@ -7,6 +7,7 @@ Monitors network traffic on Linux servers and reports to the Flowtriq API.
 
 import argparse
 import collections
+import heapq
 import json
 import logging
 import math
@@ -24,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.43"
+VERSION = "1.9.44"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1488,8 +1489,7 @@ class TrafficAnalyser:
     def top_src_ips(self, n: int = 20) -> list:
         total = self.total_packets or 1
         result = []
-        for ip, c in sorted(self.src_ips.items(),
-                             key=lambda x: x[1], reverse=True)[:n]:
+        for ip, c in heapq.nlargest(n, self.src_ips.items(), key=lambda x: x[1]):
             entry = {"ip": ip, "count": c}
             d = self.src_ip_detail.get(ip)
             if d:
@@ -1535,13 +1535,11 @@ class TrafficAnalyser:
 
     def top_dst_ports(self, n: int = 20) -> list:
         return [{"port": p, "count": c}
-                for p, c in sorted(self.dst_ports.items(),
-                                   key=lambda x: x[1], reverse=True)[:n]]
+                for p, c in heapq.nlargest(n, self.dst_ports.items(), key=lambda x: x[1])]
 
     def top_src_ports(self, n: int = 20) -> list:
         return [{"port": p, "count": c}
-                for p, c in sorted(self.src_ports.items(),
-                                   key=lambda x: x[1], reverse=True)[:n]]
+                for p, c in heapq.nlargest(n, self.src_ports.items(), key=lambda x: x[1])]
 
     def protocol_breakdown(self) -> dict:
         """Compute protocol percentages from actual packet inspection (scapy).
@@ -3424,7 +3422,7 @@ def classify_subtype(family: str, top_ports: list = None,
                           389: "cldap_amplification", 19: "chargen_amplification",
                           161: "snmp_amplification", 3702: "wsd_amplification",
                           5353: "mdns_amplification", 1194: "openvpn_amplification",
-                          3283: "apple_remote_amplification", 3389: "rdp_amplification"}
+                          3283: "apple_remote_amplification"}
             if top_src_port in _amp_ports:
                 return _amp_ports[top_src_port]
             if top_port in _amp_ports:
@@ -3436,15 +3434,18 @@ def classify_subtype(family: str, top_ports: list = None,
         # Fragment flood: high percentage of IP fragments indicates fragmentation attack
         if fragment_pct > 30:
             return "udp_fragment_flood"
-        # QUIC flood: UDP port 443 is used by HTTP/3 over QUIC
-        if top_port == 443:
+        # QUIC flood: UDP port 443 is HTTP/3 over QUIC. Only classify as QUIC
+        # if packet sizes are small (Initial packets are ~1200 bytes, but flood
+        # packets are often smaller). Large packets on port 443 are more likely
+        # generic UDP reflection, not QUIC-specific.
+        if top_port == 443 and avg_pkt_len > 0 and avg_pkt_len < 1300:
             return "quic_flood"
         _amp_ports = {53: "dns_amplification", 123: "ntp_amplification",
                       1900: "ssdp_amplification", 11211: "memcached_amplification",
                       389: "cldap_amplification", 19: "chargen_amplification",
                       161: "snmp_amplification", 3702: "wsd_amplification",
                       5353: "mdns_amplification", 1194: "openvpn_amplification",
-                      3283: "apple_remote_amplification", 3389: "rdp_amplification"}
+                      3283: "apple_remote_amplification"}
         # Check source ports first (amplification comes FROM reflector ports)
         if top_src_port in _amp_ports:
             return _amp_ports[top_src_port]
@@ -4850,10 +4851,14 @@ class Agent:
             if not self.baseline.baseline_ready and pps >= _absolute_floor:
                 _trigger = True
             # BPS-based trigger: catch amplification attacks that are low PPS but
-            # high bandwidth. Only fires after baseline is ready and BPS threshold
-            # is meaningful (above 50 Mbps floor).
-            if not _trigger and self.baseline.baseline_ready and self.baseline.bps_threshold > 0:
+            # high bandwidth (e.g. NTP monlist at 2K PPS but 20 Gbps).
+            if not _trigger and self.baseline.bps_threshold > 0:
                 if bps > self.baseline.bps_threshold:
+                    _trigger = True
+            # During warmup, use a high absolute BPS floor (1 Gbps) to catch
+            # massive amplification attacks before baseline converges.
+            if not _trigger and not self.baseline.baseline_ready:
+                if bps > 1_000_000_000:  # 1 Gbps
                     _trigger = True
 
             # Velocity detection (opt-in): trigger on extreme rate-of-change even
@@ -4913,6 +4918,7 @@ class Agent:
                 self.below_count += 1
             else:
                 self.below_count = 0
+                self._above_count = 0  # reset confirmation counter on recovery
 
             if self.below_count >= self._attack_holddown:
                 # Flush metrics immediately so dashboard sees the resolution
@@ -6750,14 +6756,18 @@ class MirrorAgent(Agent):
                 if bl is None or bl.baseline_ready or snap.pps < _abs_floor:
                     self.per_ip_baseline.add(ip, snap.pps, snap.bps)
 
-        # 4. Per-IP detection (with 2-tick confirmation window)
+        # 4. Per-IP detection (with confirmation window)
         for ip, snap in ip_snapshots.items():
             if ip not in self.active_attacks:
                 if self.per_ip_baseline.check(ip, snap.pps, snap.bps):
-                    self._ip_confirm_counts[ip] = self._ip_confirm_counts.get(ip, 0) + 1
-                    if self._ip_confirm_counts[ip] >= 2:
-                        self._begin_ip_attack(ip, snap)
-                        self._ip_confirm_counts.pop(ip, None)
+                    bl_info = self.per_ip_baseline.get_baseline(ip)
+                    # Require baseline-ready before confirmation, unless massive spike
+                    if bl_info["ready"] or snap.pps >= 50000:
+                        self._ip_confirm_counts[ip] = self._ip_confirm_counts.get(ip, 0) + 1
+                        if self._ip_confirm_counts[ip] >= 3:
+                            self._begin_ip_attack(ip, snap)
+                            self._ip_confirm_counts.pop(ip, None)
+                    # else: baseline not ready and PPS < 50K, let baseline build
                 else:
                     self._ip_confirm_counts.pop(ip, None)
             else:

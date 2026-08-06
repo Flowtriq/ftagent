@@ -237,9 +237,18 @@ class TestClassifySubtype:
         assert result == "memcached_amplification"
 
     def test_quic_flood(self):
+        # QUIC requires port 443 + small packet size
         result = classify_subtype("udp_flood",
-                                   top_ports=[{"port": 443, "count": 100}])
+                                   top_ports=[{"port": 443, "count": 100}],
+                                   avg_pkt_len=200)
         assert result == "quic_flood"
+
+    def test_port_443_without_small_packets_not_quic(self):
+        # Port 443 with large packets is generic, not QUIC
+        result = classify_subtype("udp_flood",
+                                   top_ports=[{"port": 443, "count": 100}],
+                                   avg_pkt_len=1400)
+        assert result != "quic_flood"
 
     def test_small_packet_flood(self):
         result = classify_subtype("udp_flood",
