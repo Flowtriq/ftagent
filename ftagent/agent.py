@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.44"
+VERSION = "1.9.45"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1223,6 +1223,7 @@ _PAYLOAD_SIGS = {
 
 class TrafficAnalyser:
     def __init__(self):
+        self._lock = threading.Lock()
         self.reset()
 
     # Memory safety caps — prevent OOM on large botnets (10M+ source IPs)
@@ -1234,6 +1235,10 @@ class TrafficAnalyser:
     MAX_INNER_IPS = 1_000       # max inner dst IPs (VMs) tracked per hypervisor
 
     def reset(self) -> None:
+        with self._lock:
+            self._reset_unlocked()
+
+    def _reset_unlocked(self) -> None:
         self.tcp_flags = {"SYN": 0, "ACK": 0, "RST": 0, "FIN": 0,
                           "PSH": 0, "URG": 0}
         self.src_ips: dict = {}        # ip -> count
@@ -1275,15 +1280,14 @@ class TrafficAnalyser:
     def process_packet(self, pkt, ioc_matcher=None, gre_decap=None,
                        hypervisor_mode: bool = False) -> None:
         """
-        Analyse one packet for stats.
-
-        gre_decap: GREDecapsulator instance or None. When set, strips GRE
-                   headers from the stats packet. The original pkt is never
-                   modified — it's passed separately to PCAP for forensics.
-
-        hypervisor_mode: When True and GRE decapsulation happened, track inner
-                         destination IP to attribute traffic to individual VMs.
+        Analyse one packet for stats. Thread-safe: called from PCAP thread
+        while main thread may call reset().
         """
+        with self._lock:
+            self._process_packet_unlocked(pkt, ioc_matcher, gre_decap, hypervisor_mode)
+
+    def _process_packet_unlocked(self, pkt, ioc_matcher=None, gre_decap=None,
+                                  hypervisor_mode: bool = False) -> None:
         self.total_packets += 1
 
         if not SCAPY_AVAILABLE:
@@ -4493,6 +4497,7 @@ class Agent:
         self._last_attack_end: float = 0.0
         self._attack_cooldown: float = 60.0  # suppress re-detection for N seconds after attack ends
         self._attack_holddown: int = 10     # consecutive below-threshold ticks before resolving
+        self.preferred_firewall: str = cfg.get("preferred_firewall", "iptables")
         self.velocity_curve: collections.deque = collections.deque(maxlen=2000)
         self.last_update: float = 0.0
         self.server_threshold: float | None = None
@@ -4520,6 +4525,7 @@ class Agent:
 
         # Command deduplication: track executed command IDs
         self._executed_command_ids: set = set()
+        self._executed_command_order: collections.deque = collections.deque(maxlen=500)
 
     @property
     def threshold(self) -> float:
@@ -4952,7 +4958,7 @@ class Agent:
         try:
             self._metrics_queue.put_nowait(agg)
         except queue.Full:
-            pass  # drop oldest if queue is full (backpressure)
+            logger.debug("Metrics queue full, dropping current batch")
 
     def _metrics_sender_loop(self) -> None:
         """Background thread: drains metrics queue and POSTs to API."""
@@ -5756,7 +5762,11 @@ class Agent:
                             continue
                         self._execute_command(cmd)
                         if cmd_id:
+                            if len(self._executed_command_order) == self._executed_command_order.maxlen:
+                                evicted = self._executed_command_order[0]
+                                self._executed_command_ids.discard(evicted)
                             self._executed_command_ids.add(cmd_id)
+                            self._executed_command_order.append(cmd_id)
                         executed += 1
                     if executed:
                         logger.info("Command poll: processed %d commands", executed)
@@ -5818,7 +5828,7 @@ class Agent:
                         logger.warning("Forced update error: %s", e)
 
             if "pps_threshold" in data and data["pps_threshold"]:
-                self.server_threshold = float(data["pps_threshold"])
+                self.server_threshold = max(0.0, float(data["pps_threshold"]))
                 logger.info("Server threshold: %.0f", self.server_threshold)
             elif data.get("dynamic_threshold", True):
                 self.server_threshold = None
@@ -5867,10 +5877,12 @@ class Agent:
                         continue
                     self._execute_command(cmd)
                     if cmd_id:
+                        # Bounded deque auto-evicts oldest; keep set in sync
+                        if len(self._executed_command_order) == self._executed_command_order.maxlen:
+                            evicted = self._executed_command_order[0]
+                            self._executed_command_ids.discard(evicted)
                         self._executed_command_ids.add(cmd_id)
-                        # Prevent unbounded growth: keep only last 500 IDs
-                        if len(self._executed_command_ids) > 500:
-                            self._executed_command_ids = set(list(self._executed_command_ids)[-250:])
+                        self._executed_command_order.append(cmd_id)
 
             # Flow collector config from server (dashboard can enable/configure per node)
             # Dashboard values override local config.json; local values act as
@@ -5949,6 +5961,9 @@ class Agent:
                 self._attack_holddown = max(3, int(data["attack_holddown"]))
             if "attack_cooldown" in data:
                 self._attack_cooldown = max(10, float(data["attack_cooldown"]))
+            # Preferred firewall from tenant settings
+            if "preferred_firewall" in data:
+                self.preferred_firewall = data["preferred_firewall"]
 
             # Service Ports config from server
             sp_cfg = data.get("service_ports", {})
