@@ -176,6 +176,8 @@ def _parse_sflow_flow_sample(data: bytes, offset: int, length: int) -> list[Flow
         return []
     (_seq, _source_id, sampling_rate, _sample_pool,
      _drops, _input, _output, num_records) = struct.unpack_from("!IIIIIIII", data, offset)
+    if sampling_rate == 0:
+        sampling_rate = 1
     return _parse_sflow_sample_records(data, offset + 32, end, num_records, sampling_rate)
 
 
@@ -186,6 +188,8 @@ def _parse_sflow_expanded_flow_sample(data: bytes, offset: int, length: int) -> 
         return []
     _seq = struct.unpack_from("!I", data, offset)[0]
     sampling_rate = struct.unpack_from("!I", data, offset + 12)[0]
+    if sampling_rate == 0:
+        sampling_rate = 1
     num_records = struct.unpack_from("!I", data, offset + 40)[0]
     return _parse_sflow_sample_records(data, offset + 44, end, num_records, sampling_rate)
 
@@ -507,6 +511,9 @@ def _parse_v9_template_flowset(data: bytes, offset: int, length: int,
         field_count = struct.unpack_from("!H", data, offset + 2)[0]
         offset += 4
 
+        if field_count > 128:
+            return  # reject oversized templates (memory DoS protection)
+
         fields = []
         for _ in range(field_count):
             if offset + 4 > end:
@@ -531,6 +538,9 @@ def _parse_ipfix_template_set(data: bytes, offset: int, length: int,
         template_id = struct.unpack_from("!H", data, offset)[0]
         field_count = struct.unpack_from("!H", data, offset + 2)[0]
         offset += 4
+
+        if field_count > 128:
+            return  # reject oversized templates (memory DoS protection)
 
         fields = []
         for _ in range(field_count):
@@ -771,6 +781,7 @@ class FlowAggregator:
 
     def __init__(self, per_dst_ip_mode: bool = False):
         self._lock = threading.Lock()
+        self._dst_overflow_count = 0
         # Accumulator for current window
         self._packets = 0
         self._octets = 0
@@ -847,6 +858,11 @@ class FlowAggregator:
                     dst = self._per_dst.get(rec.dst_ip)
                     if dst is None:
                         if len(self._per_dst) >= self.MAX_DST_IPS:
+                            self._dst_overflow_count += 1
+                            if self._dst_overflow_count == 1000:
+                                logger.warning("Per-dst-IP overflow: %d packets dropped "
+                                               "(cap=%d IPs)", self._dst_overflow_count,
+                                               self.MAX_DST_IPS)
                             continue
                         dst = {"packets": 0, "octets": 0, "tcp": 0, "udp": 0, "icmp": 0,
                                "src_ips": {}, "dst_ports": {}, "tcp_flags": {
@@ -890,10 +906,11 @@ class FlowAggregator:
             else:
                 self._snap_tcp_pct = self._snap_udp_pct = self._snap_icmp_pct = 0.0
 
-            # Snapshot per-dst-IP data
+            # Snapshot per-dst-IP data (deep copy to avoid race with ingest)
             if self._per_dst_ip_mode:
-                self._snap_per_dst = dict(self._per_dst)
+                self._snap_per_dst = {k: dict(v) for k, v in self._per_dst.items()}
                 self._per_dst.clear()
+                self._dst_overflow_count = 0
             else:
                 self._snap_per_dst = {}
 
