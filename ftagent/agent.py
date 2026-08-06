@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.41"
+VERSION = "1.9.42"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -2207,6 +2207,100 @@ class PcapCapture:
                     hypervisor_mode=self._hypervisor_mode,
                 )
 
+    def sample_tcp_flags_from_ring(self, max_packets: int = 5000) -> dict:
+        """Parse TCP flags from the latest ring pcap file (tcpdump mode).
+        Returns flag counts dict. Uses raw struct parsing, no scapy needed.
+        Samples up to max_packets TCP packets to keep CPU bounded."""
+        flags = {"SYN": 0, "ACK": 0, "RST": 0, "FIN": 0, "PSH": 0, "URG": 0}
+        if self.pcap_mode != "tcpdump" or not self._ring_dir:
+            return flags
+        import glob as _glob
+        import struct
+        ring_files = sorted(
+            _glob.glob(os.path.join(self._ring_dir, "ring*")),
+            key=lambda f: os.path.getmtime(f), reverse=True)
+        # Also check capture dir if we have one (attack-time pcap)
+        if hasattr(self, '_tcpdump_capture_dir') and self._tcpdump_capture_dir:
+            cap_files = sorted(
+                _glob.glob(os.path.join(self._tcpdump_capture_dir, "*.pcap")),
+                key=lambda f: os.path.getmtime(f), reverse=True)
+            ring_files = cap_files + ring_files
+        tcp_count = 0
+        for pcap_path in ring_files[:3]:  # at most 3 files
+            try:
+                with open(pcap_path, "rb") as f:
+                    hdr = f.read(24)
+                    if len(hdr) < 24:
+                        continue
+                    magic = struct.unpack("<I", hdr[:4])[0]
+                    if magic == 0xa1b2c3d4:
+                        endian = "<"
+                    elif magic == 0xd4c3b2a1:
+                        endian = ">"
+                    else:
+                        continue
+                    link_type = struct.unpack(endian + "I", hdr[20:24])[0]
+                    # 1 = Ethernet, 113 = Linux cooked capture (SLL)
+                    if link_type == 1:
+                        l2_skip = 14
+                    elif link_type == 113:
+                        l2_skip = 16
+                    else:
+                        continue
+                    while tcp_count < max_packets:
+                        rec_hdr = f.read(16)
+                        if len(rec_hdr) < 16:
+                            break
+                        incl_len, orig_len = struct.unpack(endian + "II", rec_hdr[8:16])
+                        pkt_data = f.read(incl_len)
+                        if len(pkt_data) < incl_len:
+                            break
+                        # Parse Ethernet/SLL -> IP -> TCP
+                        if len(pkt_data) < l2_skip + 20:
+                            continue
+                        # Check EtherType (or SLL protocol) for IPv4
+                        if link_type == 1:
+                            ethertype = struct.unpack("!H", pkt_data[12:14])[0]
+                            # Skip 802.1Q VLAN tag
+                            offset = l2_skip
+                            if ethertype == 0x8100 and len(pkt_data) >= l2_skip + 4:
+                                ethertype = struct.unpack("!H", pkt_data[l2_skip + 2:l2_skip + 4])[0]
+                                offset = l2_skip + 4
+                            if ethertype != 0x0800:
+                                continue
+                        else:
+                            proto_type = struct.unpack("!H", pkt_data[14:16])[0]
+                            offset = l2_skip
+                            if proto_type != 0x0800:
+                                continue
+                        if len(pkt_data) < offset + 20:
+                            continue
+                        ip_byte0 = pkt_data[offset]
+                        ihl = (ip_byte0 & 0x0F) * 4
+                        protocol = pkt_data[offset + 9]
+                        if protocol != 6:  # not TCP
+                            continue
+                        tcp_offset = offset + ihl
+                        if len(pkt_data) < tcp_offset + 14:
+                            continue
+                        tcp_flags_byte = pkt_data[tcp_offset + 13]
+                        if tcp_flags_byte & 0x02:
+                            flags["SYN"] += 1
+                        if tcp_flags_byte & 0x10:
+                            flags["ACK"] += 1
+                        if tcp_flags_byte & 0x04:
+                            flags["RST"] += 1
+                        if tcp_flags_byte & 0x01:
+                            flags["FIN"] += 1
+                        if tcp_flags_byte & 0x08:
+                            flags["PSH"] += 1
+                        if tcp_flags_byte & 0x20:
+                            flags["URG"] += 1
+                        tcp_count += 1
+            except Exception as exc:
+                logger.debug("Ring pcap flag sampling error on %s: %s", pcap_path, exc)
+        return flags
+
     # Max total size for pre-attack ring snapshot: 100MB
     # This prevents copying multi-GB ring files on high-traffic links
     _MAX_RING_SNAPSHOT_BYTES = 100 * 1024 * 1024
@@ -3601,6 +3695,7 @@ class ServicePortDetector:
         self._attack_sources: list = []
         self._config_version = ""
         self.ip_safelist: set = set()
+        self._safelist_networks: list = []  # parsed ipaddress.ip_network objects for CIDR entries
         self._auto_safelist: set = set()  # auto-detected: localhost, own IPs
         self.min_block_pps = 10  # minimum PPS from a source before blocking
 
@@ -3633,6 +3728,19 @@ class ServicePortDetector:
             logger.info("Auto-safelist: %d local IPs/subnet IPs protected",
                         len(safe))
 
+    def is_safelisted(self, ip: str) -> bool:
+        """Check if an IP is on the safelist (supports both exact IPs and CIDR ranges)."""
+        if ip in self.ip_safelist or ip in self._auto_safelist:
+            return True
+        if self._safelist_networks:
+            import ipaddress as _ipa
+            try:
+                addr = _ipa.ip_address(ip)
+                return any(addr in net for net in self._safelist_networks)
+            except (ValueError, TypeError):
+                pass
+        return False
+
     def configure(self, sp_cfg: dict) -> None:
         """Apply config from server. Rebuilds accounting rules if ports changed."""
         with self._lock:
@@ -3652,7 +3760,18 @@ class ServicePortDetector:
             self.response_mode = sp_cfg.get("response_mode", "full")
             self.block_cooldown = max(60, int(sp_cfg.get("block_cooldown", 300)))
             self.block_scope = sp_cfg.get("block_scope", "non_service")
-            self.ip_safelist = set(sp_cfg.get("ip_safelist", []))
+            raw_safelist = sp_cfg.get("ip_safelist", [])
+            self.ip_safelist = set()
+            self._safelist_networks = []
+            import ipaddress as _ipa
+            for entry in raw_safelist:
+                if "/" in entry:
+                    try:
+                        self._safelist_networks.append(_ipa.ip_network(entry, strict=False))
+                    except (ValueError, TypeError):
+                        self.ip_safelist.add(entry)
+                else:
+                    self.ip_safelist.add(entry)
 
             if new_version != self._config_version:
                 logger.info("Service ports config changed, rebuilding accounting rules")
@@ -4028,6 +4147,16 @@ class ServicePortDetector:
         # Remove safelisted IPs before ranking
         for safe_ip in safelist_snapshot:
             sources.pop(safe_ip, None)
+        # Also remove IPs matching CIDR safelist entries
+        if self._safelist_networks:
+            import ipaddress as _ipa
+            for src_ip in list(sources.keys()):
+                try:
+                    addr = _ipa.ip_address(src_ip)
+                    if any(addr in net for net in self._safelist_networks):
+                        sources.pop(src_ip, None)
+                except (ValueError, TypeError):
+                    pass
 
         # Sort by connection count descending, take top 50
         top = sorted(sources.items(), key=lambda x: x[1]["pps"], reverse=True)[:50]
@@ -4067,7 +4196,7 @@ class ServicePortDetector:
                 if not ip or ip in self._block_rules:
                     continue
                 # Never block safelisted or local IPs
-                if ip in self.ip_safelist or ip in self._auto_safelist:
+                if self.is_safelisted(ip):
                     logger.info("Service port block skipped (safelisted): %s", ip)
                     continue
                 # Require minimum PPS before blocking (don't block 1-2 PPS noise)
@@ -5155,12 +5284,15 @@ class Agent:
 
         proto = self._proto_breakdown()
         _frag_pct = self.analyser.fragment_pct()
+        _upd_flags = dict(self.analyser.tcp_flags)
+        if not any(_upd_flags.values()) and self.pcap.pcap_mode == "tcpdump" and self.pcap.enabled:
+            _upd_flags = self.pcap.sample_tcp_flags_from_ring()
         if not self._classification_locked:
             family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"],
                                      syn_ratio=self.analyser.syn_ratio(),
                                      dns_detected=bool(self.analyser.dns_queries),
                                      top_ports=self.analyser.top_dst_ports(),
-                                     tcp_flags=dict(self.analyser.tcp_flags),
+                                     tcp_flags=_upd_flags,
                                      other_pct=proto.get("other", 0.0),
                                      fragment_pct=_frag_pct)
             family, _upd_subtype, _upd_tool, _ = enrich_from_ioc(
@@ -5249,6 +5381,9 @@ class Agent:
         _top_ports = self.analyser.top_dst_ports()
         _src_ports = self.analyser.top_src_ports()
         _flags = dict(self.analyser.tcp_flags)
+        # In tcpdump mode, analyser never sees packets — sample flags from ring pcap
+        if not any(_flags.values()) and self.pcap.pcap_mode == "tcpdump" and self.pcap.enabled:
+            _flags = self.pcap.sample_tcp_flags_from_ring()
         _avg_pkt = self.analyser.avg_pkt_length()
         _frag_pct = self.analyser.fragment_pct()
         family = classify_attack(
