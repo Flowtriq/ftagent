@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.42"
+VERSION = "1.9.43"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -1018,6 +1018,7 @@ class BaselineManager:
             'threshold': self.threshold,
             'bps_threshold': self.bps_threshold,
             'baseline_ready': self.baseline_ready,
+            'saved_at': time.time(),
         }
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1028,12 +1029,19 @@ class BaselineManager:
             logger.debug("Baseline save failed: %s", e)
 
     def restore_state(self, path: str) -> bool:
-        """Restore baseline state from disk. Returns True if restored."""
+        """Restore baseline state from disk. Returns True if restored.
+        Rejects baselines older than 24 hours to prevent stale thresholds."""
         try:
             with open(path) as f:
                 state = json.load(f)
             samples = state.get('samples', [])
             if not samples or len(samples) < 50:
+                return False
+            # Reject stale baselines (>24 hours old)
+            saved_at = state.get('saved_at', 0)
+            if saved_at and time.time() - saved_at > 86400:
+                age_h = (time.time() - saved_at) / 3600
+                logger.info("Baseline too old (%.1f hours), discarding", age_h)
                 return False
             self.samples = collections.deque(samples, maxlen=self.WINDOW)
             self._running_sum = sum(self.samples)
@@ -1078,8 +1086,8 @@ class PerIPBaselineManager:
         self._last_seen: dict[str, float] = {}
         self._last_prune: float = 0.0
 
-    def add(self, ip: str, pps: float) -> None:
-        """Feed a PPS sample for this IP into its baseline."""
+    def add(self, ip: str, pps: float, bps: float = 0.0) -> None:
+        """Feed a PPS/BPS sample for this IP into its baseline."""
         now = time.monotonic()
         self._last_seen[ip] = now
 
@@ -1095,25 +1103,28 @@ class PerIPBaselineManager:
             # LRU touch
             self._baselines.move_to_end(ip)
 
-        bl.add(pps)
+        bl.add(pps, bps)
 
         # Periodic stale eviction (every 60s)
         if now - self._last_prune >= 60:
             self._last_prune = now
             self._prune_stale(now)
 
-    def check(self, ip: str, pps: float) -> bool:
-        """Returns True if this IP's PPS exceeds its threshold."""
+    def check(self, ip: str, pps: float, bps: float = 0.0) -> bool:
+        """Returns True if this IP's PPS or BPS exceeds its threshold.
+        BPS check catches low-PPS high-bandwidth amplification attacks
+        (e.g. NTP monlist at 2K PPS but 20 Gbps)."""
         bl = self._baselines.get(ip)
         if bl is None:
-            # No baseline yet -- use absolute floor
-            return pps >= 10000
+            return pps >= 10000 or bps >= 500_000_000  # 500 Mbps absolute floor
         if not bl.baseline_ready:
-            # Baseline still building -- only trigger on absolute floor
-            # (don't use the 150 PPS default floor, it's too low for mirror mode
-            # where many IPs will have legitimate low-level traffic)
-            return pps >= 10000
-        return pps > bl.threshold
+            return pps >= 10000 or bps >= 500_000_000
+        if pps > bl.threshold:
+            return True
+        # BPS trigger: 3x the baseline BPS average (if we have BPS data)
+        if bps > 0 and hasattr(bl, 'avg_bps') and bl.avg_bps > 0:
+            return bps > bl.avg_bps * 10  # 10x average BPS
+        return False
 
     def get_threshold(self, ip: str) -> float:
         """Returns current threshold for an IP (0 if unknown)."""
@@ -1242,15 +1253,23 @@ class TrafficAnalyser:
         self.per_vm_detail: dict = {}  # inner_dst_ip -> {pps, bps, tcp, udp, icmp, src_ips}
 
     def _evict_low_count_ips(self) -> None:
-        """Cap src_ips dict at MAX_SRC_IPS. Instead of sorting all entries,
-        just stop inserting new IPs once full. The HLL tracks true cardinality."""
+        """Cap src_ips dict at MAX_SRC_IPS. The HLL tracks true cardinality
+        regardless, so eviction only affects the detailed per-IP breakdown."""
         if len(self.src_ips) <= self.MAX_SRC_IPS:
             return
-        # Simple strategy: remove IPs with count == 1 (one-hit wonders)
+        # Phase 1: remove count=1 one-hit wonders
         to_remove = [ip for ip, c in self.src_ips.items() if c <= 1]
         for ip in to_remove[:len(self.src_ips) - self.MAX_SRC_IPS + 1000]:
             del self.src_ips[ip]
             self.src_ip_detail.pop(ip, None)
+        # Phase 2: if still over cap, remove lowest-count IPs
+        if len(self.src_ips) > self.MAX_SRC_IPS:
+            excess = len(self.src_ips) - self.MAX_SRC_IPS + 1000
+            lowest = sorted(self.src_ips.items(), key=lambda x: x[1])[:excess]
+            for ip, _ in lowest:
+                del self.src_ips[ip]
+                self.src_ip_detail.pop(ip, None)
+            self._src_ip_overflow = True
 
     def process_packet(self, pkt, ioc_matcher=None, gre_decap=None,
                        hypervisor_mode: bool = False) -> None:
@@ -3330,13 +3349,15 @@ def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
                     top_ports: list = None, tcp_flags: dict = None,
                     other_pct: float = 0.0,
                     fragment_pct: float = 0.0) -> str:
-    # Fragment flood: overwhelmingly fragmented traffic is its own family
-    if fragment_pct > 50:
+    # Fragment flood: overwhelmingly fragmented traffic is its own family.
+    # Use 60% threshold — small sample sizes produce noisy fragment ratios,
+    # and legitimate MTU issues can cause 50%+ fragmentation briefly.
+    if fragment_pct > 60:
         return "fragment_flood"
-    # DNS flood requires DNS to be a significant portion of traffic, not just
-    # one query in the ring buffer. A single DNS lookup during a UDP flood
-    # should not reclassify the entire attack as dns_flood.
-    if dns_detected and udp_pct > 40:
+    # DNS flood: require DNS to dominate UDP traffic. A handful of DNS queries
+    # during a generic UDP flood should not reclassify the entire attack.
+    # dns_detected is bool(analyser.dns_queries) — check the count, not just presence.
+    if dns_detected and udp_pct > 50:
         return "dns_flood"
     if udp_pct > 45:
         return "udp_flood"
@@ -3344,12 +3365,11 @@ def classify_attack(tcp_pct: float, udp_pct: float, icmp_pct: float,
         return "syn_flood"
     if icmp_pct > 30:
         return "icmp_flood"
-    # Multi-vector requires at least two protocols with SIGNIFICANT presence (>25%).
-    # Normal internet traffic is typically ~65% TCP / ~30% UDP / ~1% ICMP, which
-    # should NOT be classified as multi-vector. The old 15% threshold caused most
-    # traffic spikes on mixed-protocol networks to appear as coordinated attacks.
-    elevated = sum(1 for v in (tcp_pct, udp_pct, icmp_pct) if v > 25)
-    if elevated >= 2:
+    # Multi-vector: both protocols must be strongly elevated (>35% each).
+    # Normal internet traffic (~65% TCP / ~30% UDP) should NOT trigger this.
+    # True multi-vector attacks have roughly balanced protocol splits (e.g. 45/45).
+    sorted_pcts = sorted([tcp_pct, udp_pct, icmp_pct], reverse=True)
+    if sorted_pcts[0] > 35 and sorted_pcts[1] > 35:
         return "multi_vector"
     # GRE/ESP/IPIP/other protocol floods
     if other_pct > 30:
@@ -3521,13 +3541,13 @@ def classify_tcp_subtype(tcp_flags: dict) -> str:
     # SYN-ACK flood: both SYN and ACK high
     if syn_r > 0.3 and ack_r > 0.3:
         return "syn_ack_flood"
-    if rst_r > 0.4:
+    if rst_r > 0.3:
         return "rst_flood"
-    if fin_r > 0.4:
+    if fin_r > 0.3:
         return "fin_flood"
-    if ack_r > 0.6 and syn_r < 0.1:
+    if ack_r > 0.45 and syn_r < 0.15:
         return "ack_flood"
-    if psh_r > 0.4 and ack_r > 0.3:
+    if psh_r > 0.25 and ack_r > 0.2:
         return "psh_ack_flood"
     # Fallback: if flags have data, return tcp_generic
     return "tcp_generic"
@@ -4732,13 +4752,14 @@ class Agent:
 
         # Don't pollute baseline with attack traffic — it would inflate the
         # threshold and make future detection less sensitive.
-        # Also skip samples above the absolute floor when baseline isn't ready,
-        # so a new node getting attacked doesn't build a baseline from attack data.
-        # Also skip samples during the sustained-confirmation window (_above_count > 0)
-        # to prevent threshold creep from repeated attack probes.
+        # Skip when: attacking, in confirmation window, OR current PPS exceeds
+        # threshold. The threshold check catches the first tick of a spike
+        # (before _above_count is incremented) that would otherwise leak into
+        # the baseline and cause threshold creep.
         _abs_floor = self.server_threshold or 10000
         _in_confirmation = getattr(self, '_above_count', 0) > 0
-        if not self.attacking and not _in_confirmation and (self.baseline.baseline_ready or pps < _abs_floor):
+        _exceeds_threshold = pps > self.threshold
+        if not self.attacking and not _in_confirmation and not _exceeds_threshold and (self.baseline.baseline_ready or pps < _abs_floor):
             self.baseline.add(pps, bps)
 
         # Buffer metrics locally, flush every _metrics_interval seconds.
@@ -5050,7 +5071,7 @@ class Agent:
 
         family = classify_attack(_init_tcp, _init_udp, _init_icmp,
                                  syn_ratio=_syn_est,
-                                 dns_detected=bool(self.analyser.dns_queries),
+                                 dns_detected=len(self.analyser.dns_queries) >= 10,
                                  top_ports=self.analyser.top_dst_ports(),
                                  tcp_flags=dict(self.analyser.tcp_flags),
                                  fragment_pct=self.analyser.fragment_pct())
@@ -5208,7 +5229,7 @@ class Agent:
         proto = self._proto_breakdown()
         family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"],
                                  syn_ratio=self.analyser.syn_ratio(),
-                                 dns_detected=bool(self.analyser.dns_queries),
+                                 dns_detected=len(self.analyser.dns_queries) >= 10,
                                  top_ports=self.analyser.top_dst_ports(),
                                  tcp_flags=dict(self.analyser.tcp_flags),
                                  other_pct=proto.get("other", 0.0),
@@ -5290,7 +5311,7 @@ class Agent:
         if not self._classification_locked:
             family = classify_attack(proto["tcp"], proto["udp"], proto["icmp"],
                                      syn_ratio=self.analyser.syn_ratio(),
-                                     dns_detected=bool(self.analyser.dns_queries),
+                                     dns_detected=len(self.analyser.dns_queries) >= 10,
                                      top_ports=self.analyser.top_dst_ports(),
                                      tcp_flags=_upd_flags,
                                      other_pct=proto.get("other", 0.0),
@@ -5389,7 +5410,7 @@ class Agent:
         family = classify_attack(
             proto["tcp"], proto["udp"], proto["icmp"],
             syn_ratio=self.analyser.syn_ratio(),
-            dns_detected=bool(self.analyser.dns_queries),
+            dns_detected=len(self.analyser.dns_queries) >= 10,
             top_ports=_top_ports,
             tcp_flags=_flags,
             other_pct=proto.get("other", 0.0),
@@ -5439,7 +5460,16 @@ class Agent:
 
         # Compute incident-level confidence score (0-100).
         # Combines multiple signals to distinguish real attacks from traffic spikes.
-        _conf = 30  # base
+        # Base confidence scales with duration: micro-bursts are uncertain,
+        # sustained floods are almost certainly real.
+        if duration < 10:
+            _conf = 15  # very short burst, likely noise
+        elif duration < 30:
+            _conf = 25  # borderline
+        elif duration < 120:
+            _conf = 35  # likely real
+        else:
+            _conf = 45  # sustained, high confidence base
         # PPS/threshold ratio: higher ratio = more confident
         _ratio = self.peak_pps / max(self.threshold, 1)
         _conf += min(25, int(_ratio * 5))  # up to +25 for 5x+ threshold
@@ -5455,11 +5485,11 @@ class Agent:
         # Packet size uniformity: attack tools produce uniform sizes
         if _avg_pkt > 0 and self.analyser.pkt_length_std() < 50:
             _conf += 10
-        # Duration: longer attacks are more likely real
-        if duration > 60:
+        # Duration bonus for sustained attacks
+        if duration > 300:
+            _conf += 10  # 5+ minutes
+        elif duration > 60:
             _conf += 5
-        elif duration < 15:
-            _conf -= 10  # very short, likely noise
         # IOC matches boost
         _conf += min(20, _ioc_conf_boost)
         # Spoofing/botnet indicators
@@ -6566,6 +6596,9 @@ class MirrorAgent(Agent):
 
         # Active attacks: dict[dst_ip -> IPAttackState]
         self.active_attacks: dict[str, dict] = {}
+        # Per-IP confirmation counters: require 2 consecutive above-threshold
+        # ticks before triggering an attack (mirrors the 3-tick window in agent mode)
+        self._ip_confirm_counts: dict[str, int] = {}
         # Per-IP PCAP processes (BPF-filtered per attacked IP)
         self._ip_pcap_procs: dict[str, subprocess.Popen] = {}
 
@@ -6715,13 +6748,18 @@ class MirrorAgent(Agent):
                 _abs_floor = self.server_threshold or 10000
                 bl = self.per_ip_baseline._baselines.get(ip)
                 if bl is None or bl.baseline_ready or snap.pps < _abs_floor:
-                    self.per_ip_baseline.add(ip, snap.pps)
+                    self.per_ip_baseline.add(ip, snap.pps, snap.bps)
 
-        # 4. Per-IP detection
+        # 4. Per-IP detection (with 2-tick confirmation window)
         for ip, snap in ip_snapshots.items():
             if ip not in self.active_attacks:
-                if self.per_ip_baseline.check(ip, snap.pps):
-                    self._begin_ip_attack(ip, snap)
+                if self.per_ip_baseline.check(ip, snap.pps, snap.bps):
+                    self._ip_confirm_counts[ip] = self._ip_confirm_counts.get(ip, 0) + 1
+                    if self._ip_confirm_counts[ip] >= 2:
+                        self._begin_ip_attack(ip, snap)
+                        self._ip_confirm_counts.pop(ip, None)
+                else:
+                    self._ip_confirm_counts.pop(ip, None)
             else:
                 # Update existing attack
                 state = self.active_attacks[ip]
@@ -6752,12 +6790,14 @@ class MirrorAgent(Agent):
                 if state["below_count"] >= 10:
                     self._end_ip_attack(ip)
 
-        # 5. Buffer aggregate metrics (same format as parent)
-        # Use weighted protocol breakdown from all IPs
-        total_tcp = sum(s.tcp_pct * s.packets for s in ip_snapshots.values())
-        total_udp = sum(s.udp_pct * s.packets for s in ip_snapshots.values())
-        total_icmp = sum(s.icmp_pct * s.packets for s in ip_snapshots.values())
-        total_pkts = sum(s.packets for s in ip_snapshots.values())
+        # 5. Buffer aggregate metrics — single pass over snapshots
+        total_tcp = total_udp = total_icmp = total_pkts = 0
+        for s in ip_snapshots.values():
+            p = s.packets
+            total_tcp += s.tcp_pct * p
+            total_udp += s.udp_pct * p
+            total_icmp += s.icmp_pct * p
+            total_pkts += p
         tcp_pct = round(total_tcp / total_pkts, 1) if total_pkts > 0 else 0
         udp_pct = round(total_udp / total_pkts, 1) if total_pkts > 0 else 0
         icmp_pct = round(total_icmp / total_pkts, 1) if total_pkts > 0 else 0

@@ -586,7 +586,10 @@ class TestCollisionChecks(unittest.TestCase):
         self.assertEqual(classify_attack(20, 60, 10), "udp_flood")
         self.assertEqual(classify_attack(60, 10, 10, syn_ratio=0.7), "syn_flood")
         self.assertEqual(classify_attack(10, 10, 50), "icmp_flood")
-        self.assertEqual(classify_attack(30, 30, 30), "multi_vector")
+        # Multi-vector now requires both protocols >35%
+        self.assertEqual(classify_attack(45, 45, 5), "multi_vector")
+        # 30/30/30 is balanced but below threshold — should not be multi_vector
+        self.assertNotEqual(classify_attack(30, 30, 30), "multi_vector")
 
     def test_classify_subtype_unchanged(self):
         """Subtype classification should produce same results."""
@@ -765,6 +768,8 @@ class TestFlowOnlyMirrorMode(unittest.TestCase):
         agent.mirror_engine = None
         agent.mirror_ip_labels = {}
         agent.active_attacks = {}
+        agent._ip_confirm_counts = {}
+        agent._monitored_networks = []
         agent._last_snapshot = {}
         agent._last_aggregate_pps = 0.0
         agent._last_aggregate_bps = 0.0

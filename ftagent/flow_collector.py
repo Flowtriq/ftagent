@@ -148,17 +148,10 @@ def parse_sflow_v5(data: bytes) -> list[FlowRecord]:
     return records
 
 
-def _parse_sflow_flow_sample(data: bytes, offset: int, length: int) -> list[FlowRecord]:
-    """Parse a standard sFlow flow sample."""
+def _parse_sflow_sample_records(data: bytes, offset: int, end: int,
+                                num_records: int, sampling_rate: int) -> list[FlowRecord]:
+    """Parse flow records from an sFlow sample (shared by standard and expanded)."""
     records = []
-    end = offset + length
-    if offset + 32 > end:
-        return records
-
-    (_seq, _source_id, sampling_rate, _sample_pool,
-     _drops, _input, _output, num_records) = struct.unpack_from("!IIIIIIII", data, offset)
-    offset += 32
-
     for _ in range(min(num_records, 50)):
         if offset + 8 > end:
             break
@@ -173,40 +166,28 @@ def _parse_sflow_flow_sample(data: bytes, offset: int, length: int) -> list[Flow
                 records.append(rec)
 
         offset = rec_end
-
     return records
+
+
+def _parse_sflow_flow_sample(data: bytes, offset: int, length: int) -> list[FlowRecord]:
+    """Parse a standard sFlow flow sample."""
+    end = offset + length
+    if offset + 32 > end:
+        return []
+    (_seq, _source_id, sampling_rate, _sample_pool,
+     _drops, _input, _output, num_records) = struct.unpack_from("!IIIIIIII", data, offset)
+    return _parse_sflow_sample_records(data, offset + 32, end, num_records, sampling_rate)
 
 
 def _parse_sflow_expanded_flow_sample(data: bytes, offset: int, length: int) -> list[FlowRecord]:
     """Parse an expanded sFlow flow sample (uses 32-bit IDs)."""
-    records = []
     end = offset + length
     if offset + 44 > end:
-        return records
-
+        return []
     _seq = struct.unpack_from("!I", data, offset)[0]
-    # expanded: src_id_type(4) + src_id_idx(4)
     sampling_rate = struct.unpack_from("!I", data, offset + 12)[0]
-    # sample_pool(4), drops(4), input_format(4), input_value(4), output_format(4), output_value(4)
     num_records = struct.unpack_from("!I", data, offset + 40)[0]
-    offset += 44
-
-    for _ in range(min(num_records, 50)):
-        if offset + 8 > end:
-            break
-        rec_format = struct.unpack_from("!I", data, offset)[0] & 0xFFF
-        rec_len = struct.unpack_from("!I", data, offset + 4)[0]
-        offset += 8
-        rec_end = offset + rec_len
-
-        if rec_format == 1:  # Raw packet header
-            rec = _parse_sflow_raw_header(data, offset, rec_len, sampling_rate)
-            if rec:
-                records.append(rec)
-
-        offset = rec_end
-
-    return records
+    return _parse_sflow_sample_records(data, offset + 44, end, num_records, sampling_rate)
 
 
 def _parse_sflow_raw_header(data: bytes, offset: int, length: int,

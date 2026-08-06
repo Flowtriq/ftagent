@@ -153,11 +153,17 @@ class TestClassifyAttack:
         assert classify_attack(10.0, 80.0, 5.0, dns_detected=True) == "dns_flood"
 
     def test_multi_vector(self):
-        result = classify_attack(30.0, 30.0, 25.0)
+        # Both protocols must be >35% to be multi-vector
+        result = classify_attack(45.0, 45.0, 5.0)
         assert result == "multi_vector"
 
+    def test_not_multi_vector_normal_traffic(self):
+        # 30/30/25 is normal mixed traffic, should NOT be multi_vector
+        result = classify_attack(30.0, 30.0, 25.0)
+        assert result != "multi_vector"
+
     def test_fragment_flood(self):
-        result = classify_attack(10.0, 10.0, 10.0, fragment_pct=60.0)
+        result = classify_attack(10.0, 10.0, 10.0, fragment_pct=65.0)
         assert result == "fragment_flood"
 
     def test_protocol_flood(self):
@@ -186,7 +192,7 @@ class TestClassifyAttack:
 
     def test_fragment_takes_priority_over_all(self):
         result = classify_attack(30.0, 30.0, 30.0,
-                                  dns_detected=True, fragment_pct=55.0)
+                                  dns_detected=True, fragment_pct=65.0)
         assert result == "fragment_flood"
 
     def test_syn_flood_threshold_boundary(self):
@@ -873,12 +879,14 @@ class TestEdgeCases:
 
     def test_traffic_analyser_evict_low_count_ips(self):
         ta = TrafficAnalyser()
-        # Fill up src_ips
+        # Set a small cap for testing
+        ta.MAX_SRC_IPS = 50
+        # Fill up src_ips past the cap
         for i in range(100):
             ta.src_ips[f"10.0.0.{i}"] = i + 1
-        original_count = len(ta.src_ips)
         ta._evict_low_count_ips()
-        assert len(ta.src_ips) < original_count
+        # Should be reduced to near MAX_SRC_IPS
+        assert len(ta.src_ips) <= ta.MAX_SRC_IPS
 
     def test_per_ip_baseline_concurrent_access(self):
         """Test thread safety of PerIPBaselineManager."""
