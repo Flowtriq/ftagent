@@ -16,6 +16,7 @@ import queue
 import re
 import signal
 import shlex
+import shutil
 import struct
 import sys
 import threading
@@ -25,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.46"
+VERSION = "1.9.47"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -7353,25 +7354,58 @@ def setup_wizard(config_path: str) -> None:
 
     save_config(config_path, cfg)
     print(f"\n  Config written to {config_path}")
-    print(f"  Node UUID: {cfg['node_uuid']}\n")
+    print(f"  Node UUID: {cfg['node_uuid']}")
+
+    # Auto-install systemd service so the agent survives reboots / SSH disconnects
+    if os.geteuid() == 0 and _has_systemd():
+        print()
+        install_service(quiet=False)
+        print()
+    else:
+        print("\n  To run as a service:")
+        print("    sudo ftagent --install-service\n")
 
 
 # ---------------------------------------------------------------------------
 # CLI: Install systemd service
 # ---------------------------------------------------------------------------
 
-SYSTEMD_UNIT = """[Unit]
+SYSTEMD_UNIT = """\
+[Unit]
 Description=Flowtriq DDoS Detection Agent
+Documentation=https://flowtriq.com/docs?section=agent
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 {script_path}
-Restart=always
-RestartSec=5
+ExecStart={python_path} -m ftagent
+Restart=on-failure
+RestartSec=10s
+
+# Run as root for raw packet capture
+User=root
+Group=root
+
+# State and log directories
+RuntimeDirectory=ftagent
+StateDirectory=ftagent
+LogsDirectory=ftagent
+
+# Hardening
+PrivateTmp=true
+NoNewPrivileges=false
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ftagent /var/log /etc/ftagent
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# Output
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=ftagent
 LimitNOFILE=65536
 
 [Install]
@@ -7379,19 +7413,38 @@ WantedBy=multi-user.target
 """
 
 
-def install_service() -> None:
-    script = os.path.abspath(__file__)
-    unit = SYSTEMD_UNIT.format(script_path=script)
+def _has_systemd() -> bool:
+    """Return True if systemctl is available on this system."""
+    return os.path.isfile("/run/systemd/system") or shutil.which("systemctl") is not None
+
+
+def install_service(quiet: bool = False) -> bool:
+    """Install, enable, and start the ftagent systemd service.
+
+    Returns True if the service was installed and started successfully.
+    """
+    if not _has_systemd():
+        if not quiet:
+            print("  systemd not available, skipping service install.")
+        return False
+
+    python_path = shutil.which("python3") or sys.executable
+    unit = SYSTEMD_UNIT.format(python_path=python_path)
     svc_path = "/etc/systemd/system/ftagent.service"
     try:
         with open(svc_path, "w") as f:
             f.write(unit)
-        print(f"  Service file written to {svc_path}")
+        if not quiet:
+            print(f"  Service file written to {svc_path}")
         os.system("systemctl daemon-reload")
-        print("  Run: systemctl enable --now ftagent")
+        os.system("systemctl enable --now ftagent >/dev/null 2>&1")
+        if not quiet:
+            print("  Service enabled and started.")
+        return True
     except PermissionError:
-        print("  Error: must run as root to install service.")
-        sys.exit(1)
+        if not quiet:
+            print("  Error: must run as root to install service.")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -7459,6 +7512,9 @@ def main() -> None:
         print(f"  Config written to {args.config}")
         print(f"  API key: {args.api_key[:8]}...{args.api_key[-4:]}")
         print(f"  Node UUID: {args.node_uuid}")
+        # Auto-install systemd service
+        if os.geteuid() == 0:
+            install_service(quiet=True)
         return
 
     if args.setup:
