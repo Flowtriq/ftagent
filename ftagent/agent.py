@@ -7399,8 +7399,8 @@ PrivateTmp=true
 NoNewPrivileges=false
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=/var/lib/ftagent /var/log /etc/ftagent
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+ReadWritePaths=/var/lib/ftagent /var/log /etc/ftagent /usr/local /tmp
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SETUID CAP_SETGID
 
 # Output
 StandardOutput=journal
