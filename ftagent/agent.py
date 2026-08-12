@@ -908,6 +908,13 @@ class BaselineManager:
     _BPS_MULTIPLIER = 3  # trigger at 3x p99 BPS
     _MIN_READY_BPS_THRESHOLD = 50_000_000  # 50 Mbps minimum (below this, BPS trigger is off)
 
+    # Extended warmup: during the first 30 minutes, use 5x multiplier instead
+    # of 3x. The baseline at 5 min (300 samples) is based on very little data
+    # and can be skewed by a burst. 5x still catches real DDoS (which typically
+    # exceeds 10-50x baseline) but prevents false positives from normal traffic
+    # variation during the learning period.
+    WARMUP_PERIOD = 1800  # 30 minutes in seconds (1 tick = 1 second)
+
     def __init__(self, window: int = 300):
         self.WINDOW = window
         self.samples: collections.deque = collections.deque(maxlen=self.WINDOW)
@@ -918,6 +925,10 @@ class BaselineManager:
         self.baseline_ready = False
         self._since_recalc = 0
         self._running_sum = 0.0
+        # Total samples ever added (not bounded by deque window).
+        # Used for warmup period tracking and baseline quality assessment.
+        self._total_samples: int = 0
+        self._became_ready: bool = False  # tracks first transition to ready
         # BPS baseline for bandwidth-based detection
         self.bps_samples: collections.deque = collections.deque(maxlen=self.WINDOW)
         self.avg_bps = 0.0
@@ -937,6 +948,7 @@ class BaselineManager:
             self._running_sum -= self.samples[0]
         self.samples.append(pps)
         self._running_sum += pps
+        self._total_samples += 1
 
         # BPS tracking for bandwidth-based detection
         if len(self.bps_samples) == self.bps_samples.maxlen:
@@ -993,13 +1005,57 @@ class BaselineManager:
             # can still detect attacks. Once ready, use data-driven threshold
             # but never go below _MIN_READY_THRESHOLD -- a tiny spike on a
             # quiet server is not a DDoS attack.
+            #
+            # Extended warmup: during the first WARMUP_PERIOD samples after
+            # baseline becomes ready, use a higher multiplier (5x instead of 3x).
+            # The baseline at 300 samples can be skewed by a burst during the
+            # first 5 minutes. 5x catches real attacks while avoiding false
+            # positives from normal traffic variance on a young baseline.
             if self.baseline_ready:
-                self.threshold = max(effective_p99 * 3, self._MIN_READY_THRESHOLD)
+                warmup_active = self._total_samples < self.WARMUP_PERIOD
+                multiplier = 5.0 if warmup_active else 3.0
+                self.threshold = max(effective_p99 * multiplier, self._MIN_READY_THRESHOLD)
             else:
                 self.threshold = max(effective_p99 * 3, self._DEFAULT_FLOOR)
 
+        was_ready = self.baseline_ready
         if n >= self.WINDOW:
             self.baseline_ready = True
+        # Log the transition from not-ready to ready exactly once
+        if self.baseline_ready and not was_ready and not self._became_ready:
+            self._became_ready = True
+            warmup_remaining = max(0, (self.WARMUP_PERIOD - self._total_samples) // 60)
+            logger.info("Baseline established: avg=%.0f PPS, p99=%.0f PPS, threshold=%.0f PPS "
+                        "(%d samples). Extended warmup active for %d more minutes.",
+                        self.avg_pps, self.p99_pps, self.threshold,
+                        self._total_samples, warmup_remaining)
+
+    @property
+    def warmup_active(self) -> bool:
+        """Whether the extended warmup period is still in effect."""
+        return self.baseline_ready and self._total_samples < self.WARMUP_PERIOD
+
+    @property
+    def baseline_quality(self) -> str:
+        """Quality indicator based on how many samples have been collected.
+        - 'learning': < 300 samples (baseline not ready)
+        - 'low': 300-1800 samples (5-30 min, warmup period)
+        - 'medium': 1800-3600 samples (30-60 min)
+        - 'high': 3600+ samples (1 hour+)
+        """
+        if self._total_samples < 300:
+            return "learning"
+        elif self._total_samples < 1800:
+            return "low"
+        elif self._total_samples < 3600:
+            return "medium"
+        else:
+            return "high"
+
+    @property
+    def total_samples(self) -> int:
+        """Total number of samples ever added (not bounded by deque window)."""
+        return self._total_samples
 
     @property
     def hourly_ready(self) -> bool:
@@ -1024,6 +1080,7 @@ class BaselineManager:
             'threshold': self.threshold,
             'bps_threshold': self.bps_threshold,
             'baseline_ready': self.baseline_ready,
+            'total_samples': self._total_samples,
             'saved_at': time.time(),
         }
         try:
@@ -1062,8 +1119,13 @@ class BaselineManager:
             self.threshold = state.get('threshold', self._DEFAULT_FLOOR)
             self.bps_threshold = state.get('bps_threshold', 0.0)
             self.baseline_ready = state.get('baseline_ready', False)
-            logger.info("Baseline restored from disk: %d samples, p99=%.0f, threshold=%.0f",
-                        len(self.samples), self.p99_pps, self.threshold)
+            self._total_samples = state.get('total_samples', len(self.samples))
+            if self.baseline_ready:
+                self._became_ready = True
+            logger.info("Baseline restored from disk: %d samples (total=%d, quality=%s), "
+                        "p99=%.0f, threshold=%.0f",
+                        len(self.samples), self._total_samples, self.baseline_quality,
+                        self.p99_pps, self.threshold)
             return True
         except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
             return False
@@ -4528,6 +4590,10 @@ class Agent:
         # false positives that erode user trust in the first few minutes.
         self._STARTUP_GRACE_SECONDS = 90
 
+        # Zero-traffic warning: fire once after 5+ minutes of zero PPS
+        self._tick_count: int = 0
+        self._zero_traffic_warned: bool = False
+
         # Command deduplication: track executed command IDs
         self._executed_command_ids: set = set()
         self._executed_command_order: collections.deque = collections.deque(maxlen=500)
@@ -4560,6 +4626,35 @@ class Agent:
             "icmp": self.monitor.icmp_pct,
             "other": 0,
         }
+
+    def _get_available_interfaces(self) -> list:
+        """Read /proc/net/dev and return a list of non-virtual interfaces with traffic info."""
+        skip = {"lo", "docker0"}
+        skip_prefix = ("br-", "veth", "virbr", "dummy", "tun", "tap", "flannel", "cni", "cali")
+        result = []
+        try:
+            with open("/proc/net/dev") as f:
+                for line in f:
+                    parts = line.strip().split(":")
+                    if len(parts) != 2:
+                        continue
+                    name = parts[0].strip()
+                    if name in skip or name.startswith(skip_prefix):
+                        continue
+                    fields = parts[1].split()
+                    rx_bytes = int(fields[0]) if len(fields) >= 1 else 0
+                    tx_bytes = int(fields[8]) if len(fields) >= 9 else 0
+                    result.append({
+                        "name": name,
+                        "rx_bytes": rx_bytes,
+                        "tx_bytes": tx_bytes,
+                        "has_traffic": rx_bytes > 0 or tx_bytes > 0,
+                    })
+        except (OSError, ValueError):
+            pass
+        # Sort by rx_bytes descending so the most active interface is first
+        result.sort(key=lambda i: i["rx_bytes"], reverse=True)
+        return result
 
     def run(self) -> None:
         logger.info("Flowtriq Agent %s starting on %s",
@@ -4738,8 +4833,23 @@ class Agent:
         if not self.monitor.read():
             return
 
+        self._tick_count += 1
         pps = self.monitor.pps
         bps = self.monitor.bps
+
+        # Zero-traffic warning: if agent has been running 5+ minutes with no
+        # traffic and baseline never converged, the interface is likely wrong.
+        if (self._tick_count >= 300 and not self.baseline.baseline_ready
+                and pps == 0 and not self._zero_traffic_warned):
+            active_ifaces = [i["name"] for i in self._get_available_interfaces()
+                             if i["has_traffic"]]
+            logger.warning(
+                "Zero traffic detected on interface %s for 5+ minutes. "
+                "This usually means the wrong network interface is configured. "
+                "Available interfaces with traffic: %s",
+                self.monitor.interface,
+                ", ".join(active_ifaces) if active_ifaces else "(none)")
+            self._zero_traffic_warned = True
 
         # Snapshot config values to avoid race with config thread mid-tick
         _holddown = self._attack_holddown
@@ -4865,6 +4975,17 @@ class Agent:
             _trigger = pps > _effective_threshold
             if not self.baseline.baseline_ready and pps >= _absolute_floor:
                 _trigger = True
+            # Warmup safety backstop: during the extended warmup period the 5x
+            # multiplier can push the dynamic threshold well above the absolute
+            # floor (e.g. p99=20K -> threshold=100K, but floor is 10K).  Keep
+            # the absolute floor active as a hard ceiling so obvious attacks
+            # that exceed it are never missed just because warmup inflated the
+            # dynamic threshold.  The 3x normal multiplier on the floor (30K
+            # for the default 10K) still provides headroom above normal traffic.
+            if not _trigger and self.baseline.warmup_active:
+                _warmup_ceiling = _absolute_floor * 3
+                if pps >= _warmup_ceiling:
+                    _trigger = True
             # BPS-based trigger: catch amplification attacks that are low PPS but
             # high bandwidth (e.g. NTP monlist at 2K PPS but 20 Gbps).
             if not _trigger and self.baseline.bps_threshold > 0:
@@ -5590,6 +5711,9 @@ class Agent:
                 hb = {
                     "version": VERSION,
                     "baseline_ready": self.baseline.baseline_ready,
+                    "baseline_quality": self.baseline.baseline_quality,
+                    "baseline_warmup_active": self.baseline.warmup_active,
+                    "baseline_total_samples": self.baseline.total_samples,
                     "baseline_avg_pps": round(self.baseline.avg_pps, 1),
                     "baseline_p99_pps": round(self.baseline.p99_pps, 1),
                     "baseline_hourly_ready": self.baseline.hourly_ready,
@@ -5603,6 +5727,12 @@ class Agent:
                     # Hybrid mode: report whether agent has PCAP active (Feature 5)
                     "pcap_active": self.pcap.enabled,
                     "flow_active": self.flow is not None,
+                    # Interface visibility for dashboard dropdown and diagnostics
+                    "interface": self.monitor.interface,
+                    "available_interfaces": self._get_available_interfaces(),
+                    "zero_traffic_warning": (self._tick_count >= 300
+                                             and not self.baseline.baseline_ready
+                                             and self.monitor.pps == 0),
                 }
                 # Export analyser overflow metrics
                 if hasattr(self, 'analyser'):
@@ -7198,6 +7328,9 @@ class MirrorAgent(Agent):
                 hb = {
                     "version": VERSION,
                     "baseline_ready": self.baseline.baseline_ready,
+                    "baseline_quality": self.baseline.baseline_quality,
+                    "baseline_warmup_active": self.baseline.warmup_active,
+                    "baseline_total_samples": self.baseline.total_samples,
                     "baseline_avg_pps": round(self.baseline.avg_pps, 1),
                     "baseline_p99_pps": round(self.baseline.p99_pps, 1),
                     "baseline_hourly_ready": self.baseline.hourly_ready,
