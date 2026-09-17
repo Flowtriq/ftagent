@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.48"
+VERSION = "1.9.49"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -3891,6 +3891,8 @@ class ServicePortDetector:
             val = str(entry.get("port_value", "")).strip()
             if not val:
                 continue
+            # iptables multiport uses colon for ranges (e.g. 31801:31803), not hyphens
+            val = val.replace("-", ":")
             if proto in ("tcp", "both"):
                 tcp_ports.extend(p.strip() for p in val.split(",") if p.strip())
             if proto in ("udp", "both"):
