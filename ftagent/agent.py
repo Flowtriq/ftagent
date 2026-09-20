@@ -6635,11 +6635,11 @@ class Agent:
             cmds = [
                 f"nft add table inet {nft_table} 2>/dev/null || true",
                 f"nft add chain inet {nft_table} {nft_chain} "
-                f"{{ type filter hook ingress priority -500\\; policy accept\\; }} 2>/dev/null || true",
+                f"{{ type filter hook input priority -300\\; policy accept\\; }} 2>/dev/null || true",
             ]
 
             # Build the match expression
-            match_parts = [f"ip daddr {target}"]
+            match_parts = [f"ip saddr {target}"]
             if proto in ("tcp", "udp"):
                 match_parts.append(f"meta l4proto {proto}")
                 if dport:
