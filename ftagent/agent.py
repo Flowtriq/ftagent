@@ -3899,12 +3899,21 @@ class ServicePortDetector:
                 udp_ports.extend(p.strip() for p in val.split(",") if p.strip())
 
         result = []
-        # iptables multiport allows max 15 port entries per rule; split into chunks
+        # iptables multiport allows max 15 port entries per rule.
+        # A port range (e.g. 8080:8090) counts as 2 entries, not 1.
         for proto, ports in [("tcp", tcp_ports), ("udp", udp_ports)]:
-            for i in range(0, len(ports), 15):
-                chunk = ports[i:i+15]
-                if chunk:
+            chunk = []
+            weight = 0
+            for p in ports:
+                w = 2 if ":" in p else 1
+                if weight + w > 15 and chunk:
                     result.append((proto, ",".join(chunk)))
+                    chunk = []
+                    weight = 0
+                chunk.append(p)
+                weight += w
+            if chunk:
+                result.append((proto, ",".join(chunk)))
         return result
 
     def _run_ipt(self, args: list, check: bool = False) -> bool:
