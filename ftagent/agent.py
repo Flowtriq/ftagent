@@ -115,7 +115,9 @@ def check_for_updates(force: bool = False, interactive: bool = True) -> None:
     import json as _json
 
     # Throttle: only check once per day unless forced
-    state_file = os.path.expanduser("~/.ftagent_update_check")
+    # Use /var/lib/ftagent if available (systemd StateDirectory), fall back to home
+    _state_dir = "/var/lib/ftagent" if os.path.isdir("/var/lib/ftagent") else os.path.expanduser("~")
+    state_file = os.path.join(_state_dir, ".ftagent_update_check")
     if not force:
         try:
             mtime = os.path.getmtime(state_file)
@@ -3043,6 +3045,8 @@ class L7Monitor:
             return None
         return self._compute_stats(now)
 
+    _LOOPBACK_IPS = frozenset({"127.0.0.1", "::1", "127.0.0.53"})
+
     def _parse_line(self, line: str) -> Optional[tuple]:
         # JSON format (nginx json_combined, Caddy, Node.js Morgan/Pino, Go, Python)
         if line.startswith("{"):
@@ -3074,7 +3078,7 @@ class L7Monitor:
                 raw_proto = (d.get("server_protocol") or d.get("protocol")
                              or d.get("httpVersion") or d.get("http_version") or "")
                 http_version = _normalize_http_version(raw_proto)
-                if ip and status:
+                if ip and status and ip not in self._LOOPBACK_IPS:
                     return (ip, method, path, status, size, ua, resp_time, http_version)
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
@@ -3092,7 +3096,8 @@ class L7Monitor:
             size = int(size_str) if size_str != "-" else 0
             path = path.split("?")[0] if "?" in path else path
             http_version = _normalize_http_version(raw_proto)
-            return (ip, method, path, status, size, ua, None, http_version)
+            if ip not in self._LOOPBACK_IPS:
+                return (ip, method, path, status, size, ua, None, http_version)
         return None
 
     def _compute_stats(self, now: float) -> dict:
@@ -6640,12 +6645,42 @@ class Agent:
                 f"nft delete rule inet {nft_table} {nft_chain} handle $h; done 2>/dev/null || true"
             )
         elif spec_type == "xdp_filter":
-            # Ensure table and chain exist
-            cmds = [
-                f"nft add table inet {nft_table} 2>/dev/null || true",
+            # Create table (idempotent — OK to suppress "already exists")
+            tbl_r = subprocess.run(
+                f"nft add table inet {nft_table}",
+                shell=True, capture_output=True, text=True, timeout=15,
+            )
+            if tbl_r.returncode != 0 and "File exists" not in (tbl_r.stderr or ""):
+                self.api._post("/agent/commands/ack", {
+                    "command_id": cmd_id,
+                    "status": "failed",
+                    "error": f"Failed to create nft table: {tbl_r.stderr.strip()}",
+                }, retries=2)
+                return
+
+            # Create chain — must verify it actually exists
+            chain_cmd = (
                 f"nft add chain inet {nft_table} {nft_chain} "
-                f"{{ type filter hook input priority -300\\; policy accept\\; }} 2>/dev/null || true",
-            ]
+                f"{{ type filter hook input priority -300\\; policy accept\\; }}"
+            )
+            chain_r = subprocess.run(
+                chain_cmd, shell=True, capture_output=True, text=True, timeout=15,
+            )
+            if chain_r.returncode != 0 and "File exists" not in (chain_r.stderr or ""):
+                # Verify chain doesn't already exist from a previous run
+                verify_r = subprocess.run(
+                    f"nft list chain inet {nft_table} {nft_chain}",
+                    shell=True, capture_output=True, text=True, timeout=10,
+                )
+                if verify_r.returncode != 0:
+                    self.api._post("/agent/commands/ack", {
+                        "command_id": cmd_id,
+                        "status": "failed",
+                        "error": f"Failed to create nft chain: {chain_r.stderr.strip()}",
+                    }, retries=2)
+                    return
+
+            applied += 1  # table + chain created successfully
 
             # Build the match expression
             match_parts = [f"ip saddr {target}"]
@@ -6660,18 +6695,18 @@ class Agent:
 
             if rate_pps and int(rate_pps) > 0:
                 # Rate-limit mode: allow up to rate_pps, drop excess
-                cmds.append(
+                cmds = [
                     f"nft add rule inet {nft_table} {nft_chain} "
                     f"{match_expr} limit rate over {max(1, int(rate_pps))}/second "
                     f"drop comment \"{nft_comment}\""
-                )
+                ]
             else:
                 # Full drop mode
                 nft_action = "drop" if action == "drop" else "accept"
-                cmds.append(
+                cmds = [
                     f"nft add rule inet {nft_table} {nft_chain} "
                     f"{match_expr} {nft_action} comment \"{nft_comment}\""
-                )
+                ]
         else:
             self.api._post("/agent/commands/ack", {
                 "command_id": cmd_id,
