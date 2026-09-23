@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.50"
+VERSION = "1.9.51"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -5303,6 +5303,13 @@ class Agent:
                             len(result["pending_commands"]))
                 for cmd in result["pending_commands"]:
                     self._execute_command(cmd)
+                    cmd_id = cmd.get("id", 0)
+                    if cmd_id:
+                        if len(self._executed_command_order) == self._executed_command_order.maxlen:
+                            evicted = self._executed_command_order[0]
+                            self._executed_command_ids.discard(evicted)
+                        self._executed_command_ids.add(cmd_id)
+                        self._executed_command_order.append(cmd_id)
         else:
             self.incident_uuid = str(uuid.uuid4())
             logger.warning("Using local incident UUID: %s", self.incident_uuid)
@@ -5434,6 +5441,13 @@ class Agent:
                             len(result["pending_commands"]))
                 for cmd in result["pending_commands"]:
                     self._execute_command(cmd)
+                    cmd_id = cmd.get("id", 0)
+                    if cmd_id:
+                        if len(self._executed_command_order) == self._executed_command_order.maxlen:
+                            evicted = self._executed_command_order[0]
+                            self._executed_command_ids.discard(evicted)
+                        self._executed_command_ids.add(cmd_id)
+                        self._executed_command_order.append(cmd_id)
         else:
             self.incident_uuid = str(uuid.uuid4())
             logger.warning("SP using local incident UUID: %s", self.incident_uuid)
@@ -7100,6 +7114,13 @@ class MirrorAgent(Agent):
             if "pending_commands" in result and result["pending_commands"]:
                 for cmd in result["pending_commands"]:
                     self._execute_command(cmd)
+                    cmd_id = cmd.get("id", 0)
+                    if cmd_id:
+                        if len(self._executed_command_order) == self._executed_command_order.maxlen:
+                            evicted = self._executed_command_order[0]
+                            self._executed_command_ids.discard(evicted)
+                        self._executed_command_ids.add(cmd_id)
+                        self._executed_command_order.append(cmd_id)
         else:
             incident_uuid = str(uuid.uuid4())
             logger.warning("Using local mirror incident UUID for %s: %s",
