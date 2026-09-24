@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.51"
+VERSION = "1.9.52"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -6554,6 +6554,20 @@ class Agent:
                     pass  # no private IP found, allow
                 if any("Blocked blackhole" in e for e in errors[-1:]):
                     continue
+            # Auto-create nft table/chain if the command adds a rule
+            if line.startswith("nft add rule "):
+                parts = line.split()
+                # nft add rule <family> <table> <chain> ...
+                if len(parts) >= 6:
+                    nft_family, nft_tbl, nft_chn = parts[3], parts[4], parts[5]
+                    # Map chain name to hook type (input->input, output->output, forward->forward)
+                    hook = nft_chn if nft_chn in ("input", "output", "forward") else "input"
+                    import subprocess as _sp
+                    _sp.run(["nft", "add", "table", nft_family, nft_tbl],
+                            capture_output=True, timeout=5)
+                    _sp.run(["nft", "add", "chain", nft_family, nft_tbl, nft_chn,
+                             f"{{ type filter hook {hook} priority 0 ; policy accept ; }}"],
+                            capture_output=True, timeout=5)
             try:
                 import subprocess
                 result = subprocess.run(
