@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.59"
+VERSION = "1.9.60"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -2430,40 +2430,44 @@ class PcapCapture:
 
     def start_capture(self, incident_uuid: str = "",
                        api_client=None) -> None:
-        if self.pcap_mode == "tcpdump" and self._ring_dir:
-            # In tcpdump mode, snapshot the current ring files as the pre-attack sample
-            import glob
-            import shutil
+        if self.pcap_mode == "tcpdump":
+            import subprocess
             self._tcpdump_capture_dir = os.path.join(self.pcap_dir, f"_capture_{incident_uuid[:8]}")
             os.makedirs(self._tcpdump_capture_dir, exist_ok=True)
-            # Copy ring files newest-first, up to snapshot size limit
-            ring_files = sorted(
-                glob.glob(os.path.join(self._ring_dir, "ring*")),
-                key=lambda f: os.path.getmtime(f), reverse=True)
-            copied_bytes = 0
-            for rf in ring_files:
-                try:
-                    rf_size = os.path.getsize(rf)
-                    if copied_bytes + rf_size > self._MAX_RING_SNAPSHOT_BYTES:
-                        if copied_bytes == 0:
-                            # At least copy one ring file even if oversized, but truncate it
-                            dst = os.path.join(self._tcpdump_capture_dir, os.path.basename(rf))
-                            with open(rf, "rb") as src_f, open(dst, "wb") as dst_f:
-                                remaining = self._MAX_RING_SNAPSHOT_BYTES
-                                while remaining > 0:
-                                    chunk = src_f.read(min(65536, remaining))
-                                    if not chunk:
-                                        break
-                                    dst_f.write(chunk)
-                                    remaining -= len(chunk)
-                            copied_bytes = self._MAX_RING_SNAPSHOT_BYTES
-                        break
-                    shutil.copy2(rf, self._tcpdump_capture_dir)
-                    copied_bytes += rf_size
-                except Exception:
-                    pass
-            # Start a dedicated tcpdump for this incident
-            import subprocess
+
+            # Snapshot pre-attack ring files (if ring buffer is active)
+            if self._ring_dir:
+                import glob
+                import shutil as _shutil
+                ring_files = sorted(
+                    glob.glob(os.path.join(self._ring_dir, "ring*")),
+                    key=lambda f: os.path.getmtime(f), reverse=True)
+                copied_bytes = 0
+                for rf in ring_files:
+                    try:
+                        rf_size = os.path.getsize(rf)
+                        if copied_bytes + rf_size > self._MAX_RING_SNAPSHOT_BYTES:
+                            if copied_bytes == 0:
+                                # At least copy one ring file even if oversized, but truncate it
+                                dst = os.path.join(self._tcpdump_capture_dir, os.path.basename(rf))
+                                with open(rf, "rb") as src_f, open(dst, "wb") as dst_f:
+                                    remaining = self._MAX_RING_SNAPSHOT_BYTES
+                                    while remaining > 0:
+                                        chunk = src_f.read(min(65536, remaining))
+                                        if not chunk:
+                                            break
+                                        dst_f.write(chunk)
+                                        remaining -= len(chunk)
+                                copied_bytes = self._MAX_RING_SNAPSHOT_BYTES
+                            break
+                        _shutil.copy2(rf, self._tcpdump_capture_dir)
+                        copied_bytes += rf_size
+                    except Exception:
+                        pass
+
+            # Start a dedicated tcpdump for this incident (works even when
+            # _ring_dir is None, e.g. lazy PCAP where the ring buffer thread
+            # wasn't running before the attack started)
             self._capture_file = os.path.join(self._tcpdump_capture_dir, "attack.pcap")
             try:
                 _snaplen = str(self.snaplen) if self.snaplen else "0"
@@ -5175,6 +5179,12 @@ class Agent:
         if self._pcap_lazy and not self.pcap.enabled:
             self.pcap.enabled = True
             logger.info("Lazy PCAP: starting capture for attack")
+            # Start the ring buffer thread if it wasn't running (lazy mode skipped it)
+            if self._sniffer_thread is None or not self._sniffer_thread.is_alive():
+                self._sniffer_thread = threading.Thread(
+                    target=self.pcap.background_ring, args=(self.shutdown,),
+                    daemon=True, name="pcap-ring")
+                self._sniffer_thread.start()
 
         self.peak_pps = self.monitor.pps
         self.peak_bps = self.monitor.bps
@@ -7195,6 +7205,12 @@ class MirrorAgent(Agent):
         if self._pcap_lazy and not self.pcap.enabled:
             self.pcap.enabled = True
             logger.info("Lazy PCAP: starting capture for mirror attack on %s", ip)
+            # Start the ring buffer thread if it wasn't running (lazy mode skipped it)
+            if self._sniffer_thread is None or not self._sniffer_thread.is_alive():
+                self._sniffer_thread = threading.Thread(
+                    target=self.pcap.background_ring, args=(self.shutdown,),
+                    daemon=True, name="pcap-ring")
+                self._sniffer_thread.start()
 
         baseline = self.per_ip_baseline.get_baseline(ip)
         label = self.mirror_ip_labels.get(ip, "")
