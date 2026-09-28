@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.56"
+VERSION = "1.9.57"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -3052,6 +3052,9 @@ class L7Monitor:
                 self.file.close()
             self.file = None
 
+        if not self.file:
+            return None
+
         new_lines = []
         try:
             while True:
@@ -6046,7 +6049,7 @@ class Agent:
             if "ioc_patterns" in data:
                 self.ioc_matcher.load(data["ioc_patterns"])
             if "pcap_enabled" in data:
-                self.pcap.enabled = data["pcap_enabled"] and (SCAPY_AVAILABLE or self.pcap_mode == "tcpdump")
+                self.pcap.enabled = data["pcap_enabled"] and (SCAPY_AVAILABLE or self.pcap.pcap_mode == "tcpdump")
             # Threat intel IP blocklist from server
             if "ip_blocklist" in data and isinstance(data["ip_blocklist"], list):
                 new_bl = {entry["indicator"] for entry in data["ip_blocklist"]
