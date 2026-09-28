@@ -106,10 +106,12 @@ class TestConfigLoading:
         expected_keys = [
             "api_key", "node_uuid", "api_base", "interface",
             "pcap_enabled", "pcap_mode", "pcap_dir", "log_file",
-            "log_level", "dynamic_threshold", "baseline_window",
+            "log_level", "baseline_window",
             "health_port", "auto_update", "flow_enabled",
             "gre_mode", "gre_max_depth", "hypervisor_mode",
             "mirror_mode", "mirror_interface",
+            "mirror_subnets", "mirror_ip_labels", "mirror_capture_mode",
+            "velocity_detection", "agones_sidecar", "pcap_lazy",
         ]
         for key in expected_keys:
             assert key in DEFAULT_CONFIG, f"Missing key: {key}"
@@ -590,9 +592,13 @@ class TestTrafficAnalyser:
 
     def test_spoofing_detected(self):
         ta = TrafficAnalyser()
-        # Low TTL entropy + many source IPs = spoofing
-        ta.ttl_values = [64] * 200
-        ta.src_ips = {f"1.1.1.{i}": 1 for i in range(150)}
+        # High TTL entropy + high source IP entropy + many IPs = spoofing
+        # (spoofed IPs traverse random paths producing varied TTLs)
+        import random
+        rng = random.Random(42)
+        ta.ttl_values = [rng.randint(1, 255) for _ in range(2000)]
+        ta.src_ips = {f"{rng.randint(1,223)}.{rng.randint(0,255)}.{rng.randint(0,255)}.{rng.randint(1,254)}": 1
+                      for _ in range(600)}
         assert ta.spoofing_detected() is True
 
     def test_spoofing_not_detected_few_ips(self):
@@ -603,7 +609,9 @@ class TestTrafficAnalyser:
 
     def test_botnet_detected_many_ips(self):
         ta = TrafficAnalyser()
-        ta.src_ips = {f"10.0.{i//256}.{i%256}": 1 for i in range(350)}
+        # Threshold was raised to 5000 to avoid flagging legitimate flash crowds
+        ta.src_ips = {f"10.{(i >> 16) & 0xFF}.{(i >> 8) & 0xFF}.{i & 0xFF}": 1
+                      for i in range(5500)}
         assert ta.botnet_detected() is True
 
     def test_botnet_detected_by_ioc(self):
