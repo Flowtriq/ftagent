@@ -400,18 +400,19 @@ class TestConnectivity:
 class TestHTTPErrors:
     """Tests for various HTTP error handling."""
 
-    def test_400_raises_immediately(self):
+    def test_400_returns_none_no_retry(self):
         client = _make_client()
         mock_resp = MagicMock()
         mock_resp.status_code = 400
-        mock_resp.raise_for_status.side_effect = requests.HTTPError("400 Bad Request")
+        mock_resp.text = "Bad Request"
         client.session.post.return_value = mock_resp
 
         result = client._post("/test", {}, retries=3)
         assert result is None
-        # 400 is not 503, so raise_for_status triggers the exception handler
-        # which retries up to retries count
-        assert client.session.post.call_count == 3
+        # 4xx client errors return immediately without retries (server is
+        # responding, retrying won't help) and count as CB success
+        assert client.session.post.call_count == 1
+        assert client._cb_state == "closed"
 
     def test_500_triggers_retries(self):
         client = _make_client()

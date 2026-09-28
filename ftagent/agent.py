@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.53"
+VERSION = "1.9.54"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -511,6 +511,15 @@ class APIClient:
                         self._cb_record_failure()
                         self.retry_queue.append(("POST", path, payload, timeout))
                         return None
+                # 4xx client errors (400, 404, etc.) mean the server IS
+                # responding — don't count them as circuit breaker failures.
+                # Only connectivity issues (timeouts, 5xx) should trip the CB.
+                if 400 <= resp.status_code < 500:
+                    logger.warning("API POST %s returned %d: %s",
+                                   path, resp.status_code,
+                                   resp.text[:200] if resp.text else "")
+                    self._cb_record_success()
+                    return None
                 resp.raise_for_status()
                 self._cb_record_success()
                 if resp.content:
@@ -552,6 +561,12 @@ class APIClient:
                     else:
                         self._cb_record_failure()
                         return None
+                if 400 <= resp.status_code < 500:
+                    logger.warning("API GET %s returned %d: %s",
+                                   path, resp.status_code,
+                                   resp.text[:200] if resp.text else "")
+                    self._cb_record_success()
+                    return None
                 resp.raise_for_status()
                 self._cb_record_success()
                 return resp.json()
