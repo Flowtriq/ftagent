@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.55"
+VERSION = "1.9.56"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -5948,7 +5948,7 @@ class Agent:
                 logger.warning("Auto-update check failed: %s", exc)
                 # Report update failure to dashboard so operators can see it
                 try:
-                    self.api.post("heartbeat", {
+                    self.api._post("/agent/heartbeat", {
                         "update_error": str(exc)[:200],
                         "current_version": VERSION,
                     })
@@ -6046,7 +6046,7 @@ class Agent:
             if "ioc_patterns" in data:
                 self.ioc_matcher.load(data["ioc_patterns"])
             if "pcap_enabled" in data:
-                self.pcap.enabled = data["pcap_enabled"] and SCAPY_AVAILABLE
+                self.pcap.enabled = data["pcap_enabled"] and (SCAPY_AVAILABLE or self.pcap_mode == "tcpdump")
             # Threat intel IP blocklist from server
             if "ip_blocklist" in data and isinstance(data["ip_blocklist"], list):
                 new_bl = {entry["indicator"] for entry in data["ip_blocklist"]
@@ -6176,7 +6176,7 @@ class Agent:
 
             # Velocity detection (server can override local config)
             if "velocity_detection" in data:
-                self.baseline._velocity_detection = bool(data["velocity_detection"])
+                self._velocity_detection = bool(data["velocity_detection"])
 
             # Attack holddown & cooldown (configurable per node)
             if "attack_holddown" in data:
@@ -6983,6 +6983,8 @@ class MirrorAgent(Agent):
                              name="config"),
             threading.Thread(target=self._command_poll_loop, daemon=True,
                              name="command-poll"),
+            threading.Thread(target=self._metrics_sender_loop, daemon=True,
+                             name="metrics-sender"),
         ]
 
         # Mirror capture engine thread (skip in flow-only mode)
