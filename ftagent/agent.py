@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.54"
+VERSION = "1.9.55"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -811,12 +811,30 @@ class PPSMonitor:
         if dt <= 0:
             return False
 
-        self.pps = (rx_packets - self.prev_rx_packets) / dt
-        self.bps = (rx_bytes - self.prev_rx_bytes) * 8 / dt
+        d_packets = rx_packets - self.prev_rx_packets
+        d_bytes = rx_bytes - self.prev_rx_bytes
+
+        # Counter wrap or interface reset: discard this sample
+        if d_packets < 0 or d_bytes < 0:
+            self.prev_rx_packets = rx_packets
+            self.prev_rx_bytes = rx_bytes
+            self.prev_tcp = tcp_in
+            self.prev_udp = udp_in
+            self.prev_icmp = icmp_in
+            self.prev_time = now
+            return False
+
+        self.pps = d_packets / dt
+        self.bps = d_bytes * 8 / dt
 
         d_tcp = tcp_in - self.prev_tcp
         d_udp = udp_in - self.prev_udp
         d_icmp = icmp_in - self.prev_icmp
+        # Counter wrap on protocol counters: reset to avoid negative percentages
+        if d_tcp < 0 or d_udp < 0 or d_icmp < 0:
+            d_tcp = max(0, d_tcp)
+            d_udp = max(0, d_udp)
+            d_icmp = max(0, d_icmp)
         total_proto = d_tcp + d_udp + d_icmp
 
         if total_proto > 0:
