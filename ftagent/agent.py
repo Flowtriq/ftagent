@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.57"
+VERSION = "1.9.58"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -5423,6 +5423,8 @@ class Agent:
         self.below_count = 0
         self.velocity_curve.clear()
         self.analyser.reset()
+        self._classification_votes = {}
+        self._classification_locked = ""
         self.last_update = time.monotonic()
 
         # Determine zone: check if regular volumetric threshold is also crossed
@@ -5715,37 +5717,36 @@ class Agent:
 
         if not self.incident_uuid:
             logger.error("Cannot resolve incident -- UUID is empty (open_incident likely failed)")
-            self.attacking = False
-            return
-
-        _resolve_data = {
-            "duration_seconds": round(duration, 1),
-            "peak_pps": round(self.peak_pps, 1),
-            "peak_bps": round(self.peak_bps, 1),
-            "attack_family": family,
-            "attack_subtype": subtype or None,
-            "confidence": _conf,
-            "protocol_breakdown": proto,
-            "ioc_hits": list(set(self.analyser.ioc_hits)),
-            "spoofing_detected": self.analyser.spoofing_detected(),
-            "botnet_detected": self.analyser.botnet_detected(),
-            "total_packets": self.analyser.total_packets,
-            "source_ip_count": _src_count,
-            "src_ip_entropy": self.analyser.src_ip_entropy(),
-            "tcp_flag_breakdown": _flags,
-            "dns_query_stats": self.analyser.dns_query_stats(),
-            "pkt_length_histogram": self.analyser.pkt_length_histogram(),
-            "ttl_distribution": self.analyser.ttl_distribution(),
-            "velocity_curve": list(self.velocity_curve),
-            "top_src_ips": _top_ips,
-            "top_dst_ports": _top_ports_final,
-            "avg_pkt_length": self.analyser.avg_pkt_length(),
-            "fragment_count": self.analyser.fragment_count,
-            "fragment_pct": _frag_pct,
-        }
-        if _end_tool:
-            _resolve_data["attack_tool"] = _end_tool
-        self.api.resolve_incident(self.incident_uuid, _resolve_data)
+            # Still must run cleanup below (mitigations, PCAP, Agones, cooldown)
+        else:
+            _resolve_data = {
+                "duration_seconds": round(duration, 1),
+                "peak_pps": round(self.peak_pps, 1),
+                "peak_bps": round(self.peak_bps, 1),
+                "attack_family": family,
+                "attack_subtype": subtype or None,
+                "confidence": _conf,
+                "protocol_breakdown": proto,
+                "ioc_hits": list(set(self.analyser.ioc_hits)),
+                "spoofing_detected": self.analyser.spoofing_detected(),
+                "botnet_detected": self.analyser.botnet_detected(),
+                "total_packets": self.analyser.total_packets,
+                "source_ip_count": _src_count,
+                "src_ip_entropy": self.analyser.src_ip_entropy(),
+                "tcp_flag_breakdown": _flags,
+                "dns_query_stats": self.analyser.dns_query_stats(),
+                "pkt_length_histogram": self.analyser.pkt_length_histogram(),
+                "ttl_distribution": self.analyser.ttl_distribution(),
+                "velocity_curve": list(self.velocity_curve),
+                "top_src_ips": _top_ips,
+                "top_dst_ports": _top_ports_final,
+                "avg_pkt_length": self.analyser.avg_pkt_length(),
+                "fragment_count": self.analyser.fragment_count,
+                "fragment_pct": _frag_pct,
+            }
+            if _end_tool:
+                _resolve_data["attack_tool"] = _end_tool
+            self.api.resolve_incident(self.incident_uuid, _resolve_data)
 
         # Remove all active nft mitigations applied during this incident.
         # This is critical: the server may also send xdp_filter_remove commands,
