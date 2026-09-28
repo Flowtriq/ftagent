@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.58"
+VERSION = "1.9.59"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -5330,7 +5330,12 @@ class Agent:
             _sorted_td = sorted(_tcpdump_src_ips.items(), key=lambda x: x[1], reverse=True)[:20]
             inc_data["top_src_ips"] = [{"ip": ip, "count": c} for ip, c in _sorted_td]
             inc_data["source_ip_count"] = len(_tcpdump_src_ips)
-        result = self.api.open_incident(inc_data)
+        try:
+            result = self.api.open_incident(inc_data)
+        except Exception as exc:
+            logger.error("Failed to open incident: %s — rolling back attack state", exc)
+            self.attacking = False
+            return
 
         if result and "uuid" in result:
             self.incident_uuid = result["uuid"]
@@ -7146,6 +7151,12 @@ class MirrorAgent(Agent):
                 state["below_count"] += 1
                 if state["below_count"] >= 10:
                     self._end_ip_attack(ip)
+
+        # Prune stale confirmation counters for IPs no longer in snapshots
+        if self._ip_confirm_counts:
+            stale = [ip for ip in self._ip_confirm_counts if ip not in ip_snapshots]
+            for ip in stale:
+                del self._ip_confirm_counts[ip]
 
         # 5. Buffer aggregate metrics — single pass over snapshots
         total_tcp = total_udp = total_icmp = total_pkts = 0
