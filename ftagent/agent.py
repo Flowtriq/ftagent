@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.52"
+VERSION = "1.9.53"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -4614,6 +4614,9 @@ class Agent:
         self._executed_command_ids: set = set()
         self._executed_command_order: collections.deque = collections.deque(maxlen=500)
 
+        # Track active nft mitigation comments so we can clean up on resolve
+        self._active_nft_mitigations: set = set()
+
     @property
     def threshold(self) -> float:
         if self.server_threshold is not None:
@@ -5708,6 +5711,12 @@ class Agent:
             _resolve_data["attack_tool"] = _end_tool
         self.api.resolve_incident(self.incident_uuid, _resolve_data)
 
+        # Remove all active nft mitigations applied during this incident.
+        # This is critical: the server may also send xdp_filter_remove commands,
+        # but if the API is unreachable those commands never arrive and rules
+        # stack indefinitely. Clean up locally regardless of API state.
+        self._cleanup_nft_mitigations()
+
         if self.pcap.enabled:
             pcap_path = self.pcap.stop_capture(self.incident_uuid)
             if pcap_path:
@@ -6125,6 +6134,7 @@ class Agent:
                             "duration_seconds": 0, "attack_family": "http_flood",
                             "confidence": 50, "status": "resolved"
                         })
+                        self._cleanup_nft_mitigations()
                         self.l7_incident_uuid = None
                     except Exception:
                         pass
@@ -6457,6 +6467,7 @@ class Agent:
             "l7_threat_patterns": summary.get("threat_patterns", stats.get("threat_patterns", {})),
             "l7_protocol_versions": summary.get("protocol_versions", stats.get("protocol_versions", {})),
         })
+        self._cleanup_nft_mitigations()
         self.l7_incident_uuid = ""
         self.l7_peak_rps = 0
 
@@ -6568,6 +6579,18 @@ class Agent:
                     _sp.run(["nft", "add", "chain", nft_family, nft_tbl, nft_chn,
                              f"{{ type filter hook {hook} priority 0 ; policy accept ; }}"],
                             capture_output=True, timeout=5)
+                    # Prevent rule stacking: if the rule has a comment, remove
+                    # existing rules with that comment before adding the new one
+                    _comment_match = re.search(r'comment\s+"([^"]+)"', line)
+                    if _comment_match:
+                        _cmt = _comment_match.group(1)
+                        _sp.run(
+                            f"for h in $(nft -a list chain {nft_family} {nft_tbl} {nft_chn} 2>/dev/null "
+                            f"| grep '{_cmt}' | grep -oP 'handle \\K\\d+'); do "
+                            f"nft delete rule {nft_family} {nft_tbl} {nft_chn} handle $h; done 2>/dev/null || true",
+                            shell=True, capture_output=True, timeout=10,
+                        )
+                        self._active_nft_mitigations.add(_cmt)
             try:
                 import subprocess
                 result = subprocess.run(
@@ -6721,20 +6744,29 @@ class Agent:
 
             match_expr = " ".join(match_parts)
 
+            # Remove any existing rules with the same comment first to prevent
+            # stacking (duplicate rules accumulate if commands are re-sent due
+            # to API failures, dedup window eviction, or retries).
+            cmds = [
+                f"for h in $(nft -a list chain inet {nft_table} {nft_chain} 2>/dev/null "
+                f"| grep '{nft_comment}' | grep -oP 'handle \\K\\d+'); do "
+                f"nft delete rule inet {nft_table} {nft_chain} handle $h; done 2>/dev/null || true"
+            ]
+
             if rate_pps and int(rate_pps) > 0:
                 # Rate-limit mode: allow up to rate_pps, drop excess
-                cmds = [
+                cmds.append(
                     f"nft add rule inet {nft_table} {nft_chain} "
                     f"{match_expr} limit rate over {max(1, int(rate_pps))}/second "
                     f"drop comment \"{nft_comment}\""
-                ]
+                )
             else:
                 # Full drop mode
                 nft_action = "drop" if action == "drop" else "accept"
-                cmds = [
+                cmds.append(
                     f"nft add rule inet {nft_table} {nft_chain} "
                     f"{match_expr} {nft_action} comment \"{nft_comment}\""
-                ]
+                )
         else:
             self.api._post("/agent/commands/ack", {
                 "command_id": cmd_id,
@@ -6760,6 +6792,12 @@ class Agent:
                 errors.append(f"{c}: {exc}")
                 logger.error("XDP/nft error: %s — %s", c, exc)
 
+        # Track active mitigations for cleanup on incident resolve
+        if spec_type == "xdp_filter" and applied:
+            self._active_nft_mitigations.add(nft_comment)
+        elif spec_type == "xdp_filter_remove":
+            self._active_nft_mitigations.discard(nft_comment)
+
         status = "applied" if not errors else ("failed" if not applied else "applied")
         error_msg = "; ".join(errors) if errors else None
         logger.info("XDP command #%d: %s (%d applied, %d errors)", cmd_id, status, applied, len(errors))
@@ -6768,6 +6806,38 @@ class Agent:
             "status": status,
             "error": error_msg,
         }, retries=2)
+
+    def _cleanup_nft_mitigations(self) -> None:
+        """Remove all nft mitigation rules applied during the current incident.
+
+        Called on incident resolve to ensure rules don't persist after the
+        attack ends.  This is the local safety net — even if the API is
+        unreachable and the server never sends xdp_filter_remove commands,
+        rules are cleaned up."""
+        if not self._active_nft_mitigations:
+            return
+
+        import subprocess
+        nft_table = "flowtriq_xdp"
+        nft_chain = "filter"
+        removed = 0
+
+        for comment in list(self._active_nft_mitigations):
+            try:
+                result = subprocess.run(
+                    f"for h in $(nft -a list chain inet {nft_table} {nft_chain} 2>/dev/null "
+                    f"| grep '{comment}' | grep -oP 'handle \\K\\d+'); do "
+                    f"nft delete rule inet {nft_table} {nft_chain} handle $h; done 2>/dev/null || true",
+                    shell=True, capture_output=True, text=True, timeout=15,
+                )
+                removed += 1
+                logger.info("Mitigation cleanup: removed rules for %s", comment)
+            except Exception as exc:
+                logger.error("Mitigation cleanup failed for %s: %s", comment, exc)
+
+        self._active_nft_mitigations.clear()
+        if removed:
+            logger.info("Mitigation cleanup: removed %d rule group(s) on incident resolve", removed)
 
 
 # ---------------------------------------------------------------------------
@@ -7264,6 +7334,8 @@ class MirrorAgent(Agent):
                 resolve_data["fragment_pct"] = _snap_frag_pct
 
             self.api.resolve_incident(state["incident_uuid"], resolve_data)
+
+        self._cleanup_nft_mitigations()
 
         # Stop per-IP PCAP
         self._stop_ip_pcap(ip, state.get("incident_uuid", ""))
