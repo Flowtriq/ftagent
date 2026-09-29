@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.63"
+VERSION = "1.9.64"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -6598,6 +6598,8 @@ class Agent:
                     "net.ipv4.conf.all.log_martians",
                     "net.ipv4.tcp_fin_timeout", "net.ipv4.tcp_keepalive_time",
                     "net.core.somaxconn", "net.core.netdev_max_backlog",
+                    "net.netfilter.nf_conntrack_udp_timeout",
+                    "net.netfilter.nf_conntrack_udp_timeout_stream",
                 }
                 # Extract exact sysctl key: "sysctl -w key=value" or "sysctl key=value"
                 _sysctl_parts = line.split()
