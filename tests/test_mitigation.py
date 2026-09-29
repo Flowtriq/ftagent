@@ -158,7 +158,7 @@ class TestBlockedUnsafeCommands:
 
     def test_prefix_must_match_from_start(self, agent):
         """A line containing an allowed token, but not starting with it, is blocked."""
-        cmd = "echo iptables -A INPUT -s 1.2.3.4 -j DROP"
+        cmd = "sudo iptables -A INPUT -s 1.2.3.4 -j DROP"
         with patch("subprocess.run") as mock_run:
             agent._execute_command({
                 "id": 3,

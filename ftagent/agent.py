@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.62"
+VERSION = "1.9.63"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -6547,6 +6547,8 @@ class Agent:
             "rm -f /etc/nginx/conf.d/ft_",
             "rm -f /etc/apache2/conf-enabled/ft_",
             "for cc in ",
+            "echo ",          # L7 nginx/apache config generation
+            "xdp-filter ",    # XDP filter attach/drop/port
         )
         errors = []
         applied = 0
