@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.61"
+VERSION = "1.9.62"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -6560,10 +6560,19 @@ class Agent:
                 errors.append(f"Blocked unsafe command: {line}")
                 logger.warning("Blocked unsafe command: %s", line)
                 continue
-            # Block shell metacharacters that enable injection
-            if ';' in line or '`' in line or '$' in line or '|' in line or '>' in line or '<' in line:
+            # Block shell metacharacters that enable injection.
+            # Exception: 'shell' type commands (L7 nginx/apache rules) are
+            # template-generated with sanitized fields and need shell features.
+            # They still must pass the prefix allowlist above.
+            _is_shell_type = (cmd_type == "shell")
+            if not _is_shell_type and (';' in line or '`' in line or '$' in line or '|' in line or '>' in line or '<' in line):
                 errors.append(f"Blocked command with shell injection chars: {line}")
                 logger.warning("Blocked shell injection in command: %s", line)
+                continue
+            # Shell type: still block backtick subshells (never legitimate)
+            if _is_shell_type and '`' in line:
+                errors.append(f"Blocked backtick subshell in shell command: {line}")
+                logger.warning("Blocked backtick in shell command: %s", line)
                 continue
             # Block destructive commands that could lock out the server
             _tokens = line.split()
@@ -6645,10 +6654,18 @@ class Agent:
                         self._active_nft_mitigations.add(_cmt)
             try:
                 import subprocess
-                result = subprocess.run(
-                    shlex.split(line), capture_output=True, text=True,
-                    timeout=30,
-                )
+                if _is_shell_type:
+                    # Shell-type commands (L7 nginx/apache) need shell=True
+                    # for pipes, redirects, and subshells
+                    result = subprocess.run(
+                        line, shell=True, capture_output=True, text=True,
+                        timeout=30,
+                    )
+                else:
+                    result = subprocess.run(
+                        shlex.split(line), capture_output=True, text=True,
+                        timeout=30,
+                    )
                 if result.returncode == 0:
                     applied += 1
                     logger.info("Applied: %s", line)
