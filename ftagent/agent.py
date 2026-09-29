@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.60"
+VERSION = "1.9.61"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -6638,7 +6638,7 @@ class Agent:
                         _cmt = _comment_match.group(1)
                         _sp.run(
                             f"for h in $(nft -a list chain {nft_family} {nft_tbl} {nft_chn} 2>/dev/null "
-                            f"| grep '{_cmt}' | grep -oP 'handle \\K\\d+'); do "
+                            f"| grep '\"{_cmt}\"' | grep -oP 'handle \\K\\d+'); do "
                             f"nft delete rule {nft_family} {nft_tbl} {nft_chn} handle $h; done 2>/dev/null || true",
                             shell=True, capture_output=True, timeout=10,
                         )
@@ -6744,7 +6744,7 @@ class Agent:
             # Also try removing by handle (more reliable)
             cmds.append(
                 f"for h in $(nft -a list chain inet {nft_table} {nft_chain} 2>/dev/null "
-                f"| grep '{nft_comment}' | grep -oP 'handle \\K\\d+'); do "
+                f"| grep '\"{nft_comment}\"' | grep -oP 'handle \\K\\d+'); do "
                 f"nft delete rule inet {nft_table} {nft_chain} handle $h; done 2>/dev/null || true"
             )
         elif spec_type == "xdp_filter":
@@ -6801,7 +6801,7 @@ class Agent:
             # to API failures, dedup window eviction, or retries).
             cmds = [
                 f"for h in $(nft -a list chain inet {nft_table} {nft_chain} 2>/dev/null "
-                f"| grep '{nft_comment}' | grep -oP 'handle \\K\\d+'); do "
+                f"| grep '\"{nft_comment}\"' | grep -oP 'handle \\K\\d+'); do "
                 f"nft delete rule inet {nft_table} {nft_chain} handle $h; done 2>/dev/null || true"
             ]
 
@@ -6878,7 +6878,7 @@ class Agent:
             try:
                 result = subprocess.run(
                     f"for h in $(nft -a list chain inet {nft_table} {nft_chain} 2>/dev/null "
-                    f"| grep '{comment}' | grep -oP 'handle \\K\\d+'); do "
+                    f"| grep '\"{comment}\"' | grep -oP 'handle \\K\\d+'); do "
                     f"nft delete rule inet {nft_table} {nft_chain} handle $h; done 2>/dev/null || true",
                     shell=True, capture_output=True, text=True, timeout=15,
                 )
