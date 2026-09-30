@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.9.64"
+VERSION = "1.9.65"
 CONFIG_PATH = "/etc/ftagent/config.json"
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -928,11 +928,11 @@ class BaselineManager:
     _RECALC_EVERY = 10  # recalculate percentiles every N samples
     # Use a low default floor (150 PPS) only before baseline is established.
     # Once baseline is ready, threshold is purely data-driven (p99 * 3).
-    _DEFAULT_FLOOR = 5000
-    # Minimum threshold after baseline is ready. Even if p99 * 3 is lower,
-    # never trigger below this. A 500 PPS spike on a 100 PPS server is normal
-    # traffic variation, not a DDoS attack.
-    _MIN_READY_THRESHOLD = 5000
+    _DEFAULT_FLOOR = 10000
+    # Minimum threshold after baseline is ready. Even if p99 * 4 is lower,
+    # never trigger below this. Small spikes on quiet servers are normal
+    # traffic variation, not DDoS attacks.
+    _MIN_READY_THRESHOLD = 10000
     # Hourly baseline: samples needed per hour bucket before it's trusted.
     _HOURLY_MIN_SAMPLES = 60
     # Per-hour deque size: 360 samples = ~6 hours of data for each hour slot.
@@ -1048,10 +1048,10 @@ class BaselineManager:
             # positives from normal traffic variance on a young baseline.
             if self.baseline_ready:
                 warmup_active = self._total_samples < self.WARMUP_PERIOD
-                multiplier = 5.0 if warmup_active else 3.0
+                multiplier = 6.0 if warmup_active else 4.0
                 self.threshold = max(effective_p99 * multiplier, self._MIN_READY_THRESHOLD)
             else:
-                self.threshold = max(effective_p99 * 3, self._DEFAULT_FLOOR)
+                self.threshold = max(effective_p99 * 4, self._DEFAULT_FLOOR)
 
         was_ready = self.baseline_ready
         if n >= self.WINDOW:
@@ -4618,8 +4618,9 @@ class Agent:
         self.below_count: int = 0
         self._above_count: int = 0  # sustained confirmation counter
         self._last_attack_end: float = 0.0
-        self._attack_cooldown: float = 60.0  # suppress re-detection for N seconds after attack ends
+        self._attack_cooldown: float = 120.0  # suppress re-detection for N seconds after attack ends
         self._attack_holddown: int = 10     # consecutive below-threshold ticks before resolving
+        self._confirm_ticks: int = 5        # consecutive above-threshold ticks before opening incident
         self.preferred_firewall: str = cfg.get("preferred_firewall", "iptables")
         self.velocity_curve: collections.deque = collections.deque(maxlen=2000)
         self.last_update: float = 0.0
@@ -5086,14 +5087,14 @@ class Agent:
                 if _cd_elapsed < _cooldown and pps < _absolute_floor * 5:
                     _trigger = False
 
-            # Sustained-attack confirmation: require 3 consecutive ticks above
-            # threshold before opening an incident. VoIP registration storms,
-            # CDN cache refills, and game heartbeats produce brief 1-2 tick
-            # spikes that aren't attacks. Real DDoS sustains for many seconds.
+            # Sustained-attack confirmation: require N consecutive ticks above
+            # threshold before opening an incident (default 3, configurable via
+            # confirm_ticks). VoIP registration storms, CDN cache refills, game
+            # downloads produce brief spikes that aren't attacks.
             # Exception: massive floods (>5x floor) trigger immediately.
             if _trigger:
                 self._above_count = getattr(self, '_above_count', 0) + 1
-                if self._above_count < 3 and pps < _absolute_floor * 5:
+                if self._above_count < self._confirm_ticks and pps < _absolute_floor * 5:
                     _trigger = False  # wait for sustained confirmation
             else:
                 self._above_count = 0
@@ -6202,6 +6203,8 @@ class Agent:
                 self._attack_holddown = max(3, int(data["attack_holddown"]))
             if "attack_cooldown" in data:
                 self._attack_cooldown = max(10, float(data["attack_cooldown"]))
+            if "confirm_ticks" in data:
+                self._confirm_ticks = max(2, min(30, int(data["confirm_ticks"])))
             # Preferred firewall from tenant settings
             if "preferred_firewall" in data:
                 self.preferred_firewall = data["preferred_firewall"]

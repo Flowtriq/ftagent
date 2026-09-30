@@ -299,7 +299,7 @@ class TestPerIPBaselineManager(unittest.TestCase):
         self.assertAlmostEqual(bl_b["avg_pps"], 100, delta=10)
 
     def test_check_with_baseline(self):
-        """After baseline is established, check should use max(p99 x 3, 5000)."""
+        """After baseline is established, check should use max(p99 x 4, 10000)."""
         mgr = PerIPBaselineManager(window=10)
         # Build a baseline at 100 PPS
         for _ in range(15):
@@ -307,10 +307,10 @@ class TestPerIPBaselineManager(unittest.TestCase):
 
         bl = mgr.get_baseline("10.0.0.1")
         self.assertTrue(bl["ready"])
-        # threshold = max(100 * 3, 5000) = 5000, so 10000 should trigger
-        self.assertTrue(mgr.check("10.0.0.1", 10000))
-        # 3000 should not trigger (below 5000 floor)
-        self.assertFalse(mgr.check("10.0.0.1", 3000))
+        # threshold = max(100 * 4, 10000) = 10000, so 20000 should trigger
+        self.assertTrue(mgr.check("10.0.0.1", 20000))
+        # 8000 should not trigger (below 10000 floor)
+        self.assertFalse(mgr.check("10.0.0.1", 8000))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -338,9 +338,9 @@ class TestDetectionLogic(unittest.TestCase):
         for _ in range(15):
             mgr.add("10.0.0.1", 100)
             mgr.add("10.0.0.2", 200)
-        # Both should trigger independently (threshold floor = 5000)
-        self.assertTrue(mgr.check("10.0.0.1", 10000))
-        self.assertTrue(mgr.check("10.0.0.2", 15000))
+        # Both should trigger independently (threshold floor = 10000)
+        self.assertTrue(mgr.check("10.0.0.1", 20000))
+        self.assertTrue(mgr.check("10.0.0.2", 25000))
 
     def test_resolution_independence(self):
         """IP-A resolving should not affect IP-B's state."""
@@ -351,9 +351,9 @@ class TestDetectionLogic(unittest.TestCase):
             mgr.add("10.0.0.1", 100)
             mgr.add("10.0.0.2", 100)
 
-        # Both under attack (must exceed 5000 floor)
-        self.assertTrue(mgr.check("10.0.0.1", 10000))
-        self.assertTrue(mgr.check("10.0.0.2", 10000))
+        # Both under attack (must exceed 10000 floor)
+        self.assertTrue(mgr.check("10.0.0.1", 20000))
+        self.assertTrue(mgr.check("10.0.0.2", 20000))
 
         # IP-A drops back to normal
         for _ in range(5):
@@ -362,7 +362,7 @@ class TestDetectionLogic(unittest.TestCase):
         # IP-A should no longer trigger
         self.assertFalse(mgr.check("10.0.0.1", 100))
         # IP-B should still trigger
-        self.assertTrue(mgr.check("10.0.0.2", 10000))
+        self.assertTrue(mgr.check("10.0.0.2", 20000))
 
 
 # ═══════════════════════════════════════════════════════════════════════
